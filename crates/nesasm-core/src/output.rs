@@ -3,12 +3,22 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Rom,
+    Listing,
+    Srec,
+}
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct Artifact {
-    pub kind: String,
+    pub kind: ArtifactKind,
     pub path: PathBuf,
     pub size: usize,
 }
@@ -25,12 +35,13 @@ pub fn write_artifacts(
         return Err("Cannot write artifacts for a failed assembly".into());
     }
     let rom = resolve_path(output.unwrap_or(&input.with_extension("nes")), base, root)?;
-    let mut binary = result.header.clone();
-    binary.extend(&result.binary);
     let mut files = if options.srec {
         Vec::new()
     } else {
-        vec![("rom", rom.clone(), binary)]
+        let mut binary = Vec::with_capacity(result.header.len() + result.binary.len());
+        binary.extend_from_slice(&result.header);
+        binary.extend_from_slice(&result.binary);
+        vec![(ArtifactKind::Rom, rom.clone(), binary)]
     };
     let encode = |text: &str| -> Result<Vec<u8>, String> {
         match options.encoding {
@@ -47,14 +58,14 @@ pub fn write_artifacts(
     };
     if let Some(list) = &result.listing {
         files.push((
-            "listing",
+            ArtifactKind::Listing,
             resolve_path(&rom.with_extension("lst"), base, root)?,
             encode(list)?,
         ));
     }
     if let Some(srec) = &result.srec {
         files.push((
-            "srec",
+            ArtifactKind::Srec,
             resolve_path(&rom.with_extension("s28"), base, root)?,
             encode(srec)?,
         ));
@@ -67,43 +78,85 @@ pub fn write_artifacts(
         if result.dependencies.contains(path) {
             return Err("Output would overwrite an input dependency".into());
         }
+        if path.is_dir() {
+            return Err(format!("Output path is a directory: {}", path.display()));
+        }
     }
     for (_, path, _) in &files {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
-    let mut artifacts = Vec::new();
+    let mut staged = Vec::with_capacity(files.len());
     for (kind, path, data) in files {
-        // Write a sibling temporary file so a failed write cannot truncate an existing ROM.
+        staged.push(StagedArtifact::write(kind, path, &data).map_err(|e| e.to_string())?);
+    }
+    staged
+        .into_iter()
+        .map(|artifact| artifact.commit().map_err(|e| e.to_string()))
+        .collect()
+}
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Owns its temporary file, including cleanup on errors and unwinding.
+struct StagedArtifact {
+    kind: ArtifactKind,
+    path: PathBuf,
+    temp: PathBuf,
+    size: usize,
+    file: Option<fs::File>,
+}
+
+impl StagedArtifact {
+    fn write(kind: ArtifactKind, path: PathBuf, data: &[u8]) -> io::Result<Self> {
         let name = path
             .file_name()
-            .ok_or("Invalid output name")?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid output name"))?
             .to_string_lossy();
-        let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|e| e.to_string())?;
-        use std::io::Write;
-        let written = file.write_all(&data).and_then(|_| file.sync_all());
-        drop(file);
-        if let Err(e) = written {
-            let _ = fs::remove_file(&temp);
-            return Err(e.to_string());
-        }
-        if let Err(e) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(e.to_string());
-        }
-        artifacts.push(Artifact {
-            kind: kind.into(),
+        let (temp, file) = loop {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let temp = path.with_file_name(format!(".{name}.{}.{id}.tmp", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+            {
+                Ok(file) => break (temp, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        let mut staged = Self {
+            kind,
             path,
+            temp,
             size: data.len(),
-        });
+            file: Some(file),
+        };
+        let file = staged.file.as_mut().expect("newly created staging file");
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(staged)
     }
-    Ok(artifacts)
+
+    fn commit(mut self) -> io::Result<Artifact> {
+        // Windows requires the file to be closed before renaming it.
+        drop(self.file.take());
+        fs::rename(&self.temp, &self.path)?;
+        Ok(Artifact {
+            kind: self.kind,
+            path: std::mem::take(&mut self.path),
+            size: self.size,
+        })
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.temp);
+    }
 }
 
 pub(crate) fn srec(binary: &[u8], map: &[u8]) -> String {
@@ -139,4 +192,32 @@ pub(crate) fn srec(binary: &[u8], map: &[u8]) -> String {
         .wrapping_add(address as u8);
     text.push_str(&format!("S804{address:06X}{:02X}", !sum));
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simultaneous_staging_files_are_distinct_and_cleaned_up() {
+        let root = std::env::temp_dir().join(format!("nesasm-staging-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("result.nes");
+        let staged = std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    scope.spawn(move || StagedArtifact::write(ArtifactKind::Rom, path, &[0x42]))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
+        drop(staged);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(root).unwrap();
+    }
 }

@@ -2,12 +2,13 @@ pub(crate) fn packed_tile(rows: [u32; 8], validate: bool) -> Result<Vec<u8>, Str
     let mut tile = vec![0; 16];
     // Preserve the C# port's byte-pointer semantics: the packed reader consumes
     // the first eight bytes of the little-endian u32 row buffer, one byte per row.
-    let packed = rows
+    for (y, row) in rows
         .into_iter()
+        .take(2)
         .flat_map(u32::to_le_bytes)
-        .collect::<Vec<_>>();
-    for (y, row) in packed[..8].iter().enumerate() {
-        let row = *row as u32;
+        .enumerate()
+    {
+        let row = u32::from(row);
         for x in 0..8 {
             let pixel = (row >> ((7 - x) * 4)) & 15;
             if validate && pixel > 3 {

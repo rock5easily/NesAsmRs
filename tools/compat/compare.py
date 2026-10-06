@@ -116,9 +116,11 @@ def main():
         "invalid_indented_opcode": '  .org $8000\nStart:\n  nonsense\n',
         "conditional_forward_empty": '  .ifndef future\n  .endif\nfuture:\n  nop\n',
         "bss_high_water": '  .bss\n  .org $400\n  .ds 16\n  .org $200\n  .code\n  .dw _bss_end\n',
+        "unterminated_macro_include": '  .include "macro-start.asm"\n  .endm\n  .org $8000\n  emit 42\n',
     }
     (work / "helper.asm").write_text('Included: .db 42\n', encoding="utf-8")
     (work / "two.bin").write_bytes(bytes([1,2]))
+    (work / "macro-start.asm").write_text('emit .macro\n  .db \\1\n', encoding="utf-8")
     operands = {"imm":"#$12", "zp":"<$34", "zpx":"<$34,x", "zpy":"<$34,y",
                 "zi":"[$34]", "zix":"[$34,x]", "ziy":"[$34],y",
                 "abs":"$1234", "ax":"$1234,x", "ay":"$1234,y", "acc":"a",

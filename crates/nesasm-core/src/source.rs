@@ -1,6 +1,7 @@
 use crate::{AssembleRequest, SourceEncoding, SourceLocation};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -10,7 +11,6 @@ pub(crate) struct Line {
     pub location: SourceLocation,
     pub trace: Vec<SourceLocation>,
     pub expanded: bool,
-    pub return_header: Option<(usize, String)>,
 }
 
 /// Resolve existing paths or an output path whose nearest ancestor exists.
@@ -66,8 +66,14 @@ pub(crate) fn read_lines(
     path: &Path,
     trace: Vec<SourceLocation>,
 ) -> Result<Vec<Line>, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    if bytes.len() > 1024 * 1024 {
+    const SOURCE_LIMIT: usize = 1024 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .take((SOURCE_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > SOURCE_LIMIT {
         return Err("Source exceeds 1 MiB".into());
     }
     let text = match request.options.encoding {
@@ -106,7 +112,6 @@ pub(crate) fn read_lines(
                 },
                 trace: trace.clone(),
                 expanded: false,
-                return_header: None,
             });
         }
         continuation = next_continuation;

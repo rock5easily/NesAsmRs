@@ -49,6 +49,20 @@ struct Report {
     dependencies: Vec<PathBuf>,
     artifacts: Vec<Artifact>,
 }
+
+impl From<nesasm_core::AssembleResult> for Report {
+    fn from(result: nesasm_core::AssembleResult) -> Self {
+        Self {
+            success: result.success,
+            diagnostics: result.diagnostics,
+            symbols: result.symbols,
+            regions: result.regions,
+            banks: result.banks,
+            dependencies: result.dependencies,
+            artifacts: Vec::new(),
+        }
+    }
+}
 #[derive(Serialize, JsonSchema)]
 struct ReferenceReport {
     success: bool,
@@ -93,22 +107,14 @@ impl Server {
         let report = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let request = AssembleRequest {
-                input: input.input.clone(),
+                input: input.input,
                 working_directory: root.clone(),
                 include_paths: input.include_paths,
                 allowed_root: Some(root.clone()),
                 options: input.options,
             };
-            let result = nesasm_core::assemble(&request);
-            let mut report = Report {
-                success: result.success,
-                diagnostics: result.diagnostics.clone(),
-                symbols: result.symbols.clone(),
-                regions: result.regions.clone(),
-                banks: result.banks.clone(),
-                dependencies: result.dependencies.clone(),
-                artifacts: Vec::new(),
-            };
+            let mut result = nesasm_core::assemble(&request);
+            let mut artifacts = Vec::new();
             if write && result.success {
                 match nesasm_core::write_artifacts(
                     &result,
@@ -118,11 +124,11 @@ impl Server {
                     Some(&root),
                     &request.options,
                 ) {
-                    Ok(artifacts) => report.artifacts = artifacts,
+                    Ok(written) => artifacts = written,
                     Err(e) => {
-                        report.success = false;
-                        report.diagnostics.push(Diagnostic {
-                            severity: "error".into(),
+                        result.success = false;
+                        result.diagnostics.push(Diagnostic {
+                            severity: nesasm_core::Severity::Error,
                             code: "E_OUTPUT".into(),
                             message: e,
                             location: SourceLocation {
@@ -135,13 +141,15 @@ impl Server {
                     }
                 }
             }
+            let mut report = Report::from(result);
+            report.artifacts = artifacts;
             report
         })
         .await
         .unwrap_or_else(|e| Report {
             success: false,
             diagnostics: vec![Diagnostic {
-                severity: "error".into(),
+                severity: nesasm_core::Severity::Error,
                 code: "E_INTERNAL".into(),
                 message: e.to_string(),
                 location: SourceLocation::default(),

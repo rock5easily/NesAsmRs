@@ -4,9 +4,10 @@ mod image;
 mod opcode;
 mod output;
 mod source;
+mod state;
 
 pub use engine::assemble;
-pub use output::{Artifact, write_artifacts};
+pub use output::{Artifact, ArtifactKind, write_artifacts};
 pub use source::resolve_path;
 
 use schemars::JsonSchema;
@@ -64,9 +65,35 @@ pub struct SourceLocation {
     pub column: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum DataType {
+    #[serde(rename = "DB")]
+    Bytes,
+    #[serde(rename = "INCBIN")]
+    Binary,
+    #[serde(rename = "INCCHR")]
+    Characters,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Diagnostic {
-    pub severity: String,
+    pub severity: Severity,
     pub code: String,
     pub message: String,
     pub location: SourceLocation,
@@ -82,7 +109,7 @@ pub struct Symbol {
     pub location: SourceLocation,
     pub public: bool,
     pub size: usize,
-    pub data_type: Option<String>,
+    pub data_type: Option<DataType>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

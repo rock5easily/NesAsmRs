@@ -230,6 +230,92 @@ fn reference_topics() {
 }
 
 #[test]
+fn json_contract_uses_legacy_type_names() {
+    let t = Temp::new();
+    let result = t.run("Data: .db 1,2", AssembleOptions::default());
+    assert!(result.success);
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["symbols"]["Data"]["data_type"], "DB");
+    let artifacts = nesasm_core::write_artifacts(
+        &result,
+        Path::new("test.asm"),
+        None,
+        &t.0,
+        Some(&t.0),
+        &AssembleOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_value(&artifacts).unwrap()[0]["kind"], "rom");
+    let failed = t.run("  .db 256", AssembleOptions::default());
+    assert_eq!(
+        serde_json::to_value(&failed).unwrap()["diagnostics"][0]["severity"],
+        "error"
+    );
+}
+
+#[test]
+fn invalid_secondary_output_preserves_existing_rom() {
+    let t = Temp::new();
+    let result = t.run("  .list\n  .db 1", AssembleOptions::default());
+    assert!(result.success);
+    fs::write(t.0.join("test.nes"), b"existing ROM").unwrap();
+    fs::create_dir(t.0.join("test.lst")).unwrap();
+    assert!(
+        nesasm_core::write_artifacts(
+            &result,
+            Path::new("test.asm"),
+            None,
+            &t.0,
+            Some(&t.0),
+            &AssembleOptions::default()
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(t.0.join("test.nes")).unwrap(), b"existing ROM");
+    assert!(fs::read_dir(&t.0).unwrap().all(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|ext| ext != "tmp")
+    }));
+}
+
+#[test]
+fn incbin_reads_only_the_requested_range() {
+    use std::io::{Seek, SeekFrom, Write};
+    let t = Temp::new();
+    let mut binary = fs::File::create(t.0.join("large.bin")).unwrap();
+    let length = 64 * 1024 * 1024;
+    binary.set_len(length).unwrap();
+    binary.seek(SeekFrom::Start(length - 1)).unwrap();
+    binary.write_all(&[0x42]).unwrap();
+    drop(binary);
+    let result = t.run(
+        &format!("  .incbin \"large.bin\",{},1", length - 1),
+        AssembleOptions::default(),
+    );
+    assert!(result.success, "{:?}", result.diagnostics);
+    assert_eq!(result.binary[0], 0x42);
+    assert!(
+        !t.run("  .incbin \"large.bin\"", AssembleOptions::default())
+            .success
+    );
+}
+
+#[test]
+fn macro_definition_must_end_in_its_input_file() {
+    let t = Temp::new();
+    fs::write(t.0.join("macro-start.asm"), "emit .macro\n  .db \\1\n").unwrap();
+    let result = t.run(
+        "  .include \"macro-start.asm\"\n  .endm\n  .org $8000\n  emit 42\n",
+        AssembleOptions::default(),
+    );
+    assert!(!result.success);
+    assert!(result.binary.is_empty());
+}
+
+#[test]
 fn pcx_raw_rle_and_planar_tiles() {
     let t = Temp::new();
     for (bpp, planes, rle) in [(8, 1, false), (8, 1, true), (1, 2, false), (1, 2, true)] {

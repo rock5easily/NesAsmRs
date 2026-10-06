@@ -102,9 +102,8 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
         usage,
     }))
 }
-fn run(args: &Arguments) -> (AssembleResult, bool) {
+fn run(args: &Arguments) -> AssembleResult {
     let mut result = nesasm_core::assemble(&args.request);
-    let mut success = result.success;
     if !args.check
         && result.success
         && let Err(e) = nesasm_core::write_artifacts(
@@ -116,10 +115,9 @@ fn run(args: &Arguments) -> (AssembleResult, bool) {
             &args.request.options,
         )
     {
-        success = false;
         result.success = false;
         result.diagnostics.push(nesasm_core::Diagnostic {
-            severity: "error".into(),
+            severity: nesasm_core::Severity::Error,
             code: "E_OUTPUT".into(),
             message: e,
             location: nesasm_core::SourceLocation {
@@ -149,7 +147,7 @@ fn run(args: &Arguments) -> (AssembleResult, bool) {
                 d.message
             );
         }
-        if success {
+        if result.success {
             println!("Assembled {} bytes", result.binary.len());
         }
         for r in result.regions.values() {
@@ -181,7 +179,7 @@ fn run(args: &Arguments) -> (AssembleResult, bool) {
             }
         }
     }
-    (result, success)
+    result
 }
 fn fingerprint(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<(SystemTime, u64)>> {
     paths
@@ -208,7 +206,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let (mut result, success) = run(&args);
+    let mut result = run(&args);
     if args.watch {
         // Keyboard handling uses a separate thread, so polling works on all three OSes.
         let (send, recv) = std::sync::mpsc::channel();
@@ -246,7 +244,7 @@ fn main() {
             if current != previous || key == "R" {
                 // Debounce bursts from editors replacing files.
                 std::thread::sleep(Duration::from_millis(100));
-                result = run(&args).0;
+                result = run(&args);
                 for p in result.dependencies {
                     if !paths.contains(&p) {
                         paths.push(p);
@@ -255,7 +253,7 @@ fn main() {
                 previous = fingerprint(&paths);
             }
         }
-    } else if !success {
+    } else if !result.success {
         std::process::exit(1);
     }
 }

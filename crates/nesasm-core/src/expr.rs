@@ -1,3 +1,4 @@
+use crate::state::RESERVED_BANK;
 use crate::{Region, Symbol};
 use std::collections::BTreeMap;
 
@@ -7,7 +8,7 @@ pub(crate) struct Context<'a> {
     pub functions: &'a BTreeMap<String, String>,
     pub global: &'a str,
     pub pc: u32,
-    pub first: bool,
+    pub allow_undefined: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,8 +126,8 @@ struct Parser<'a, 'b> {
     ctx: &'a Context<'b>,
     depth: usize,
 }
-impl Parser<'_, '_> {
-    fn symbol(&self, name: &str) -> Result<&Symbol, String> {
+impl<'ctx, 'symbols> Parser<'ctx, 'symbols> {
+    fn symbol(&self, name: &str) -> Result<&'symbols Symbol, String> {
         let local = name.starts_with('.');
         let key = if local {
             format!("{}{name}", self.ctx.global)
@@ -151,7 +152,7 @@ impl Parser<'_, '_> {
                 } else {
                     match self.symbol(&name) {
                         Ok(s) => s.value,
-                        Err(_) if self.ctx.first => 0,
+                        Err(_) if self.ctx.allow_undefined => 0,
                         Err(e) => return Err(e),
                     }
                 }
@@ -198,7 +199,7 @@ impl Parser<'_, '_> {
                 "-" => left.wrapping_sub(right),
                 "*" => left.wrapping_mul(right),
                 "/" | "%" if right == 0 => {
-                    if self.ctx.first {
+                    if self.ctx.allow_undefined {
                         0
                     } else {
                         return Err("Division by zero".into());
@@ -244,7 +245,7 @@ impl Parser<'_, '_> {
             self.expect(")")?;
             return match size {
                 Some(n) => Ok(n as u32),
-                None if self.ctx.first => Ok(0),
+                None if self.ctx.allow_undefined => Ok(0),
                 None => Err("Region is undefined or incomplete".into()),
             };
         }
@@ -252,21 +253,21 @@ impl Parser<'_, '_> {
             let Token::Name(symbol) = &self.tokens[self.pos] else {
                 return Err(format!("{name} requires a symbol"));
             };
-            let symbol = self.symbol(symbol).ok().cloned();
+            let symbol = self.symbol(symbol).ok();
             self.pos += 1;
             self.expect(")")?;
             if upper == "DEFINED" {
                 return Ok(symbol.is_some() as u32);
             }
             let Some(s) = symbol else {
-                return if self.ctx.first {
+                return if self.ctx.allow_undefined {
                     Ok(0)
                 } else {
                     Err("Undefined symbol".into())
                 };
             };
-            if !self.ctx.first
-                && ((upper == "BANK" && s.bank == 240)
+            if !self.ctx.allow_undefined
+                && ((upper == "BANK" && s.bank == RESERVED_BANK)
                     || (upper == "SIZEOF" && s.data_type.is_none())
                     || upper == "VRAM"
                     || upper == "PAL")

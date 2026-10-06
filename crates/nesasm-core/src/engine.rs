@@ -1,14 +1,17 @@
 use crate::{
-    AssembleRequest, AssembleResult, BankUsage, Diagnostic, Region, SourceLocation, Symbol,
+    AssembleRequest, AssembleResult, BankUsage, DataType, Diagnostic, Region, Severity,
+    SourceLocation, Symbol,
 };
 use crate::{
     expr, image,
     opcode::{self, Mode},
     source::{self, Line},
+    state::{PROCEDURE_BANK, Pass, RESERVED_BANK, Section},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    io::{Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -42,13 +45,18 @@ struct Conditional {
     otherwise: bool,
 }
 
+enum PendingLine {
+    Source(Line),
+    ReturnFromInclude { depth: usize, name: String },
+}
+
 struct Engine<'a> {
     request: &'a AssembleRequest,
     result: AssembleResult,
-    first: bool,
+    pass: Pass,
     position: Position,
-    section: usize,
-    saved: BTreeMap<(usize, usize), Position>,
+    section: Section,
+    saved: BTreeMap<(Section, usize), Position>,
     section_bank: [usize; 4],
     cat: BTreeSet<usize>,
     max_bank: usize,
@@ -69,7 +77,7 @@ struct Engine<'a> {
     line_number: usize,
     macro_counter: usize,
     header: [u8; 16],
-    last_data: Option<(String, String)>,
+    last_data: Option<(String, DataType)>,
     call_bank: Option<usize>,
     call_bytes: Vec<u8>,
     calls: BTreeMap<String, u32>,
@@ -84,9 +92,9 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
     let mut engine = Engine {
         request,
         result: AssembleResult::default(),
-        first: true,
+        pass: Pass::Layout,
         position: Position::default(),
-        section: 2,
+        section: Section::Code,
         saved: BTreeMap::new(),
         section_bank: [0; 4],
         cat: BTreeSet::new(),
@@ -164,26 +172,25 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
     // The C# port leaves the map's unassigned bytes zero-initialized.
     // Occupancy is tracked separately so new structured usage data is accurate.
     engine.result.map = vec![0; LIMIT];
-    for pass in 0..2 {
-        engine.first = pass == 0;
+    for (pass, lines) in [(Pass::Layout, lines.clone()), (Pass::Emit, lines)] {
+        engine.pass = pass;
         engine.reset();
-        engine.run(lines.clone());
+        engine.run(lines);
         if !engine.conditions.is_empty() {
             engine.error_at(&location, &[], "E_CONDITIONAL", "Missing ENDIF");
         }
         if !engine.frames.is_empty() {
             engine.error_at(&location, &[], "E_PROC", "Missing ENDP/ENDPROCGROUP");
         }
-        if !engine.result.diagnostics.is_empty()
-            && engine
-                .result
-                .diagnostics
-                .iter()
-                .any(|d| d.severity == "error")
+        if engine
+            .result
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
         {
             break;
         }
-        if pass == 0 {
+        if pass == Pass::Layout {
             engine.relocate();
             engine.reserve("_bss_end", engine.max_bss as u32);
             engine.reserve("_nb_bank", (engine.max_bank + 1) as u32);
@@ -193,7 +200,7 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
         .result
         .diagnostics
         .iter()
-        .any(|d| d.severity == "error");
+        .any(|d| d.severity == Severity::Error);
     if engine.result.success {
         let len = (engine.max_bank + 1) * BANK_SIZE;
         engine.result.binary.truncate(len);
@@ -234,19 +241,20 @@ impl Engine<'_> {
             page: 7,
             ..Position::default()
         };
-        self.section = 2;
+        self.section = Section::Code;
         self.section_bank = [0; 4];
         self.saved.clear();
-        self.saved.insert((0, 0), Position::default());
+        self.saved
+            .insert((Section::ZeroPage, 0), Position::default());
         self.saved.insert(
-            (1, 0),
+            (Section::Bss, 0),
             Position {
                 offset: 0x200,
                 ..Position::default()
             },
         );
-        self.saved.insert((2, 0), self.position.clone());
-        self.saved.insert((3, 0), self.position.clone());
+        self.saved.insert((Section::Code, 0), self.position.clone());
+        self.saved.insert((Section::Data, 0), self.position.clone());
         self.conditions.clear();
         self.frames.clear();
         self.macros.clear();
@@ -262,7 +270,7 @@ impl Engine<'_> {
         self.line_number = 0;
         self.macro_counter = 0;
         self.last_data = None;
-        if !self.first {
+        if self.pass.is_emitting() {
             self.listing = format!("#[1]   {}\n", self.request.input.display());
         }
     }
@@ -272,7 +280,7 @@ impl Engine<'_> {
             Symbol {
                 name: name.into(),
                 value,
-                bank: 240,
+                bank: RESERVED_BANK,
                 page: 0,
                 location: SourceLocation::default(),
                 public: true,
@@ -289,7 +297,7 @@ impl Engine<'_> {
         message: &str,
     ) {
         self.result.diagnostics.push(Diagnostic {
-            severity: "error".into(),
+            severity: Severity::Error,
             code: code.into(),
             message: message.into(),
             location: loc.clone(),
@@ -316,7 +324,7 @@ impl Engine<'_> {
                 functions: &self.functions,
                 global: &self.position.global,
                 pc: self.pc(),
-                first: self.first,
+                allow_undefined: self.pass.is_layout(),
             },
         )
     }
@@ -329,7 +337,7 @@ impl Engine<'_> {
                 functions: &self.functions,
                 global: &self.position.global,
                 pc: self.pc(),
-                first: false,
+                allow_undefined: false,
             },
         )
     }
@@ -365,7 +373,7 @@ impl Engine<'_> {
         } else {
             name.into()
         };
-        if self.first && self.if_undefined.contains(&key) {
+        if self.pass.is_layout() && self.if_undefined.contains(&key) {
             return Err("Cannot define a symbol declared undefined by IFDEF/IFNDEF".into());
         }
         if !self.defined.insert(key.clone()) {
@@ -379,7 +387,7 @@ impl Engine<'_> {
             }
             return Err(format!("Symbol '{key}' is multiply defined"));
         }
-        if self.first
+        if self.pass.is_layout()
             && self
                 .result
                 .symbols
@@ -388,14 +396,14 @@ impl Engine<'_> {
         {
             return Err("Reserved symbol cannot be redefined".into());
         }
-        if self.first {
+        if self.pass.is_layout() {
             self.result.symbols.insert(
                 key.clone(),
                 Symbol {
                     name: key.clone(),
                     value,
-                    bank: if self.section < 2 {
-                        240
+                    bank: if self.section.is_ram() {
+                        RESERVED_BANK
                     } else {
                         self.position.bank
                     },
@@ -421,15 +429,9 @@ impl Engine<'_> {
         Ok(key)
     }
     fn run(&mut self, lines: Vec<Line>) {
-        let mut queue: VecDeque<Line> = lines.into();
+        let mut queue: VecDeque<PendingLine> = lines.into_iter().map(PendingLine::Source).collect();
         let mut steps = 0usize;
-        while let Some(line) = queue.pop_front() {
-            if let Some((depth, name)) = &line.return_header {
-                if !self.first && self.any_list && self.request.options.list_level > 0 {
-                    self.listing.push_str(&format!("#[{depth}]   {name}\n"));
-                }
-                continue;
-            }
+        while let Some(line) = self.next_source_line(&mut queue) {
             steps += 1;
             if steps > 1_000_000 {
                 self.error_at(
@@ -462,7 +464,11 @@ impl Engine<'_> {
                     self.error_at(&line.location, &line.trace, "E_CONDITIONAL", &e);
                     break;
                 }
-                if !self.first && self.list && parent_active && (!line.expanded || self.mlist) {
+                if self.pass.is_emitting()
+                    && self.list
+                    && parent_active
+                    && (!line.expanded || self.mlist)
+                {
                     self.list_line(&line, &self.position.clone(), &op, &[], false);
                     if let Some(value) = display {
                         self.insert_listing_value(value);
@@ -475,16 +481,17 @@ impl Engine<'_> {
             }
             if op == "MACRO" || op == "MAC" {
                 let name = label.clone().unwrap_or_else(|| operand.trim().into());
-                if !self.first && self.list {
+                if self.pass.is_emitting() && self.list {
                     self.list_line(&line, &self.position.clone(), "MACRO", &[], false);
                 }
                 let mut body = Vec::new();
                 let mut found = false;
-                while let Some(next) = queue.pop_front() {
+                // A macro definition must close before its source file returns.
+                while let Some(PendingLine::Source(next)) = queue.pop_front() {
                     if !next.expanded {
                         self.line_number = next.location.line;
                     }
-                    if !self.first && self.list {
+                    if self.pass.is_emitting() && self.list {
                         self.list_line(&next, &self.position.clone(), "MACRO", &[], false);
                     }
                     let (_, next_op, _) = self.parse(source::strip_comment(&next.text));
@@ -511,7 +518,7 @@ impl Engine<'_> {
                 continue;
             }
             if let Some(body) = self.macros.get(&op).cloned() {
-                if !self.first && self.list && (!line.expanded || self.mlist) {
+                if self.pass.is_emitting() && self.list && (!line.expanded || self.mlist) {
                     let mut position = self.position.clone();
                     if !self.mlist {
                         position.offset += position.page * 8192;
@@ -587,7 +594,7 @@ impl Engine<'_> {
                                 .result
                                 .symbols
                                 .get(&name)
-                                .is_some_and(|s| s.bank == 240)
+                                .is_some_and(|s| s.bank == RESERVED_BANK)
                             {
                                 3
                             } else {
@@ -604,7 +611,7 @@ impl Engine<'_> {
                     expanded.push(next);
                 }
                 for next in expanded.into_iter().rev() {
-                    queue.push_front(next);
+                    queue.push_front(PendingLine::Source(next));
                 }
                 continue;
             }
@@ -633,7 +640,10 @@ impl Engine<'_> {
                         .unwrap_or((1, String::new()));
                     self.input_names
                         .insert(path.clone(), (depth + 1, name.clone()));
-                    if !self.first && self.any_list && self.request.options.list_level > 0 {
+                    if self.pass.is_emitting()
+                        && self.any_list
+                        && self.request.options.list_level > 0
+                    {
                         self.listing
                             .push_str(&format!("#[{}]   {name}\n", depth + 1));
                         if self.list {
@@ -649,11 +659,12 @@ impl Engine<'_> {
                             .get(&line.location.file)
                             .cloned()
                             .unwrap_or((1, self.request.input.display().to_string()));
-                        let mut returning = line.clone();
-                        returning.return_header = Some(header);
-                        queue.push_front(returning);
+                        queue.push_front(PendingLine::ReturnFromInclude {
+                            depth: header.0,
+                            name: header.1,
+                        });
                         for next in lines.into_iter().rev() {
-                            queue.push_front(next);
+                            queue.push_front(PendingLine::Source(next));
                         }
                     }
                     Err(e) => {
@@ -667,7 +678,7 @@ impl Engine<'_> {
             let data = self.execute(label.as_deref(), &op, &operand, &line);
             match data {
                 Ok(bytes) => {
-                    if !self.first
+                    if self.pass.is_emitting()
                         && self.list
                         && (!line.expanded || self.mlist)
                         && !["LIST", "MLIST", "NOMLIST"].contains(&op.as_str())
@@ -687,6 +698,22 @@ impl Engine<'_> {
             }
         }
     }
+    fn next_source_line(&mut self, queue: &mut VecDeque<PendingLine>) -> Option<Line> {
+        loop {
+            match queue.pop_front()? {
+                PendingLine::Source(line) => return Some(line),
+                PendingLine::ReturnFromInclude { depth, name } => {
+                    if self.pass.is_emitting()
+                        && self.any_list
+                        && self.request.options.list_level > 0
+                    {
+                        self.listing.push_str(&format!("#[{depth}]   {name}\n"));
+                    }
+                }
+            }
+        }
+    }
+
     fn parse(&self, text: &str) -> (Option<String>, String, String) {
         let indented = text.starts_with(char::is_whitespace);
         if text.starts_with('*') {
@@ -752,7 +779,7 @@ impl Engine<'_> {
                     } else {
                         operand.into()
                     };
-                    if self.first && !self.result.symbols.contains_key(&key) {
+                    if self.pass.is_layout() && !self.result.symbols.contains_key(&key) {
                         self.if_undefined.insert(key.clone());
                     }
                     self.result.symbols.contains_key(&key) != (op == "IFNDEF")
@@ -807,7 +834,7 @@ impl Engine<'_> {
             let global = self.position.global.clone();
             let key = self.define(name, value, line, false)?;
             let symbol = self.result.symbols.get_mut(&key).unwrap();
-            symbol.bank = 240;
+            symbol.bank = RESERVED_BANK;
             symbol.page = 0;
             self.position.global = global;
             return Ok(Vec::new());
@@ -824,10 +851,10 @@ impl Engine<'_> {
             if addr > 65535 {
                 return Err("ORG out of range".into());
             }
-            if self.section == 0 && addr > 255 {
+            if self.section == Section::ZeroPage && addr > 255 {
                 return Err("Zero page ORG out of range".into());
             }
-            if self.section == 1 && addr > 0x7ff {
+            if self.section == Section::Bss && addr > 0x7ff {
                 return Err("BSS ORG out of range".into());
             }
             if !self.frames.is_empty() {
@@ -861,7 +888,7 @@ impl Engine<'_> {
         if op == "RS"
             && let Some(key) = &key
         {
-            self.result.symbols.get_mut(key).unwrap().bank = 240;
+            self.result.symbols.get_mut(key).unwrap().bank = RESERVED_BANK;
         }
         if op == "RS" {
             self.position.global = global;
@@ -879,7 +906,7 @@ impl Engine<'_> {
                 }
             }
             "BANK" => {
-                if self.section < 2 || !self.frames.is_empty() {
+                if self.section.is_ram() || !self.frames.is_empty() {
                     return Err("BANK not allowed in this section/procedure".into());
                 }
                 let args = source::arguments(operand)?;
@@ -915,39 +942,22 @@ impl Engine<'_> {
                         });
                 self.max_bank = self.max_bank.max(bank);
             }
-            "ORG" => {
-                let addr = self.value(operand)? as usize;
-                if addr > 65535 {
-                    return Err("ORG out of range".into());
-                }
-                self.position.page = addr >> 13;
-                self.position.offset = addr & 8191;
-                if self.section == 0 && addr > 255 {
-                    return Err("Zero page ORG out of range".into());
-                }
-                if self.section == 1 && addr > 0x7ff {
-                    return Err("BSS ORG out of range".into());
-                }
-                if !self.frames.is_empty() {
-                    return Err("ORG not allowed inside a procedure".into());
-                }
-            }
             "ZP" | "BSS" | "CODE" | "DATA" => {
                 if !operand.is_empty() {
                     return Err("Unexpected section operand".into());
                 }
                 let section = match op {
-                    "ZP" => 0,
-                    "BSS" => 1,
-                    "CODE" => 2,
-                    _ => 3,
+                    "ZP" => Section::ZeroPage,
+                    "BSS" => Section::Bss,
+                    "CODE" => Section::Code,
+                    _ => Section::Data,
                 };
-                if !self.frames.is_empty() && section != 2 {
+                if !self.frames.is_empty() && section != Section::Code {
                     return Err("Section not allowed in procedure".into());
                 }
                 self.save();
                 self.section = section;
-                let bank = self.section_bank[section];
+                let bank = self.section_bank[section.index()];
                 self.position = self
                     .saved
                     .get(&(section, bank))
@@ -966,7 +976,7 @@ impl Engine<'_> {
                 if name.is_empty() || name.len() > 64 {
                     return Err("Invalid region name".into());
                 }
-                if self.first {
+                if self.pass.is_layout() {
                     let address = self.linear();
                     let r = self.result.regions.entry(name.clone()).or_insert(Region {
                         name,
@@ -987,7 +997,7 @@ impl Engine<'_> {
                 }
             }
             "DB" | "BYTE" | "DW" | "WORD" => {
-                if self.section < 2 {
+                if self.section.is_ram() {
                     return Err("Data emission not allowed in RAM section".into());
                 }
                 let args = source::arguments(operand)?;
@@ -1012,7 +1022,7 @@ impl Engine<'_> {
                         }
                     } else {
                         let n = self.value(&arg)?;
-                        if !self.first
+                        if self.pass.is_emitting()
                             && (if wide {
                                 n > 65535 && n < 0xffff8000
                             } else {
@@ -1046,13 +1056,17 @@ impl Engine<'_> {
                 if count > LIMIT {
                     return Err("Allocation too large".into());
                 }
-                if self.section < 2 {
-                    let limit = if self.section == 0 { 256 } else { 2048 };
+                if self.section.is_ram() {
+                    let limit = if self.section == Section::ZeroPage {
+                        256
+                    } else {
+                        2048
+                    };
                     if self.position.offset + count > limit {
                         return Err("RAM allocation out of range".into());
                     }
                     self.position.offset += count;
-                    if self.section == 1 {
+                    if self.section == Section::Bss {
                         self.max_bss = self.max_bss.max(self.position.offset);
                     }
                     self.save();
@@ -1088,24 +1102,37 @@ impl Engine<'_> {
                 if !self.result.dependencies.contains(&path) {
                     self.result.dependencies.push(path.clone());
                 }
-                let data = fs::read(&path).map_err(|e| e.to_string())?;
+                let mut file = fs::File::open(&path).map_err(|e| e.to_string())?;
+                let length = file.metadata().map_err(|e| e.to_string())?.len();
                 let offset = if args.len() > 1 {
-                    self.value(&args[1])? as usize
+                    u64::from(self.value(&args[1])?)
                 } else {
                     0
                 };
                 let size = if args.len() > 2 {
-                    self.value(&args[2])? as usize
+                    u64::from(self.value(&args[2])?)
                 } else {
-                    data.len()
+                    length
                         .checked_sub(offset)
                         .ok_or("INCBIN offset out of range")?
                 };
                 let end = offset.checked_add(size).ok_or("INCBIN range overflow")?;
-                bytes = data
-                    .get(offset..end)
-                    .ok_or("INCBIN range out of bounds")?
-                    .to_vec();
+                if end > length {
+                    return Err("INCBIN range out of bounds".into());
+                }
+                let available = if self.frames.is_empty() {
+                    LIMIT.checked_sub(self.linear())
+                } else {
+                    BANK_SIZE.checked_sub(self.position.offset)
+                }
+                .ok_or("ROM limit exceeded")?;
+                if size > available as u64 {
+                    return Err("ROM limit exceeded".into());
+                }
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| e.to_string())?;
+                bytes = vec![0; size as usize];
+                file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
                 let page = (self.position.page + (self.position.offset + bytes.len()) / 8192) & 7;
                 self.emit_buffer(&bytes)?;
                 self.position.page = page;
@@ -1119,7 +1146,7 @@ impl Engine<'_> {
                 for (row, arg) in rows.iter_mut().zip(args) {
                     *row = self.value(&arg)?;
                 }
-                bytes = image::packed_tile(rows, !self.first)?;
+                bytes = image::packed_tile(rows, self.pass.is_emitting())?;
                 self.emit_buffer(&bytes)?;
             }
             "INCCHR" => {
@@ -1213,14 +1240,14 @@ impl Engine<'_> {
                 self.emit(&bytes)?;
             }
             _ => {
-                if self.section < 2 {
+                if self.section.is_ram() {
                     return Err("Instruction not allowed in RAM section".into());
                 }
                 bytes = self.instruction(op, operand)?;
                 self.emit(&bytes)?;
             }
         }
-        if !self.first
+        if self.pass.is_emitting()
             && self.warn
             && !self.request.options.warning_disabled
             && ["INCBIN", "INCCHR"].contains(&op)
@@ -1229,7 +1256,7 @@ impl Engine<'_> {
             let overflow = (self.position.bank - line_start_bank - 1) * 8192 + self.position.offset;
             if overflow > 0 {
                 self.result.diagnostics.push(Diagnostic {
-                    severity: "warning".into(),
+                    severity: Severity::Warning,
                     code: "W_BANK_OVERFLOW".into(),
                     message: format!("Bank overflow by {overflow} bytes"),
                     location: line.location.clone(),
@@ -1238,10 +1265,10 @@ impl Engine<'_> {
             }
         }
         if ["DB", "BYTE", "DW", "WORD", "INCBIN", "INCCHR"].contains(&op) {
-            let kind = if ["DB", "BYTE", "DW", "WORD"].contains(&op) {
-                "DB"
-            } else {
-                op
+            let kind = match op {
+                "INCBIN" => DataType::Binary,
+                "INCCHR" => DataType::Characters,
+                _ => DataType::Bytes,
             };
             let amount = if self.position.offset >= start {
                 self.position.offset - start
@@ -1251,11 +1278,11 @@ impl Engine<'_> {
             if let Some(key) = key {
                 if let Some(s) = self.result.symbols.get_mut(&key) {
                     s.size = amount;
-                    s.data_type = Some(kind.into());
+                    s.data_type = Some(kind);
                 }
-                self.last_data = Some((key, kind.into()));
+                self.last_data = Some((key, kind));
             } else if let Some((name, previous)) = &self.last_data
-                && previous == kind
+                && *previous == kind
                 && let Some(s) = self.result.symbols.get_mut(name)
             {
                 s.size += amount;
@@ -1268,7 +1295,7 @@ impl Engine<'_> {
     fn save(&mut self) {
         self.saved
             .insert((self.section, self.position.bank), self.position.clone());
-        self.section_bank[self.section] = self.position.bank;
+        self.section_bank[self.section.index()] = self.position.bank;
     }
     fn emit(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.emit_impl(bytes, false)
@@ -1277,7 +1304,7 @@ impl Engine<'_> {
         self.emit_impl(bytes, true)
     }
     fn emit_impl(&mut self, bytes: &[u8], buffer: bool) -> Result<(), String> {
-        if self.section < 2 {
+        if self.section.is_ram() {
             return Err("Data emission not allowed in RAM section".into());
         }
         let mut pos = self.position.clone();
@@ -1297,15 +1324,15 @@ impl Engine<'_> {
                 pos.offset = 0;
             }
             let address = pos.bank * BANK_SIZE + pos.offset;
-            if address >= LIMIT && !self.first {
+            if address >= LIMIT && self.pass.is_emitting() {
                 return Err("ROM limit exceeded".into());
             }
             if pos.bank < 128 {
                 self.max_bank = self.max_bank.max(pos.bank);
             }
-            if !self.first {
+            if self.pass.is_emitting() {
                 self.result.binary[address] = *byte;
-                self.result.map[address] = self.section as u8 + ((pos.page as u8) << 5);
+                self.result.map[address] = self.section.map_byte(pos.page);
                 self.occupied[address] = true;
             }
             pos.offset += 1;
@@ -1335,7 +1362,7 @@ impl Engine<'_> {
         if let Some(code) = opcode::opcode(name, Mode::Rel) {
             let value = self.value(operand)?;
             let delta = value.wrapping_sub(self.pc() + 2) as i32;
-            if !self.first && !(-128..=127).contains(&delta) {
+            if self.pass.is_emitting() && !(-128..=127).contains(&delta) {
                 return Err("Branch address out of range".into());
             }
             return Ok(vec![code, delta as u8]);
@@ -1452,7 +1479,7 @@ impl Engine<'_> {
                 }
             }
         }
-        if !self.first
+        if self.pass.is_emitting()
             && (if wide {
                 value > 65535
             } else if mode == Mode::Imm {
@@ -1483,7 +1510,7 @@ impl Engine<'_> {
         line: &Line,
         group: bool,
     ) -> Result<Vec<u8>, String> {
-        if self.section != 2 {
+        if self.section != Section::Code {
             return Err("Procedure requires CODE section".into());
         }
         if !self.frames.is_empty() && (group || !self.frames.last().unwrap().group) {
@@ -1499,7 +1526,7 @@ impl Engine<'_> {
             return Err("Invalid procedure name".into());
         }
         let saved = self.position.clone();
-        if self.first {
+        if self.pass.is_layout() {
             if self.procedures.iter().any(|p| p.name == name) {
                 return Err("Duplicate procedure".into());
             }
@@ -1513,7 +1540,7 @@ impl Engine<'_> {
                 name: name.clone(),
                 base,
                 org: base,
-                bank: 0xf1,
+                bank: PROCEDURE_BANK,
                 size: 0,
                 group: parent,
             });
@@ -1543,7 +1570,7 @@ impl Engine<'_> {
             return Err("Mismatched procedure end".into());
         }
         let end = self.position.offset;
-        if self.first {
+        if self.pass.is_layout() {
             let p = self
                 .procedures
                 .iter_mut()
@@ -1614,7 +1641,7 @@ impl Engine<'_> {
         self.reserve("_call_bank", (bank + 1) as u32);
     }
     fn call(&mut self, name: &str) -> Result<Vec<u8>, String> {
-        if self.first {
+        if self.pass.is_layout() {
             return Ok(vec![0x20, 0, 0]);
         }
         let target = if let Some(p) = self.procedures.iter().find(|p| p.name == name).cloned() {
@@ -1660,7 +1687,7 @@ impl Engine<'_> {
                 ];
                 for (i, b) in stub.iter().enumerate() {
                     self.result.binary[bank * 8192 + offset + i] = *b;
-                    self.result.map[bank * 8192 + offset + i] = 0x82;
+                    self.result.map[bank * 8192 + offset + i] = Section::Code.map_byte(4);
                     self.occupied[bank * 8192 + offset + i] = true;
                 }
                 self.call_bytes.extend(stub);
