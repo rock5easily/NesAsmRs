@@ -1,0 +1,11 @@
+[package]
+name = "nesasm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+encoding_rs.workspace = true
+schemars.workspace = true

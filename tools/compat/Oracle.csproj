@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>NesAsmOracle</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Compile Include="../../Assembler/**/*.cs" Exclude="../../Assembler/obj/**;../../Assembler/bin/**;../../Assembler/Properties/**" />
+    <Compile Include="Oracle.cs" />
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+</Project>

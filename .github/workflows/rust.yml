@@ -1,0 +1,53 @@
+name: Rust build, test and compatibility
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nesasm-${{ matrix.os }}
+          path: |
+            target/release/nesasm
+            target/release/nesasm.exe
+            target/release/nesasm-mcp
+            target/release/nesasm-mcp.exe
+          if-no-files-found: error
+  compatibility:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: dotnet build tools/compat/Oracle.csproj --configuration Release
+      - run: cargo build --workspace --locked
+      - run: python tools/compat/compare.py --oracle tools/compat/bin/Release/net48/NesAsmOracle.exe --rust target/debug/nesasm.exe
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: compatibility-results
+          path: target/compat/cases

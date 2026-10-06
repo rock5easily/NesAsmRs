@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/nesasm-core", "crates/nesasm-cli", "crates/nesasm-mcp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+nesasm-core = { path = "crates/nesasm-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+schemars = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process", "sync"] }
+rmcp = { version = "3", features = ["server", "client", "transport-io", "transport-child-process"] }
