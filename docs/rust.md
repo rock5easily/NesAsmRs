@@ -1,5 +1,7 @@
 # Rust版の構成と検証
 
+型の関係と処理の流れは [Rust版のUML図](rust-uml.md) を参照してください。
+
 ## 構成
 
 Cargo workspaceは以下の3クレートで構成します。
