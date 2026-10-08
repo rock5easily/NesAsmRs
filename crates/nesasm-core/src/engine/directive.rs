@@ -5,12 +5,7 @@ use crate::error::{AsmError, AsmResult};
 use crate::source::{self, Line};
 use crate::state::{BANK_SIZE, BSS_LIMIT, MAX_BANKS, PCX_LIMIT, ROM_LIMIT, Section, ZP_LIMIT};
 use crate::{DataType, Diagnostic, DiagnosticCode, Region, Severity, SourceEncoding, image};
-use std::{
-    fs,
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-    rc::Rc,
-};
+use std::{path::Path, rc::Rc};
 
 /// Directive names after upper-casing and removing a leading dot; aliases
 /// (`DB`/`BYTE`, `MACRO`/`MAC`, ...) map to one variant.
@@ -649,9 +644,9 @@ impl Engine<'_> {
             return Err("INCBIN expects file[, offset[, size]]".into());
         }
         let name = source::quoted(&args[0])?;
-        let path = source::find_file(self.request, Path::new(&name))?;
+        let path = self.files.find(self.request, Path::new(&name))?;
         self.depend(&path);
-        let length = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        let length = self.files.len(&path)?;
         let offset = match args.get(1) {
             Some(offset) => u64::from(self.value(offset)?),
             None => 0,
@@ -680,12 +675,7 @@ impl Engine<'_> {
         }
         let size = size as usize;
         let bytes = if self.pass.is_emitting() {
-            let mut file = fs::File::open(&path).map_err(|e| e.to_string())?;
-            file.seek(SeekFrom::Start(offset))
-                .map_err(|e| e.to_string())?;
-            let mut bytes = vec![0; size];
-            file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
-            bytes
+            self.files.read_range(&path, offset, size)?
         } else {
             Vec::new()
         };
@@ -710,7 +700,7 @@ impl Engine<'_> {
             return Err("INCCHR expects a PCX file".into());
         }
         let name = source::quoted(&args[0])?;
-        let path = source::find_file(self.request, Path::new(&name))?;
+        let path = self.files.find(self.request, Path::new(&name))?;
         self.depend(&path);
         let nums = args[1..]
             .iter()
@@ -720,10 +710,7 @@ impl Engine<'_> {
         if let Some(tiles) = self.cache.tiles.get(&key) {
             return Ok(Rc::clone(tiles));
         }
-        let mut data = Vec::new();
-        fs::File::open(&key.0)
-            .and_then(|f| f.take(PCX_LIMIT + 1).read_to_end(&mut data))
-            .map_err(|e| e.to_string())?;
+        let data = self.files.read(&key.0, PCX_LIMIT)?;
         if data.len() as u64 > PCX_LIMIT {
             return Err("PCX file is too large".into());
         }

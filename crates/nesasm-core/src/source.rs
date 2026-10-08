@@ -1,7 +1,8 @@
 use crate::{AssembleRequest, SourceEncoding, SourceLocation};
 use std::{
+    collections::HashMap,
     fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     rc::Rc,
 };
@@ -89,43 +90,116 @@ pub(crate) fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub(crate) fn find_file(request: &AssembleRequest, name: &Path) -> Result<PathBuf, String> {
-    let mut bases = vec![request.working_directory.clone()];
-    bases.extend(request.include_paths.iter().map(|p| {
-        if p.is_absolute() {
-            p.clone()
-        } else {
-            request.working_directory.join(p)
+/// Input files: the request's in-memory files, which take precedence, and
+/// the file system.
+pub(crate) struct Files {
+    /// In-memory files by resolved path.
+    memory: HashMap<PathBuf, Rc<[u8]>>,
+}
+
+impl Files {
+    /// Resolves the in-memory file names like other paths of the request:
+    /// relative to the working directory and within the allowed root.
+    pub fn new(request: &AssembleRequest) -> Result<Self, String> {
+        let mut memory = HashMap::new();
+        for (name, data) in &request.files {
+            let path = resolve_path(
+                name,
+                &request.working_directory,
+                request.allowed_root.as_deref(),
+            )
+            .map_err(|e| format!("In-memory file '{}': {e}", name.display()))?;
+            memory.insert(path, Rc::from(data.as_slice()));
         }
-    }));
-    // A base that rejects the path does not stop the search; report it only
-    // when no other base provides the file.
-    let mut rejected = None;
-    for base in bases {
-        match resolve_path(name, &base, request.allowed_root.as_deref()) {
-            Ok(candidate) if candidate.is_file() => return Ok(candidate),
-            Ok(_) => {}
-            Err(e) => {
-                rejected.get_or_insert(e);
+        Ok(Self { memory })
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.memory.contains_key(path) || path.is_file()
+    }
+
+    /// Finds `name` in the working directory, then in the include paths.
+    pub fn find(&self, request: &AssembleRequest, name: &Path) -> Result<PathBuf, String> {
+        let mut bases = vec![request.working_directory.clone()];
+        bases.extend(request.include_paths.iter().map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                request.working_directory.join(p)
+            }
+        }));
+        // A base that rejects the path does not stop the search; report it only
+        // when no other base provides the file.
+        let mut rejected = None;
+        for base in bases {
+            match resolve_path(name, &base, request.allowed_root.as_deref()) {
+                Ok(candidate) if self.exists(&candidate) => return Ok(candidate),
+                Ok(_) => {}
+                Err(e) => {
+                    rejected.get_or_insert(e);
+                }
+            }
+            if name.is_absolute() {
+                break;
             }
         }
-        if name.is_absolute() {
-            break;
+        Err(rejected.unwrap_or_else(|| format!("Cannot open file '{}'", name.display())))
+    }
+
+    pub fn len(&self, path: &Path) -> Result<u64, String> {
+        match self.memory.get(path) {
+            Some(data) => Ok(data.len() as u64),
+            None => Ok(fs::metadata(path).map_err(|e| e.to_string())?.len()),
         }
     }
-    Err(rejected.unwrap_or_else(|| format!("Cannot open file '{}'", name.display())))
+
+    /// Reads at most `limit` bytes; a longer file returns `limit + 1` bytes so
+    /// the caller can report it as too large.
+    pub fn read(&self, path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+        if let Some(data) = self.memory.get(path) {
+            let end = data.len().min(
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1),
+            );
+            return Ok(data[..end].to_vec());
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .map_err(|e| e.to_string())?
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+
+    /// Reads `size` bytes at `offset`; the range must lie within the file.
+    pub fn read_range(&self, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+        if let Some(data) = self.memory.get(path) {
+            let start = usize::try_from(offset).map_err(|_| "Range out of bounds")?;
+            return data
+                .get(start..start + size)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "Range out of bounds".into());
+        }
+        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = vec![0; size];
+        file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
 }
 
 /// Reads and decodes a source file, joining `\` continuation lines.
-pub(crate) fn read_source(request: &AssembleRequest, path: &Path) -> Result<SourceText, String> {
-    const SOURCE_LIMIT: usize = 1024 * 1024;
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take((SOURCE_LIMIT + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > SOURCE_LIMIT {
+pub(crate) fn read_source(
+    request: &AssembleRequest,
+    files: &Files,
+    path: &Path,
+) -> Result<SourceText, String> {
+    const SOURCE_LIMIT: u64 = 1024 * 1024;
+    let bytes = files.read(path, SOURCE_LIMIT)?;
+    if bytes.len() as u64 > SOURCE_LIMIT {
         return Err("Source exceeds 1 MiB".into());
     }
     let text = match request.options.encoding {

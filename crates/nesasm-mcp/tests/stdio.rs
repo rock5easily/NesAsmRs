@@ -127,7 +127,7 @@ fn stdio_lifecycle_validation_build_and_recovery() {
     let mut c = Client::start();
     let listed = c.request("tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 3);
+    assert_eq!(tools.len(), 4);
     for tool in tools {
         assert!(tool["inputSchema"].is_object());
         assert!(tool["outputSchema"].is_object());
@@ -167,6 +167,7 @@ fn stdio_lifecycle_validation_build_and_recovery() {
         include_paths: vec![],
         allowed_root: Some(c.root.clone()),
         options: Default::default(),
+        ..Default::default()
     };
     let core = nesasm_core::assemble(&request);
     assert_eq!(&bytes[16..], &core.binary);
@@ -393,4 +394,125 @@ fn reference_documents_are_resources() {
     }
     let templates = c.request("resources/templates/list", json!({}));
     assert_eq!(templates["result"]["resourceTemplates"], json!([]));
+}
+
+const PROGRAM: &str = concat!(
+    "  .inesprg 1\n  .ineschr 0\n",
+    "  .bank 1\n  .org $E000\nReset:\n  .include \"lib.asm\"\n",
+    "  lda #$12\n  sta <$10\n  bne Reset\nNmi: rti\n",
+    "  .org $FFFA\n  .dw Nmi, Reset, 0\n",
+);
+
+#[test]
+fn in_memory_sources_and_line_map() {
+    let mut c = Client::start();
+    let r = c.call(
+        "check",
+        json!({
+            "input":"main.asm",
+            "sources":{"main.asm":PROGRAM,"lib.asm":"Init:\n  sei\n"},
+            "lines":{"file":"main.asm","from_line":7,"to_line":9}
+        }),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let page = &r["structuredContent"]["lines"];
+    assert_eq!(page["total"], 3, "{page}");
+    let first = &page["lines"][0];
+    assert_eq!(first["file"], "main.asm");
+    assert_eq!(
+        (first["line"].as_u64(), first["bank"].as_u64()),
+        (Some(7), Some(1))
+    );
+    assert_eq!(first["address"], 0xe001);
+    assert_eq!(first["bytes"], "A9 12");
+    // Paging and address filters.
+    let r = c.call(
+        "check",
+        json!({"input":"main.asm","sources":{"main.asm":PROGRAM,"lib.asm":"  sei\n"},
+               "lines":{"bank":1,"from_address":0xe000,"to_address":0xe003,"offset":1,"limit":1}}),
+    );
+    let page = &r["structuredContent"]["lines"];
+    // Reset:, sei (from lib.asm), lda and sta lie in $E000-$E003 of bank 1.
+    assert_eq!(page["total"], 4, "{page}");
+    assert_eq!(page["lines"].as_array().unwrap().len(), 1);
+    assert_eq!(page["lines"][0]["file"], "lib.asm");
+    // Lines are only returned on request, and in-memory sources are never written.
+    let r = c.call(
+        "check",
+        json!({"input":"main.asm","sources":{"main.asm":"  nop\n"}}),
+    );
+    assert!(r["structuredContent"].get("lines").is_none(), "{r}");
+    assert!(!c.root.join("main.asm").exists());
+    // assemble writes only the ROM, from in-memory sources.
+    let r = c.call(
+        "assemble",
+        json!({"input":"main.asm","sources":{"main.asm":PROGRAM,"lib.asm":"  sei\n"}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(c.root.join("main.nes").is_file());
+    assert!(!c.root.join("main.asm").exists());
+    let r = c.call(
+        "check",
+        json!({"input":"main.asm","sources":{"../escape.asm":"  nop\n"}}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+}
+
+#[test]
+fn inspect_rom_reports_header_vectors_and_code() {
+    let mut c = Client::start();
+    let project =
+        json!({"input":"main.asm","sources":{"main.asm":PROGRAM,"lib.asm":"Init:\n  sei\n"}});
+    let r = c.call(
+        "inspect_rom",
+        json!({"project":project,
+               "disassemble":{"bank":1,"address":0xe000,"length":5},
+               "hexdump":{"bank":1,"address":0xfffa,"length":6}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["header"]["prg_16k"], 1);
+    assert_eq!(report["vectors"][0]["reset"], 0xe000);
+    assert_eq!(report["warnings"], json!([]), "{report}");
+    let code = report["disassembly"].as_array().unwrap();
+    assert_eq!(code[0]["instruction"], "SEI");
+    assert_eq!(code[0]["labels"], json!(["Init", "Reset"]));
+    assert_eq!(code[3]["instruction"], "BNE $E000");
+    assert_eq!(report["hexdump"][0]["bytes"], "07 E0 00 E0 00 00");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("RESET $E000") && text.contains("E001  A9 12"),
+        "{text}"
+    );
+    // The ROM file written by assemble gives the same vectors, without symbols.
+    c.call("assemble", json!(project));
+    let r = c.call(
+        "inspect_rom",
+        json!({"rom":"main.nes","disassemble":{"bank":1,"address":0xe000,"length":1}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["vectors"][0]["reset"], 0xe000);
+    assert_eq!(
+        r["structuredContent"]["disassembly"][0]["labels"],
+        json!([])
+    );
+    // Problems are reported, not raised.
+    let broken =
+        json!({"input":"main.asm","sources":{"main.asm":"  .inesprg 1\n  .org $C000\n  nop\n"}});
+    let r = c.call("inspect_rom", json!({"project":broken}));
+    let warnings = r["structuredContent"]["warnings"].to_string();
+    assert!(
+        warnings.contains("RESET") || warnings.contains("vectors"),
+        "{r}"
+    );
+    for bad in [
+        json!({}),
+        json!({"rom":"main.nes","project":project}),
+        json!({"rom":"../outside.nes"}),
+        json!({"rom":"main.nes","hexdump":{"bank":9,"address":0}}),
+        json!({"project":{"input":"main.asm","sources":{"main.asm":"  lda #300\n"}}}),
+    ] {
+        let r = c.call("inspect_rom", bad.clone());
+        assert_eq!(r["isError"], true, "{bad}: {r}");
+    }
 }

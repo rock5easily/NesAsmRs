@@ -2,6 +2,7 @@ mod engine;
 mod error;
 mod expr;
 mod image;
+pub mod inspect;
 mod opcode;
 mod output;
 mod source;
@@ -124,7 +125,7 @@ impl Default for AssembleOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct AssembleRequest {
     pub input: PathBuf,
     pub working_directory: PathBuf,
@@ -132,6 +133,46 @@ pub struct AssembleRequest {
     /// When present, every dependency must resolve within this canonical root.
     pub allowed_root: Option<PathBuf>,
     pub options: AssembleOptions,
+    /// In-memory files (sources or data) that take precedence over the file
+    /// system, by path relative to `working_directory`. Source text must be
+    /// in `options.encoding`; see [`encode_source`].
+    pub files: BTreeMap<PathBuf, Vec<u8>>,
+    /// Record every assembled line in [`AssembleResult::lines`].
+    pub collect_lines: bool,
+}
+
+/// Encodes source text for [`AssembleRequest::files`].
+pub fn encode_source(text: &str, encoding: &SourceEncoding) -> Result<Vec<u8>, String> {
+    match encoding {
+        SourceEncoding::Utf8 => Ok(text.as_bytes().to_vec()),
+        SourceEncoding::Sjis => {
+            let (bytes, _, unmappable) = encoding_rs::SHIFT_JIS.encode(text);
+            if unmappable {
+                Err("Source cannot be encoded as SJIS".into())
+            } else {
+                Ok(bytes.into_owned())
+            }
+        }
+    }
+}
+
+/// One assembled line: where it came from, where it was placed and what it
+/// produced. Recorded when [`AssembleRequest::collect_lines`] is set.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct LineRecord {
+    pub location: SourceLocation,
+    /// For lines expanded from a macro, the line of the macro call.
+    pub called_from: Option<SourceLocation>,
+    /// ROM bank; `None` in the ZP and BSS sections.
+    pub bank: Option<u8>,
+    /// CPU address before the line.
+    pub address: u32,
+    /// Bytes produced (the first 64 for larger INCBIN, INCCHR and DS data).
+    pub bytes: Vec<u8>,
+    /// Number of bytes produced.
+    pub size: usize,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,6 +461,9 @@ pub struct AssembleResult {
     pub dependencies: Vec<PathBuf>,
     pub listing: Option<String>,
     pub srec: Option<String>,
+    /// Assembled lines in order, when requested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<LineRecord>,
 }
 
 impl AssembleResult {

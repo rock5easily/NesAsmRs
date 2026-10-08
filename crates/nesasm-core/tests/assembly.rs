@@ -18,6 +18,7 @@ impl Temp {
             include_paths: vec![],
             allowed_root: Some(self.0.clone()),
             options,
+            ..Default::default()
         })
     }
 }
@@ -28,6 +29,7 @@ fn fixture(path: &Path) -> AssembleResult {
         include_paths: vec![],
         allowed_root: None,
         options: AssembleOptions::default(),
+        ..Default::default()
     })
 }
 
@@ -257,6 +259,7 @@ fn explicit_sjis_and_invalid_utf8() {
         include_paths: vec![],
         allowed_root: None,
         options: AssembleOptions::default(),
+        ..Default::default()
     };
     assert!(!nesasm_core::assemble(&request).success);
     request.options.encoding = SourceEncoding::Sjis;
@@ -599,6 +602,7 @@ fn resource_limits_and_cancellation() {
         include_paths: vec![],
         allowed_root: Some(t.0.clone()),
         options: AssembleOptions::default(),
+        ..Default::default()
     };
     let r = nesasm_core::assemble_with_cancel(&request, &std::sync::atomic::AtomicBool::new(true));
     assert!(!r.success);
@@ -833,6 +837,7 @@ fn include_search_continues_past_rejected_directories() {
         include_paths: vec!["..".into(), "inc".into()],
         allowed_root: Some(t.0.clone()),
         options: AssembleOptions::default(),
+        ..Default::default()
     };
     let r = nesasm_core::assemble(&request);
     assert!(r.success, "{:?}", r.diagnostics);
@@ -1061,6 +1066,7 @@ fn junction_escape_is_rejected() {
         include_paths: vec![],
         allowed_root: None,
         options: AssembleOptions::default(),
+        ..Default::default()
     });
     assert!(ok.success, "without a root the junction is followed");
 }
@@ -1082,7 +1088,153 @@ fn db_strings_keep_source_encoding_bytes() {
             encoding: SourceEncoding::Sjis,
             ..AssembleOptions::default()
         },
+        ..Default::default()
     });
     assert!(r.success, "{:?}", r.diagnostics);
     assert_eq!(&r.binary[..5], &[0x61, 0x82, 0xa0, b'"', 1]);
+}
+
+fn memory_request(t: &Temp, files: &[(&str, &[u8])]) -> AssembleRequest {
+    AssembleRequest {
+        input: "main.asm".into(),
+        working_directory: t.0.clone(),
+        allowed_root: Some(t.0.clone()),
+        files: files
+            .iter()
+            .map(|(name, data)| (PathBuf::from(name), data.to_vec()))
+            .collect(),
+        collect_lines: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn in_memory_files_take_precedence_and_stay_in_the_root() {
+    let t = Temp::new();
+    fs::write(t.0.join("main.asm"), "  .db 1\n").unwrap();
+    fs::write(t.0.join("disk.bin"), [9, 9]).unwrap();
+    let request = memory_request(
+        &t,
+        &[
+            (
+                "main.asm",
+                b"  .include \"inc/part.asm\"\n  .incbin \"data.bin\"\n  .incbin \"disk.bin\"\n",
+            ),
+            ("inc/part.asm", b"  .db 2\n"),
+            ("data.bin", &[3, 4]),
+        ],
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..5], &[2, 3, 4, 9, 9]);
+    assert!(r.dependencies.iter().any(|d| d.ends_with("part.asm")));
+    // Nothing is written for in-memory files.
+    assert!(!t.0.join("inc").exists());
+    for name in ["../outside.asm", "/abs/main.asm"] {
+        let mut request = memory_request(&t, &[("main.asm", b"  nop\n")]);
+        request.files.insert(name.into(), b"  nop\n".to_vec());
+        let r = nesasm_core::assemble(&request);
+        assert!(!r.success, "{name}");
+        assert!(
+            r.diagnostics[0].message.contains("In-memory file"),
+            "{:?}",
+            r.diagnostics
+        );
+    }
+}
+
+#[test]
+fn line_records_map_sources_to_addresses_and_bytes() {
+    let t = Temp::new();
+    let request = memory_request(
+        &t,
+        &[
+            (
+                "main.asm",
+                b"emit .macro\n  lda #\\1\n  .endm\n  .zp\nvar: .ds 1\n  .code\n  .bank 0\n  .org $C000\nStart:\n  emit 5\n  .incbin \"big.bin\"\n",
+            ),
+            ("big.bin", &[7; 100]),
+        ],
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    let by_text = |text: &str| r.lines.iter().find(|l| l.text.trim() == text).unwrap();
+    let var = by_text("var: .ds 1");
+    assert_eq!((var.bank, var.address), (None, 0));
+    let start = by_text("Start:");
+    assert_eq!(
+        (start.bank, start.address, start.size),
+        (Some(0), 0xc000, 0)
+    );
+    let lda = by_text("lda #5");
+    assert_eq!(
+        (lda.location.line, lda.address, lda.bytes.as_slice()),
+        (2, 0xc000, &[0xa9, 5][..])
+    );
+    assert_eq!(lda.called_from.as_ref().unwrap().line, 10);
+    let incbin = by_text(".incbin \"big.bin\"");
+    assert_eq!((incbin.size, incbin.bytes.len()), (100, 64));
+    // Not collected unless requested.
+    let mut request = request.clone();
+    request.collect_lines = false;
+    assert!(nesasm_core::assemble(&request).lines.is_empty());
+}
+
+#[test]
+fn rom_inspection_decodes_header_vectors_and_code() {
+    use nesasm_core::inspect::{Mirroring, Rom};
+    let t = Temp::new();
+    let r = t.run(
+        concat!(
+            "  .inesprg 1\n  .ineschr 1\n  .inesmap 1\n  .inesmir 1\n",
+            "  .zp\nptr: .ds 2\n  .code\n",
+            "  .bank 1\n  .org $E000\nReset:\n  lda [ptr],y\n  jmp Reset\n  .db $02\n",
+            "Nmi: rti\n  .org $FFFA\n  .dw Nmi, Reset, 0\n",
+            // CHR ROM: the bank after the two PRG banks.
+            "  .bank 2\n  .org $0000\n  .db 0\n",
+        ),
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let rom = Rom::from_assembly(&r);
+    let header = rom.header.as_ref().unwrap();
+    assert_eq!(
+        (
+            header.prg_16k,
+            header.chr_8k,
+            header.mapper,
+            header.mirroring
+        ),
+        (1, 1, 1, Mirroring::Vertical)
+    );
+    assert_eq!(rom.bank_count(), 3);
+    let vectors = rom.vectors();
+    assert_eq!(
+        (vectors[0].bank, vectors[0].reset, vectors[0].nmi),
+        (1, 0xe000, 0xe006)
+    );
+    assert!(rom.warnings().is_empty(), "{:?}", rom.warnings());
+    let code = rom.disassemble(1, 0xe000, 4, &r.symbols).unwrap();
+    let text: Vec<&str> = code.iter().map(|l| l.instruction.as_str()).collect();
+    assert_eq!(text, ["LDA [$00],Y", "JMP $E000", ".db $02", "RTI"]);
+    assert_eq!(code[0].labels, ["Reset"]);
+    assert_eq!(code[0].operand_symbols, ["ptr"]);
+    assert_eq!(code[1].operand_symbols, ["Reset"]);
+    assert_eq!(code[3].labels, ["Nmi"]);
+    let dump = rom.hexdump(1, 0xfffa, 6).unwrap();
+    assert_eq!(dump[0].bytes, "06 E0 00 E0 00 00");
+    assert!(rom.disassemble(9, 0x8000, 1, &r.symbols).is_err());
+    // The same ROM read back from a .nes file.
+    let mut file = r.header.clone();
+    file.extend(&r.binary);
+    let from_file = Rom::from_file(&file).unwrap();
+    assert_eq!(from_file.vectors()[0].reset, 0xe000);
+    // A raw payload without header, and a header that does not match the data.
+    assert!(Rom::from_file(&r.binary).unwrap().header.is_none());
+    let short = Rom::from_file(&file[..16 + 8192]).unwrap();
+    assert!(
+        short.warnings().iter().any(|w| w.contains("declares")),
+        "{:?}",
+        short.warnings()
+    );
 }

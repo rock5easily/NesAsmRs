@@ -159,6 +159,7 @@ fn matches_recorded_csharp_results() {
             include_paths: vec![],
             allowed_root: None,
             options: options(case["flags"].as_array().unwrap()),
+            ..Default::default()
         };
         let result = nesasm_core::assemble(&request);
         if let Err(e) = check(name, &result, &request.input, &case["expected"]) {

@@ -508,6 +508,7 @@ classDiagram
         -execute(input, write, output)
         -assemble(input)
         -check(input)
+        -inspect_rom(input)
         -get_reference(input)
         list_resources()
         read_resource(uri)

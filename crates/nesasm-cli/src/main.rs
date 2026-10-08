@@ -105,6 +105,7 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
             include_paths: includes,
             allowed_root: None,
             options,
+            ..Default::default()
         },
         output,
         json,

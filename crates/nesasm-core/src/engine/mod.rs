@@ -11,14 +11,14 @@ mod procedure;
 mod rom;
 
 use crate::error::AsmResult;
-use crate::source::{self, Line, SourceText};
+use crate::source::{self, Files, Line, SourceText};
 use crate::state::{
     BANK_SIZE, BSS_START, MAX_BANKS, MAX_NESTING, PROCEDURE_BANK, Pass, START_PAGE, STEP_LIMIT,
     Section,
 };
 use crate::{
-    AssembleRequest, AssembleResult, BankRef, DataType, Diagnostic, DiagnosticCode, RamUsage,
-    Severity, SourceLocation, Symbol, expr,
+    AssembleRequest, AssembleResult, BankRef, DataType, Diagnostic, DiagnosticCode, LineRecord,
+    RamUsage, Severity, SourceLocation, Symbol, expr,
 };
 use conditional::Conditions;
 use directive::Directive;
@@ -116,6 +116,7 @@ struct Engine<'a> {
     macros: Macros,
     conditions: Conditions,
     cache: SourceCache,
+    files: Files,
 }
 
 pub fn assemble(request: &AssembleRequest) -> AssembleResult {
@@ -125,7 +126,19 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
 /// Assembles like [`assemble`], stopping with an `E_CANCELLED` error once
 /// `cancel` is set. The flag is checked before each source line.
 pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> AssembleResult {
-    let mut engine = Engine::new(request, cancel);
+    let files = match Files::new(request) {
+        Ok(files) => files,
+        Err(e) => {
+            let mut result = AssembleResult::default();
+            result.push_error(Diagnostic::error(
+                DiagnosticCode::Io,
+                e,
+                SourceLocation::file(&request.input),
+            ));
+            return result;
+        }
+    };
+    let mut engine = Engine::new(request, cancel, files);
     let location = SourceLocation::file(&request.input);
     for (name, value) in [
         ("MAGICKIT", 1),
@@ -138,7 +151,7 @@ pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> A
     ] {
         engine.reserve(name, value);
     }
-    let path = match source::find_file(request, &request.input) {
+    let path = match engine.files.find(request, &request.input) {
         Ok(p) => p,
         Err(e) => {
             engine.error_at(&location, &[], DiagnosticCode::Io, &e);
@@ -184,7 +197,7 @@ pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> A
 }
 
 impl<'a> Engine<'a> {
-    fn new(request: &'a AssembleRequest, cancel: &'a AtomicBool) -> Self {
+    fn new(request: &'a AssembleRequest, cancel: &'a AtomicBool, files: Files) -> Self {
         Self {
             request,
             cancel,
@@ -216,6 +229,7 @@ impl<'a> Engine<'a> {
             macros: Macros::default(),
             conditions: Conditions::default(),
             cache: SourceCache::default(),
+            files,
         }
     }
 
@@ -336,7 +350,7 @@ impl<'a> Engine<'a> {
             self.result.dependencies.push(path.into());
         }
         if !self.cache.sources.contains_key(path) {
-            let text = source::read_source(self.request, path)?;
+            let text = source::read_source(self.request, &self.files, path)?;
             self.cache
                 .sources
                 .insert(path.into(), (Rc::from(path), text));
@@ -577,6 +591,7 @@ impl<'a> Engine<'a> {
         directive: Option<Directive>,
     ) -> bool {
         let start = self.position;
+        let section = self.section;
         let rs_before = self.rs;
         let data = self.execute(statement, directive, line);
         // Keep later addresses stable when an emit-pass line fails: advance by the
@@ -598,6 +613,12 @@ impl<'a> Engine<'a> {
         }
         match data {
             Ok(bytes) => {
+                if self.request.collect_lines
+                    && self.pass.is_emitting()
+                    && (statement.label.is_some() || !statement.op.is_empty())
+                {
+                    self.record_line(line, start, section, &bytes);
+                }
                 if self.listing.shows(self.pass, line)
                     && !matches!(
                         directive,
@@ -621,6 +642,24 @@ impl<'a> Engine<'a> {
                 e.fatal
             }
         }
+    }
+
+    /// Adds `line` to the line map of the result.
+    fn record_line(&mut self, line: &Line, start: Position, section: Section, bytes: &[u8]) {
+        const SHOWN_BYTES: usize = 64;
+        self.result.lines.push(LineRecord {
+            location: line.location(),
+            called_from: line.expanded.then(|| line.trace.last().cloned()).flatten(),
+            bank: if section.is_ram() {
+                None
+            } else {
+                u8::try_from(start.bank).ok()
+            },
+            address: start.pc() as u32,
+            bytes: bytes[..bytes.len().min(SHOWN_BYTES)].to_vec(),
+            size: bytes.len(),
+            text: line.text.clone(),
+        });
     }
 
     fn next_source_line(&mut self, queue: &mut VecDeque<PendingLine>) -> Option<Line> {
@@ -648,7 +687,7 @@ impl<'a> Engine<'a> {
         {
             name.push_str(".asm");
         }
-        let path = source::find_file(self.request, Path::new(&name))?;
+        let path = self.files.find(self.request, Path::new(&name))?;
         let trace = extend_trace(line);
         if trace.len() > MAX_NESTING {
             return Err("Include nesting limit exceeded".into());
