@@ -1,4 +1,5 @@
 use crate::{AssembleOptions, AssembleResult, SourceEncoding, resolve_path};
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::{
@@ -8,7 +9,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     Rom,
@@ -16,7 +18,8 @@ pub enum ArtifactKind {
     Srec,
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Artifact {
     pub kind: ArtifactKind,
     pub path: PathBuf,
@@ -119,7 +122,7 @@ fn check_rooted_output(rom: &Path, root: &Path) -> Result<(), String> {
     if !matches!(extension.as_deref(), Some("nes" | "bin")) {
         return Err("Output file must have a .nes or .bin extension".into());
     }
-    let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let root = crate::source::canonicalize(root)?;
     let relative = rom
         .strip_prefix(&root)
         .map_err(|_| "Path is outside the project root")?;
@@ -195,6 +198,7 @@ impl Drop for StagedArtifact {
 }
 
 pub(crate) fn srec(binary: &[u8], map: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut text = String::new();
     for bank in 0..binary.len() / 8192 {
         let mut pos = bank * 8192;
@@ -213,19 +217,19 @@ pub(crate) fn srec(binary: &[u8], map: &[u8]) -> String {
                 .wrapping_add((start >> 16) as u8)
                 .wrapping_add((start >> 8) as u8)
                 .wrapping_add(start as u8);
-            text.push_str(&format!("S2{count:02X}{start:06X}"));
+            let _ = write!(text, "S2{count:02X}{start:06X}");
             for b in &binary[start..pos] {
                 sum = sum.wrapping_add(*b);
-                text.push_str(&format!("{b:02X}"));
+                let _ = write!(text, "{b:02X}");
             }
-            text.push_str(&format!("{:02X}\n", !sum));
+            let _ = writeln!(text, "{:02X}", !sum);
         }
     }
     let address = ((map[0] >> 5) as usize) << 13;
     let sum = 4u8
         .wrapping_add((address >> 8) as u8)
         .wrapping_add(address as u8);
-    text.push_str(&format!("S804{address:06X}{:02X}", !sum));
+    let _ = write!(text, "S804{address:06X}{:02X}", !sum);
     text
 }
 

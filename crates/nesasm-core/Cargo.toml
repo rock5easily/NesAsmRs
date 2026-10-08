@@ -3,9 +3,17 @@ name = "nesasm-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 encoding_rs.workspace = true
-schemars.workspace = true
+schemars = { workspace = true, optional = true }
+
+[features]
+# JSON schemas for the public types (used by the MCP server).
+schema = ["dep:schemars"]

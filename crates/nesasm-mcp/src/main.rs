@@ -1,11 +1,11 @@
 use nesasm_core::{
-    Artifact, AssembleOptions, AssembleRequest, BankUsage, Diagnostic, Region, SourceLocation,
-    Symbol,
+    Artifact, AssembleOptions, AssembleRequest, BankUsage, Diagnostic, DiagnosticCode,
+    ReferenceTopic, Region, SourceLocation, Symbol,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -27,6 +27,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 struct AssemblyInput {
     /// Entry .asm file, relative to the server project root.
     input: PathBuf,
+    /// Extra directories searched by INCLUDE/INCBIN/INCCHR; must be inside the root.
     #[serde(default)]
     include_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -35,18 +36,23 @@ struct AssemblyInput {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct BuildInput {
+    /// Entry .asm file, relative to the server project root.
     input: PathBuf,
+    /// Extra directories searched by INCLUDE/INCBIN/INCCHR; must be inside the root.
     #[serde(default)]
     include_paths: Vec<PathBuf>,
     #[serde(default)]
     options: AssembleOptions,
-    /// ROM output path within the project root; defaults to input stem + .nes.
+    /// ROM output path within the project root, ending in .nes or .bin and outside
+    /// hidden directories; defaults to input stem + .nes. Listing and S-record
+    /// files use the same stem.
     output: Option<PathBuf>,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReferenceInput {
-    topic: Option<String>,
+    /// Documentation topic (default index).
+    topic: Option<ReferenceTopic>,
 }
 
 #[derive(Default, Serialize, JsonSchema)]
@@ -127,34 +133,14 @@ impl Server {
                 allowed_root: Some(root.clone()),
                 options: input.options,
             };
-            let mut result = nesasm_core::assemble_with_cancel(&request, &worker_cancel);
-            let mut artifacts = Vec::new();
-            if write && result.success {
-                match nesasm_core::write_artifacts(
-                    &result,
-                    &request.input,
-                    output.as_deref(),
-                    &root,
-                    Some(&root),
-                    &request.options,
-                ) {
-                    Ok(written) => artifacts = written,
-                    Err(e) => {
-                        result.success = false;
-                        result.diagnostics.push(Diagnostic {
-                            severity: nesasm_core::Severity::Error,
-                            code: "E_OUTPUT".into(),
-                            message: e,
-                            location: SourceLocation {
-                                file: output.unwrap_or_else(|| request.input.with_extension("nes")),
-                                line: 0,
-                                column: None,
-                            },
-                            expansion_trace: Vec::new(),
-                        });
-                    }
-                }
-            }
+            let (result, artifacts) = if write {
+                nesasm_core::build(&request, output.as_deref(), &worker_cancel)
+            } else {
+                (
+                    nesasm_core::assemble_with_cancel(&request, &worker_cancel),
+                    Vec::new(),
+                )
+            };
             let mut report = Report::from(result);
             report.artifacts = artifacts;
             report
@@ -169,28 +155,24 @@ impl Server {
         };
         let mut report = joined.unwrap_or_else(|e| Report {
             success: false,
-            diagnostics: vec![Diagnostic {
-                severity: nesasm_core::Severity::Error,
-                code: "E_INTERNAL".into(),
-                message: e.to_string(),
-                location: SourceLocation::default(),
-                expansion_trace: Vec::new(),
-            }],
+            diagnostics: vec![Diagnostic::error(
+                DiagnosticCode::Internal,
+                e.to_string(),
+                SourceLocation::default(),
+            )],
             ..Report::default()
         });
         if timed_out {
             report.success = false;
             report.artifacts.clear();
-            report.diagnostics.push(Diagnostic {
-                severity: nesasm_core::Severity::Error,
-                code: "E_TIMEOUT".into(),
-                message: format!(
+            report.diagnostics.push(Diagnostic::error(
+                DiagnosticCode::Timeout,
+                format!(
                     "Assembly exceeded the {} second time limit",
                     self.timeout.as_secs()
                 ),
-                location: SourceLocation::default(),
-                expansion_trace: Vec::new(),
-            });
+                SourceLocation::default(),
+            ));
         }
         let summary = if report.success {
             format!(
@@ -237,20 +219,18 @@ impl Server {
     }
     #[tool(description="Read assembler syntax documentation. Topics: index, instructions, directives, expressions, options.",output_schema=schema::<ReferenceReport>(),annotations(read_only_hint=true))]
     fn get_reference(&self, Parameters(input): Parameters<ReferenceInput>) -> CallToolResult {
-        let topic = input.topic.unwrap_or_else(|| "index".into());
-        let (success, text) = match nesasm_core::reference(Some(&topic)) {
-            Ok(s) => (true, s.to_owned()),
-            Err(e) => (false, e),
-        };
+        // Unknown topics are rejected when the arguments are parsed.
+        let topic = input.topic.unwrap_or_default();
+        let text = topic.text();
         let mut result = CallToolResult::structured(
             serde_json::to_value(ReferenceReport {
-                success,
-                topic,
-                text: text.clone(),
+                success: true,
+                topic: topic.name().to_owned(),
+                text: text.to_owned(),
             })
             .unwrap(),
         );
-        result.is_error = Some(!success);
+        result.is_error = Some(false);
         result.content = vec![ContentBlock::text(text)];
         result
     }
@@ -261,9 +241,64 @@ impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         let mut config = ServerConfig::default();
         config.capabilities = ServerCapabilities::builder().enable_tools().build();
+        config.server_info = Implementation::new("nesasm-mcp", env!("CARGO_PKG_VERSION"));
         config.instructions=Some("NESASM assembler. Start with get_reference; use check to inspect diagnostics before assemble. All paths are relative to the configured project root.".into());
         config
     }
+}
+
+/// Stdio transport that answers unparsable lines with a JSON-RPC parse error,
+/// which the rmcp transport would otherwise drop silently. All output goes
+/// through one writer task so responses are never interleaved.
+fn stdio_relay() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    const PARSE_ERROR: &str =
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#;
+    let (server_in, mut feed) = tokio::io::duplex(1 << 16);
+    let (server_out, drain) = tokio::io::duplex(1 << 16);
+    let (send, mut recv) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let errors = send.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if !line.trim().is_empty() && serde_json::from_str::<serde_json::Value>(&line).is_err()
+            {
+                eprintln!("nesasm-mcp: ignoring unparsable message");
+                let _ = errors.send(PARSE_ERROR.into());
+                continue;
+            }
+            if feed
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // Dropping the feed signals end of input to the server.
+    });
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(drain).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = recv.recv().await {
+            if stdout
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .is_err()
+                || stdout.flush().await.is_err()
+            {
+                break;
+            }
+        }
+    });
+    (server_in, server_out)
 }
 
 #[tokio::main]
@@ -299,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Project root must be a directory".into());
     }
     let service = Server::new(root, Duration::from_secs(timeout))
-        .serve(rmcp::transport::stdio())
+        .serve(stdio_relay())
         .await?;
     service.waiting().await?;
     Ok(())

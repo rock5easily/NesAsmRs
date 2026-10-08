@@ -10,7 +10,9 @@ zero page automatically; `-srec`: produce .s28 instead of .nes; `-e UTF8|SJIS`: 
 
 UTF-8 is the default on every OS. SJIS uses Windows-932-compatible decoding.
 The working directory is searched before NES_INCLUDE directories (semicolon
-separated on Windows, colon separated elsewhere). Output names use the input stem:
+separated; colons are also accepted outside Windows; at most 10).
+Exit status: 0 on success, the error count (up to 255) on assembly errors,
+2 on invalid arguments. Output names use the input stem:
 .nes, .lst when LIST is enabled, and .s28 when requested.
 
 Additional Rust options: `--output path`, `--include directory` (repeatable),

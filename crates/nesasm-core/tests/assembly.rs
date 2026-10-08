@@ -524,7 +524,7 @@ fn if_condition_changed_between_passes_is_an_error() {
 fn listing_values_without_listing_level() {
     let t = Temp::new();
     let options = AssembleOptions {
-        list_level: 0,
+        list_level: nesasm_core::ListLevel::Off,
         ..AssembleOptions::default()
     };
     for text in ["  .list\nX = 1\n", "  .list\n  .if 1\n  .db 1\n  .endif\n"] {
@@ -811,4 +811,65 @@ fn listing_matches_csharp_layout() {
     // OPT l+ alone does not request a listing.
     let r = t.run("  .opt l+\n  nop\n", AssembleOptions::default());
     assert!(r.listing.is_none());
+}
+
+#[test]
+fn diagnostics_point_at_opening_lines_and_plain_paths() {
+    let t = Temp::new();
+    let r = t.run("  nop\n  .if 1\n  nop\n", AssembleOptions::default());
+    let d = &r.diagnostics[0];
+    assert_eq!((d.message.as_str(), d.location.line), ("Missing ENDIF", 2));
+    assert!(
+        !d.location.file.to_string_lossy().starts_with(r"\\?\"),
+        "{:?}",
+        d.location.file
+    );
+    let r = t.run("  nop\nfoo .proc\n  rts\n", AssembleOptions::default());
+    let d = &r.diagnostics[0];
+    assert_eq!(
+        (d.message.as_str(), d.location.line),
+        ("Missing ENDP/ENDPROCGROUP", 2)
+    );
+}
+
+#[test]
+fn include_search_continues_past_rejected_directories() {
+    let t = Temp::new();
+    fs::create_dir_all(t.0.join("inc")).unwrap();
+    fs::write(t.0.join("inc/part.asm"), "  .db 7\n").unwrap();
+    fs::write(t.0.join("test.asm"), "  .include \"part.asm\"\n").unwrap();
+    let request = AssembleRequest {
+        input: "test.asm".into(),
+        working_directory: t.0.clone(),
+        include_paths: vec!["..".into(), "inc".into()],
+        allowed_root: Some(t.0.clone()),
+        options: AssembleOptions::default(),
+    };
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[0], 7);
+    // `..` after a missing directory is rejected the same way on every OS.
+    let r = t.run(
+        "  .include \"missing/../part.asm\"\n",
+        AssembleOptions::default(),
+    );
+    assert!(
+        r.diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not exist")),
+        "{:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn macro_arguments_are_substituted_once() {
+    let t = Temp::new();
+    // `\2` brought in by the first argument stays literal (the DB escape gives '2').
+    let r = t.run(
+        "pair .macro\n  .db \\1\n  .endm\n  pair \"a\\2\"\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..2], b"a2");
 }

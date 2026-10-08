@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
+static NEXT_ROOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct Client {
+    server_info: Value,
     child: Child,
     input: ChildStdin,
     output: mpsc::Receiver<Value>,
@@ -17,7 +20,11 @@ struct Client {
 }
 impl Client {
     fn start() -> Self {
-        let root = std::env::temp_dir().join(format!("nesasm-mcp-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "nesasm-mcp-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
         fs::create_dir_all(&root).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_nesasm-mcp"))
             .arg("--root")
@@ -41,6 +48,7 @@ impl Client {
             }
         });
         let mut c = Self {
+            server_info: Value::Null,
             child,
             input,
             output,
@@ -52,8 +60,14 @@ impl Client {
             init["result"]["capabilities"]["tools"].is_object(),
             "{init}"
         );
+        c.server_info = init["result"]["serverInfo"].clone();
         c.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         c
+    }
+    fn next_message(&mut self) -> Value {
+        self.output
+            .recv_timeout(Duration::from_secs(10))
+            .expect("MCP response timeout")
     }
     fn send(&mut self, value: Value) {
         writeln!(self.input, "{value}").unwrap();
@@ -149,4 +163,30 @@ fn stdio_lifecycle_validation_build_and_recovery() {
         json!({"input":"main.asm","output":"../escape.nes"}),
     );
     assert_eq!(escape["isError"], true);
+}
+
+#[test]
+fn protocol_errors_identity_and_schemas() {
+    let mut c = Client::start();
+    assert_eq!(c.server_info["name"], "nesasm-mcp", "{}", c.server_info);
+    // An unparsable line gets a JSON-RPC parse error and the server keeps working.
+    writeln!(c.input, "garbage{{").unwrap();
+    c.input.flush().unwrap();
+    let error = c.next_message();
+    assert_eq!(error["error"]["code"], -32700, "{error}");
+    assert!(error["id"].is_null());
+    let ping = c.request("ping", json!({}));
+    assert!(ping["result"].is_object(), "{ping}");
+    let listed = c.request("tools/list", json!({}));
+    let schemas = listed["result"]["tools"].to_string();
+    assert!(schemas.contains("\"maximum\":3"), "{schemas}");
+    assert!(schemas.contains("instructions"), "{schemas}");
+    let reply = c.request(
+        "tools/call",
+        json!({"name":"get_reference","arguments":{"topic":"unknown"}}),
+    );
+    assert!(
+        reply.get("error").is_some() || reply["result"]["isError"] == true,
+        "{reply}"
+    );
 }

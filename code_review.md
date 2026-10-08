@@ -347,6 +347,18 @@
 
 ## 4. CLI・MCP・診断
 
+> **対応状況**: M1–M8 を修正済み（回帰テスト追加）。M9 は C# 互換のため現状維持。
+> - M1: stdin と rmcp の間に中継層を置き、解析できない行に `-32700 Parse error` を返す（出力は単一タスクで直列化）。
+> - M2: serverInfo を `nesasm-mcp` / パッケージのバージョンに。
+> - M3: `list_level` に最大値 3、`topic` を enum 化、入力フィールドに説明を追加。
+> - M4: 診断パスから `\\?\` を除去（MAX_PATH 未満のみ）。`Missing ENDIF/ENDP` は開始行、
+>   プロシージャ配置エラーはあふれたプロシージャの位置で報告。
+> - M5: include 探索はルート外の候補があっても続行。存在しないディレクトリ後の `..` は全 OS でエラー。
+> - M6: ヘルプ判定を引数ループ内に移動、引数エラーは案内付きで終了コード 2、ヘルプはプレーンテキスト。
+> - M7: `NES_INCLUDE` は全 OS で `;` 区切り（Unix は `:` も可）、10 個超は警告。
+> - M8: watch は標準入力の終端・読み取りエラーで終了。
+> - M9: C# 版も Region Info を stdout に出すため、X14 の C# 書式に合わせて stdout のまま。
+
 | # | 重大度 | 内容 | 場所 | 修正案 |
 |---|---|---|---|---|
 | M1 | 中 | 不正な JSON に応答しない（-32700 もログも出ない） | `nesasm-mcp/src/main.rs:256` | -32700 を返すか stderr にログを出す。挙動をテストで固定する |
@@ -362,6 +374,31 @@
 ---
 
 ## 5. 設計・保守性・性能
+
+> **対応状況**: A–O すべて対応済み。修正前後で 684 ケース（全フィクスチャ・互換ケース・検証用入力 ×
+> 6 オプション）の ROM・map・ヘッダ・シンボル・バンク・リスト・診断が完全に一致することを確認済み。
+> - A: `engine.rs`（2100 行）を `engine/` の 8 モジュールに分割し、状態を `RomImage`・`Listing`・
+>   `Procedures`・`Macros`・`Conditions`・`SourceCache` に分けた。`execute` は 474 → 225 行。
+> - B: `Directive`（別名を統合）と `Mnemonic` の enum。各行を 1 回だけ分類。
+> - C: `Position` を `Copy` に。ラベルのスコープは `Rc<str>` で別に保持（保存・復元は `Cursor`）。
+> - D: マクロ本体を `Rc<[Line]>` で共有、引数種別を `ArgumentKind` enum で 1 回だけ計算、1 パス置換
+>   （引数中の `\1` などを再置換しない）。
+> - E: ソースと PCX 変換結果をパス間で共有。Layout パスの INCBIN はサイズのみ。
+> - F: `Line` はファイルを `Rc<Path>`、経路を `Rc<[SourceLocation]>` で共有。
+> - G: 公開 `DiagnosticCode` enum（JSON は従来の文字列）と内部 `AsmError { message, fatal }`。
+>   致命的エラーの判定をメッセージ文字列の照合から型に変更。
+> - H: `Symbol.bank` を `BankRef { Rom(u8), Constant, Procedure }` に（JSON は従来の数値）。
+> - I: メモリ配置の定数を `state.rs` に集約。
+> - J: 式のトークンを `Op` enum とスライス借用のゼロコピーに。
+> - K: プロシージャを名前の索引と ID で参照（線形探索と clone を廃止）。
+> - L: リスト行を列定数と固定幅の `Prefix` で 1 回だけ組み立て。
+> - M: ROM バッファは書き込んだバンクまで確保、使用状況は bitset、出力はバンク境界までのスライス単位。
+> - N: `ListLevel`・`ReferenceTopic` enum、`Diagnostic::error`、`AssembleResult::error_count`、
+>   `build()` を追加し、CLI と MCP の重複処理を削除。
+> - O: rmcp の client 系 feature と tokio の process を削除（`Cargo.lock` から 152 行減）、
+>   schemars を `schema` feature に、`rust-version = 1.88` と workspace lints を追加。
+> - 性能（release）: 大規模ソース（2.9 万行）0.56 → 0.17 秒・22 → 16 MB、マクロ再帰 1.59 → 0.08 秒・
+>   102 → 45 MB、式関数のネスト 2.86 → 0.97 秒。
 
 | # | 優先度 | 内容 | 場所 | 改善案 |
 |---|---|---|---|---|

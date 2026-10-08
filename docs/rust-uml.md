@@ -18,49 +18,55 @@ UMLのパッケージ間依存をMermaidのフローチャートで表現して�
 ```mermaid
 flowchart TB
     subgraph cli["nesasm-cli / nesasm"]
-        cli_main["main.rs：引数・実行・watch"]
+        cli_main["main.rs：引数・実行・watch・表示"]
     end
     subgraph mcp["nesasm-mcp"]
-        mcp_main["main.rs：Server・ツール・応答"]
+        mcp_main["main.rs：Server・ツール・stdio中継"]
     end
     subgraph core["nesasm-core"]
-        api["lib.rs：公開データ型・reference"]
-        engine["engine.rs：assemble・Engine"]
-        source["source.rs：入力解決・行読み込み"]
+        api["lib.rs：公開データ型・build・reference"]
+        subgraph engine["engine/"]
+            engine_mod["mod.rs：Engine・行処理・シンボル定義"]
+            directive["directive.rs：Directive・疑似命令"]
+            instruction["instruction.rs：命令エンコード"]
+            macros["macros.rs：マクロ定義・展開"]
+            conditional["conditional.rs：条件アセンブル"]
+            procedure["procedure.rs：PROC・CALL"]
+            listing["listing.rs：リスト出力"]
+            rom["rom.rs：ROMイメージ・バイト出力"]
+        end
+        source["source.rs：入力解決・ソース読み込み"]
         expr["expr.rs：式評価"]
-        opcode["opcode.rs：命令コード表"]
+        opcode["opcode.rs：Mnemonic・命令コード表"]
         image["image.rs：PCX・CHR変換"]
-        state["state.rs：Pass・Section"]
+        state["state.rs：メモリ配置の定数・Pass・Section"]
+        error["error.rs：AsmError"]
         output["output.rs：成果物・S-record"]
     end
     cli_main --> api
-    cli_main --> engine
-    cli_main --> output
     mcp_main --> api
-    mcp_main --> engine
-    mcp_main --> output
-    engine --> api
-    engine --> source
-    engine --> expr
-    engine --> opcode
-    engine --> image
-    engine --> state
-    engine --> output
+    api --> engine_mod
+    api --> output
+    engine_mod --> directive & instruction & macros & conditional & procedure & listing & rom
+    engine_mod --> source & expr & state & error
+    directive --> image
+    instruction --> opcode
     expr --> api
-    expr --> state
+    expr --> error
     source --> api
     output --> api
     output --> source
-    mcp_main --> rmcp["rmcp：MCP・stdio"]
+    mcp_main --> rmcp["rmcp：MCP"]
     mcp_main --> tokio["tokio：非同期処理"]
     source --> encoding["encoding_rs：SJIS変換"]
     output --> encoding
 ```
 
-`lib.rs` は `assemble`、`write_artifacts`、`Artifact`、`ArtifactKind`、
-`resolve_path` を再公開します。CLIとMCPはこの公開APIを利用します。
-コアの `assemble` は入力を読み込み、結果をメモリ上に作ります。
-成果物ファイルの書き込みは呼び出し側が `write_artifacts` で行います。
+`lib.rs` は `assemble`、`assemble_with_cancel`、`build`、`write_artifacts`、`reference`
+と公開データ型を提供します。CLIとMCPはこの公開APIだけを利用します。
+`assemble` は入力を読み込み、結果をメモリ上に作ります。`build` はアセンブルに続けて
+成果物を書き込み、書き込みの失敗を `E_OUTPUT` 診断として結果に加えます。
+JSONスキーマの導出（`schemars`）は `schema` featureで有効になり、MCPだけが使います。
 
 ## 2. 公開APIのクラス図
 
@@ -79,10 +85,18 @@ classDiagram
         +SourceEncoding encoding
         +bool raw
         +bool auto_zp
-        +u8 list_level
+        +ListLevel list_level
         +bool macro_listing
         +bool srec
         +bool warning_disabled
+    }
+    class ListLevel {
+        <<enumeration>>
+        Off
+        Brief
+        Normal
+        Full
+        clamped(level)
     }
     class SourceEncoding {
         <<enumeration>>
@@ -98,16 +112,36 @@ classDiagram
         +BTreeMap symbols
         +BTreeMap regions
         +Vec~BankUsage~ banks
+        +RamUsage ram
         +Vec~PathBuf~ dependencies
         +Option~String~ listing
         +Option~String~ srec
+        +error_count()
+        +push_error(diagnostic)
     }
     class Diagnostic {
         +Severity severity
-        +String code
+        +DiagnosticCode code
         +String message
         +SourceLocation location
         +Vec~SourceLocation~ expansion_trace
+        +error(code, message, location)
+    }
+    class DiagnosticCode {
+        <<enumeration>>
+        Io
+        Assembly
+        Symbol
+        Macro
+        Conditional
+        Include
+        Procedure
+        Limit
+        Cancelled
+        Output
+        Timeout
+        Internal
+        BankOverflow
     }
     class Severity {
         <<enumeration>>
@@ -122,12 +156,19 @@ classDiagram
     class Symbol {
         +String name
         +u32 value
-        +usize bank
-        +usize page
+        +BankRef bank
+        +Option~usize~ page
         +SourceLocation location
         +bool public
         +usize size
         +Option~DataType~ data_type
+    }
+    class BankRef {
+        <<enumeration>>
+        Rom(u8)
+        Constant
+        Procedure
+        number()
     }
     class DataType {
         <<enumeration>>
@@ -143,8 +184,28 @@ classDiagram
     }
     class BankUsage {
         +usize bank
+        +Option~String~ name
         +usize used
         +usize capacity
+        +Vec~Segment~ segments
+    }
+    class Segment {
+        +SectionKind section
+        +usize start
+        +usize size
+    }
+    class RamUsage {
+        +usize zero_page_end
+        +usize bss_end
+    }
+    class ReferenceTopic {
+        <<enumeration>>
+        Index
+        Instructions
+        Directives
+        Expressions
+        Options
+        text()
     }
     class Artifact {
         +ArtifactKind kind
@@ -159,26 +220,33 @@ classDiagram
     }
     AssembleRequest "1" *-- "1" AssembleOptions : options
     AssembleOptions *-- SourceEncoding : encoding
+    AssembleOptions *-- ListLevel : list_level
     AssembleResult "1" *-- "0..*" Diagnostic : diagnostics
     AssembleResult "1" *-- "0..*" Symbol : symbols
     AssembleResult "1" *-- "0..*" Region : regions
     AssembleResult "1" *-- "0..*" BankUsage : banks
+    AssembleResult *-- RamUsage : ram
+    BankUsage "1" *-- "0..*" Segment : segments
     Diagnostic *-- Severity : severity
+    Diagnostic *-- DiagnosticCode : code
     Diagnostic "1" *-- "1" SourceLocation : location
     Diagnostic "1" *-- "0..*" SourceLocation : expansion_trace
+    Symbol *-- BankRef : bank
     Symbol "1" *-- "1" SourceLocation : location
     Symbol "1" *-- "0..1" DataType : data_type
     Artifact *-- ArtifactKind : kind
 ```
 
 `symbols` は `BTreeMap<String, Symbol>`、`regions` は `BTreeMap<String, Region>` です。
-`Artifact` は `AssembleResult` のフィールドではなく、`write_artifacts` が返す成果物情報です。
+`Artifact` は `AssembleResult` のフィールドではなく、`build`・`write_artifacts` が返す成果物情報です。
 `binary` はiNESヘッダを含まないROMペイロードで、`header` と分けて保持します。
+JSONでは互換性のため、`DiagnosticCode` を `"E_IO"` などの文字列、`BankRef` を数値
+（ROMバンク、定数は240、未配置のプロシージャは241）、`ListLevel` を0〜3の数値で表します。
 
 ## 3. アセンブラ内部のクラス図
 
-出典：[engine.rs](../crates/nesasm-core/src/engine.rs)、[state.rs](../crates/nesasm-core/src/state.rs)、
-[source.rs](../crates/nesasm-core/src/source.rs)。
+出典：[engine/](../crates/nesasm-core/src/engine/)、[state.rs](../crates/nesasm-core/src/state.rs)、
+[source.rs](../crates/nesasm-core/src/source.rs)、[error.rs](../crates/nesasm-core/src/error.rs)。
 
 ```mermaid
 classDiagram
@@ -187,57 +255,104 @@ classDiagram
         -AssembleResult result
         -Pass pass
         -Position position
+        -Rc~str~ scope
         -Section section
         -BTreeMap saved
-        -BTreeMap macros
-        -BTreeMap functions
-        -Vec~Procedure~ procedures
-        -Vec~ProcFrame~ frames
-        -Vec~Conditional~ conditions
-        -Vec~bool~ occupied
-        -reset()
-        -load(path, trace)
+        -RomImage rom
+        -Listing listing
+        -Procedures procs
+        -Macros macros
+        -Conditions conditions
+        -SourceCache cache
         -run(lines)
-        -parse(text)
-        -execute(label, op, operand, line)
+        -parse(text) Statement
+        -execute(statement, directive, line)
+        -define(name, value, line, public)
         -value(text)
         -instruction(op, operand)
         -emit(bytes)
         -relocate()
-        -error_at(loc, trace, code, message)
+        -finish() AssembleResult
     }
-    class AssembleRequest
-    class AssembleResult
     class Position {
         -usize bank
         -usize page
         -usize offset
-        -String global
+        pc()
+        linear()
     }
-    class Procedure {
-        -String name
-        -usize base
-        -usize bank
-        -usize org
-        -usize size
-        -Option~String~ group
+    class Cursor {
+        -Position position
+        -Rc~str~ scope
     }
-    class ProcFrame {
-        -String name
-        -Position saved
-        -bool group
+    class Statement {
+        -Option~String~ label
+        -String op
+        -String operand
     }
-    class Conditional {
-        -bool parent
-        -bool condition
-        -bool otherwise
+    class Directive {
+        <<enumeration>>
+        If・Macro・Include・Equ・Org・Bank
+        Db・Dw・Ds・Incbin・Proc・Call ほか
+        parse(op)
+        is_conditional()
+    }
+    class RomImage {
+        -Vec~u8~ binary
+        -Vec~u8~ map
+        -Vec~u64~ occupied
+        +usize max_bank
+        write(address, bytes, map_byte)
+        bank_usage(bank, name)
+        into_parts(len)
+    }
+    class Listing {
+        +String text
+        +bool enabled
+        +bool requested
+        +bool macros
+        +usize line_number
+        shows(pass, line)
+    }
+    class Procedures {
+        -Vec~Procedure~ list
+        -HashMap index
+        -Vec~ProcFrame~ frames
+        -BTreeMap symbols
+        -HashMap calls
+        inside()
+        register_symbol(name)
+    }
+    class Macros {
+        -HashMap definitions
+        -usize counter
+    }
+    class Conditions {
+        -Vec~Conditional~ stack
+        -Vec~bool~ results
+        -BTreeSet undefined
+        active()
+    }
+    class SourceCache {
+        -HashMap sources
+        -HashMap tiles
+    }
+    class Line {
+        String text
+        Rc~Path~ file
+        usize line
+        Rc~[SourceLocation]~ trace
+        bool expanded
+        location()
+    }
+    class AsmError {
+        String message
+        bool fatal
     }
     class Pass {
         <<enumeration>>
         Layout
         Emit
-        is_layout()
-        is_emitting()
     }
     class Section {
         <<enumeration>>
@@ -245,48 +360,37 @@ classDiagram
         Bss
         Code
         Data
-        index()
-        is_ram()
         map_byte(page)
     }
-    class Line {
-        String text
-        SourceLocation location
-        Vec~SourceLocation~ trace
-        bool expanded
-    }
-    class SourceLocation
-    class PendingLine {
-        <<enumeration>>
-        Source(Line)
-        ReturnFromInclude(depth, name)
-    }
-    Engine --> AssembleRequest : requestを借用
-    Engine *-- AssembleResult : result
     Engine "1" *-- "1" Position : position
-    Engine "1" *-- "0..*" Position : saved
-    Engine *-- Pass : pass
-    Engine *-- Section : section
-    Engine "1" *-- "0..*" Procedure : procedures
-    Engine "1" *-- "0..*" ProcFrame : frames
-    Engine "1" *-- "0..*" Conditional : conditions
-    Engine "1" *-- "0..*" Line : macrosの定義行
-    ProcFrame *-- Position : saved
-    Line "1" *-- "1" SourceLocation : location
-    Line "1" *-- "0..*" SourceLocation : trace
-    PendingLine "1" *-- "0..1" Line : Sourceバリアント
-    Engine ..> PendingLine : run内の処理キュー
+    Engine "1" *-- "0..*" Cursor : saved
+    Cursor *-- Position
+    Engine *-- RomImage
+    Engine *-- Listing
+    Engine *-- Procedures
+    Engine *-- Macros
+    Engine *-- Conditions
+    Engine *-- SourceCache
+    Engine *-- Pass
+    Engine *-- Section
+    Engine ..> Statement : parse
+    Engine ..> Directive : 1回だけ分類
+    Engine ..> AsmError : 行エラー
+    Macros "1" *-- "0..*" Line : 定義行（展開時に共有）
 ```
 
 図中の `request_ref` は、実際のフィールド `request: &AssembleRequest` を表します。
-`saved` は `(Section, usize)` をキーにした位置の保存、`macros` は名前から `Vec<Line>` への対応です。
-`PendingLine` のキューは `run` のローカル変数で、Engineのフィールドではありません。
-`ReturnFromInclude` はincludeから戻る際の深さと名前を保持します。
+`Position` は物理位置だけを持つ `Copy` 型で、ローカルラベルの所属先（`scope`）は別に保持します。
+セクション・バンクの切り替えでは、位置と `scope` を `Cursor` として保存・復元します。
+各行は `Directive::parse` で1回だけ分類し、別名（`DB`/`BYTE`、`MACRO`/`MAC` など）は同じ値になります。
+`SourceCache` は読み込んだソースとPCXの変換結果を2つのパスで共有し、同じファイルを再読込しません。
+`Line` はファイルパスを `Rc<Path>`、展開・includeの経路を `Rc<[SourceLocation]>` で共有します。
+`AsmError` の `fatal` はバンクあふれや上限超過など、そのパスを中断するエラーを表します。
 
 ## 4. 式評価と命令・画像変換
 
 出典：[expr.rs](../crates/nesasm-core/src/expr.rs)、[opcode.rs](../crates/nesasm-core/src/opcode.rs)、
-[image.rs](../crates/nesasm-core/src/image.rs)。
+[instruction.rs](../crates/nesasm-core/src/engine/instruction.rs)、[image.rs](../crates/nesasm-core/src/image.rs)。
 
 ```mermaid
 classDiagram
@@ -302,49 +406,50 @@ classDiagram
         str global_ref
         u32 pc
         bool allow_undefined
+        Cell function_calls_ref
     }
     class Parser {
         -Vec~Token~ tokens
         -usize pos
         -Context ctx_ref
         -usize depth
-        -symbol(name)
         -expr(min)
-        -expect(op)
-        -function(name)
+        -binary(op, left, right)
+        -function(name, parens)
     }
     class Token {
         <<enumeration>>
         Number(u32)
-        Name(String)
-        String(String)
-        Op(String)
+        Name(str)
+        String(str)
+        Op(Op)
         End
     }
-    class Symbol
-    class Region
-    class OpcodeModule {
-        <<module>>
-        opcode(name, mode)
-        known(name)
+    class Op {
+        <<enumeration>>
+        Add・Sub・Mul・Div・Mod・Shl・Shr
+        Or・Xor・And・Complement・Not
+        Eq・Ne・Lt・Le・Gt・Ge
+        Open・Close・Comma
+        precedence()
+    }
+    class Mnemonic {
+        <<enumeration>>
+        Adc・And・Asl・… ・Tya
+        parse(name)
+        opcode(mode)
     }
     class Mode {
         <<enumeration>>
-        Acc
-        Imm
-        Zp
-        Zpx
-        Zpy
-        Zi
-        Zix
-        Ziy
-        Abs
-        Ax
-        Ay
-        Ind
-        Ix
-        Imp
-        Rel
+        Acc・Imm・Zp・Zpx・Zpy
+        Zi・Zix・Ziy・Abs・Ax・Ay
+        Ind・Ix・Imp・Rel
+    }
+    class Operand {
+        -str expr
+        -Mode mode
+        -Option~u8~ auto_increment
+        -Option~u8~ auto_tag
     }
     class ImageModule {
         <<module>>
@@ -355,17 +460,18 @@ classDiagram
     Engine ..> ExprModule : 式評価
     ExprModule ..> Parser : 字句解析後に生成
     Parser "1" *-- "1..*" Token : tokens
-    Parser --> Context : ctxを借用
-    Context --> "0..*" Symbol : シンボル表を借用
-    Context --> "0..*" Region : 領域表を借用
-    Engine ..> OpcodeModule : 命令コード取得
-    OpcodeModule ..> Mode : アドレッシング形式
+    Token ..> Op
+    Engine ..> Operand : オペランド解析
+    Engine ..> Mnemonic : 命令コード取得
+    Mnemonic ..> Mode
     Engine ..> ImageModule : DEFCHR・INCCHR
 ```
 
-`Context` の `_ref` は実際には参照フィールドです。シンボル表・領域表・関数表を所有しません。
+`Token` の名前と文字列は式テキストのスライスを借用し、トークンごとに `String` を作りません。
+`Context` の `_ref` は参照フィールドで、シンボル表・領域表・関数表を所有しません。
 `allow_undefined` は通常の式評価ではLayoutパス中に有効になり、未定義シンボルを0として扱います。
 `strict_value` はパスに関係なく未定義シンボルを許可しません。
+`function_calls` は1回のアセンブル全体での式関数の呼び出し回数で、上限を超えると致命的エラーです。
 
 ## 5. CLI・MCPと成果物出力
 
@@ -378,7 +484,8 @@ classDiagram
         <<module>>
         parse(args)
         run(args)
-        fingerprint(paths)
+        print_regions(result)
+        print_segment_usage(result, detail)
         main()
     }
     class Arguments {
@@ -389,36 +496,23 @@ classDiagram
         -bool watch
         -usize usage
     }
-    class AssembleRequest
-    class AssembleOptions
-    class AssembleResult
     class ServerHandler {
         <<interface>>
         get_info()
     }
     class Server {
         -PathBuf root
+        -Duration timeout
         -Arc gate
         -ToolRouter tool_router
-        -new(root)
         -execute(input, write, output)
         -assemble(input)
         -check(input)
         -get_reference(input)
     }
-    class AssemblyInput {
-        -PathBuf input
-        -Vec~PathBuf~ include_paths
-        -AssembleOptions options
-    }
-    class BuildInput {
-        -PathBuf input
-        -Vec~PathBuf~ include_paths
-        -AssembleOptions options
-        -Option~PathBuf~ output
-    }
-    class ReferenceInput {
-        -Option~String~ topic
+    class StdioRelay {
+        <<module>>
+        stdio_relay()
     }
     class Report {
         -bool success
@@ -428,17 +522,12 @@ classDiagram
         -Vec~BankUsage~ banks
         -Vec~PathBuf~ dependencies
         -Vec~Artifact~ artifacts
-        from(result)
-    }
-    class ReferenceReport {
-        -bool success
-        -String topic
-        -String text
     }
     class CoreApi {
         <<module>>
         assemble(request)
-        reference(topic)
+        assemble_with_cancel(request, cancel)
+        build(request, output, cancel)
     }
     class OutputModule {
         <<module>>
@@ -446,43 +535,28 @@ classDiagram
         srec(binary, map)
     }
     class StagedArtifact {
-        -ArtifactKind kind
         -PathBuf path
         -PathBuf temp
-        -usize size
-        -Option~File~ file
         -write(kind, path, data)
         -commit()
         drop()
     }
-    class Artifact
     CliModule ..> Arguments : parse・run
-    Arguments *-- AssembleRequest : request
-    CliModule ..> CoreApi : アセンブル
-    CliModule ..> OutputModule : 成功かつcheck無効時
+    CliModule ..> CoreApi : check時はassemble、それ以外はbuild
     Server ..|> ServerHandler
-    Server ..> AssemblyInput : check・execute
-    Server ..> BuildInput : assemble
-    Server ..> ReferenceInput : get_reference
-    AssemblyInput *-- AssembleOptions : options
-    BuildInput *-- AssembleOptions : options
-    Server ..> AssembleRequest : executeで生成
-    Server ..> CoreApi : アセンブル・参照
-    Server ..> OutputModule : 成功かつwrite有効時
+    Server ..> StdioRelay : 解析エラー応答・出力の直列化
+    Server ..> CoreApi : spawn_blocking・タイムアウトで中断
     Server ..> Report : 構造化応答
-    Server ..> ReferenceReport : 参照応答
-    AssembleResult ..> Report : Fromで所有権を移動
-    Report "1" *-- "0..*" Artifact : artifacts
+    CoreApi ..> OutputModule : build内で書き込み
     OutputModule ..> StagedArtifact : 一時ファイル作成
-    StagedArtifact ..> Artifact : commitで生成
 ```
 
 `ServerHandler` はrmcpのtraitです。MCPツールはRust上では非公開メソッドですが、
 マクロによってMCPの `assemble`・`check`・`get_reference` として公開されます。
 `gate` の型は `Arc<tokio::sync::Mutex<()>>` で、checkとassembleの実行を直列化します。
-`tool_router` の型は `ToolRouter<Self>` です。アセンブル処理は `spawn_blocking` で実行します。
-`Report::from` は診断・シンボル・領域・使用量・依存パスを移動し、ROMバイト列を応答に含めません。
-成果物情報は書き込み後に `Report.artifacts` に設定されます。
+時間制限を超えると `assemble_with_cancel` に渡したフラグを立て、エンジンは次の行で停止します。
+`stdio_relay` はstdinとrmcpの間で行を中継し、JSONとして解析できない行に `-32700` を返します。
+MCPでは `allowed_root` を指定するため、出力先は `.nes`／`.bin` と派生ファイルに限られます。
 
 ## 6. アセンブルと成果物生成のシーケンス図
 
@@ -491,64 +565,44 @@ CLIとMCPに共通する流れです。MCP固有のMutex・非同期タスク・
 ```mermaid
 sequenceDiagram
     actor Caller as CLI / MCP
-    participant API as core::assemble
+    participant API as core::build
     participant E as Engine
-    participant S as source
+    participant C as SourceCache
     participant X as expr / opcode / image
     participant O as output::write_artifacts
-    participant T as StagedArtifact
     participant FS as ファイルシステム
 
-    Caller->>API: assemble(&request)
-    API->>E: 要求ごとのEngineを生成・オプション検証
-    API->>S: find_file(request, input)
-    S->>FS: パス正規化・root内か確認
-    FS-->>S: 入力パス
-    S-->>API: 入力パス / エラー
-    API->>E: load(path, trace)
-    E->>S: read_lines(request, path, trace)
-    S->>FS: ソース読み込み
-    S-->>E: Vec of Line / エラー
-    Note over API,E: 初期化・入力解決・読込失敗時は診断付きで早期return
+    Caller->>API: build(&request, output, cancel)
+    API->>E: 要求ごとのEngineを生成
+    E->>FS: 入力パスの解決・root内か確認
+    E->>C: load(入力)
+    C->>FS: 初回のみ読み込み・デコード
     loop Layout → Emit（エラー時は中断）
-        API->>E: pass設定・reset()・run(lines)
+        E->>E: reset()・run(lines)
         loop ソース行・マクロ展開・include
-            E->>E: 条件判定・parse・execute
-            opt 式・命令・画像を処理
-                E->>X: evaluate / opcode / 画像変換
-                X-->>E: 評価値 / バイト列 / エラー
-            end
-            E->>E: 位置・シンボル更新、Emit時にバイト出力
+            E->>E: parse・Directive分類・条件判定
+            E->>X: evaluate / opcode / 画像変換
+            X-->>E: 値 / バイト列 / AsmError
+            E->>E: 位置・シンボル更新、Emit時にROMへ書き込み
+            Note over E: 行エラーは報告して続行、fatalならパスを中断
         end
-        API->>E: 条件・プロシージャの閉じ忘れと診断を確認
         opt Layout終了・エラーなし
-            API->>E: relocate()・予約シンボル更新
+            E->>E: relocate()・予約シンボル更新
         end
     end
-    API->>E: 成否判定・成功時に結果整形
-    E-->>API: AssembleResultの所有権を移動
-    API-->>Caller: AssembleResult
-    alt 成功かつ成果物書き込みが有効
-        Caller->>O: write_artifacts(result, paths, options)
-        O->>O: 全出力先を検証・入力上書きを拒否
-        loop 全成果物をステージング
-            O->>T: write(kind, path, data)
-            T->>FS: 一時ファイル作成・write・sync
-        end
-        loop 全ステージング成功後、各成果物を確定
-            O->>T: commit()
-            T->>FS: close・rename
-            T-->>O: Artifact / エラー
-        end
-        O-->>Caller: Vec of Artifact / エラー
-        Note over Caller,O: 出力失敗は呼び出し側がE_OUTPUT診断へ変換
-    else checkまたはアセンブル失敗
-        Note over Caller: 成果物を書き込まず結果を返す・表示する
+    E-->>API: finish()でAssembleResultを生成
+    alt 成功
+        API->>O: write_artifacts(result, paths, options)
+        O->>O: 出力先を検証（root内・拡張子・入力の上書き禁止）
+        O->>FS: 一時ファイルへ書き込み後rename
+        O-->>API: Vec of Artifact / エラー
+        Note over API,O: 書き込み失敗はE_OUTPUT診断として結果に追加
     end
+    API-->>Caller: (AssembleResult, Vec of Artifact)
 ```
 
 Layoutパスは配置とシンボルを計算し、その後 `relocate` がプロシージャの配置を確定します。
-Emitパスはその配置に基づいてROMとmapを生成します。
-失敗結果では `binary` と `map` を空にします。
+EmitパスはそのROMとmapを生成します。Layoutパスでは `INCBIN` のファイル本体を読まず、
+サイズだけで位置を進めます。失敗結果では `binary` と `map` を空にします。
 一時ファイルは `Drop` で後片付けします。複数成果物のrenameは順に実行されるため、
 途中の失敗で既に確定した成果物を元に戻すトランザクションにはなっていません。

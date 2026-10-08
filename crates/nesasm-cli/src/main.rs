@@ -1,4 +1,6 @@
-use nesasm_core::{AssembleOptions, AssembleRequest, AssembleResult, SourceEncoding};
+use nesasm_core::{
+    AssembleOptions, AssembleRequest, AssembleResult, ListLevel, ReferenceTopic, SourceEncoding,
+};
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -14,10 +16,10 @@ struct Arguments {
     watch: bool,
     usage: usize,
 }
+/// Maximum number of NES_INCLUDE directories, as in the C# version.
+const INCLUDE_LIMIT: usize = 10;
+
 fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
-    if args.iter().any(|a| ["-?", "--help"].contains(&a.as_str())) {
-        return Ok(None);
-    }
     let mut options = AssembleOptions::default();
     let mut input = None;
     let mut output = None;
@@ -29,6 +31,8 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            // Checked in order, so `--output -?` still names an output file.
+            "-?" | "--help" => return Ok(None),
             "-s" => usage = 1,
             "-S" => usage = 2,
             "-m" => options.macro_listing = true,
@@ -57,14 +61,14 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
                 let n = args
                     .next()
                     .ok_or("Missing listing level")?
-                    .parse::<i32>()
+                    .parse::<i64>()
                     .map_err(|_| "Invalid listing level")?;
-                options.list_level = n.clamp(0, 3) as u8;
+                options.list_level = ListLevel::clamped(n);
             }
-            "-l0" => options.list_level = 0,
-            "-l1" => options.list_level = 1,
-            "-l2" => options.list_level = 2,
-            "-l3" => options.list_level = 3,
+            "-l0" => options.list_level = ListLevel::Off,
+            "-l1" => options.list_level = ListLevel::Brief,
+            "-l2" => options.list_level = ListLevel::Normal,
+            "-l3" => options.list_level = ListLevel::Full,
             _ if arg.starts_with('-') => return Err(format!("Unknown option '{arg}'")),
             _ => {
                 if input.is_some() {
@@ -81,8 +85,15 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
     {
         input = PathBuf::from(format!("{}.asm", input.display()));
     }
-    if let Some(paths) = env::var_os("NES_INCLUDE") {
-        includes.extend(env::split_paths(&paths).take(10));
+    if let Some(paths) = env::var("NES_INCLUDE").ok().filter(|p| !p.is_empty()) {
+        let dirs = include_dirs(&paths);
+        if dirs.len() > INCLUDE_LIMIT {
+            eprintln!(
+                "warning: NES_INCLUDE has {} directories; only the first {INCLUDE_LIMIT} are used",
+                dirs.len()
+            );
+        }
+        includes.extend(dirs.into_iter().take(INCLUDE_LIMIT));
     }
     if watch && json {
         return Err("--json cannot be combined with -watch".into());
@@ -103,34 +114,12 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
     }))
 }
 fn run(args: &Arguments) -> AssembleResult {
-    let mut result = nesasm_core::assemble(&args.request);
-    if !args.check
-        && result.success
-        && let Err(e) = nesasm_core::write_artifacts(
-            &result,
-            &args.request.input,
-            args.output.as_deref(),
-            &args.request.working_directory,
-            None,
-            &args.request.options,
-        )
-    {
-        result.success = false;
-        result.diagnostics.push(nesasm_core::Diagnostic {
-            severity: nesasm_core::Severity::Error,
-            code: "E_OUTPUT".into(),
-            message: e,
-            location: nesasm_core::SourceLocation {
-                file: args
-                    .output
-                    .clone()
-                    .unwrap_or_else(|| args.request.input.with_extension("nes")),
-                line: 0,
-                column: None,
-            },
-            expansion_trace: vec![],
-        });
-    }
+    let result = if args.check {
+        nesasm_core::assemble(&args.request)
+    } else {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        nesasm_core::build(&args.request, args.output.as_deref(), &never).0
+    };
     if args.json {
         println!(
             "{}",
@@ -242,16 +231,37 @@ fn fingerprint(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<(SystemTime, u64)>
         })
         .collect()
 }
+/// Splits NES_INCLUDE. `;` separates entries on every OS, as in the C# version;
+/// on other OSes `:` is accepted too.
+fn include_dirs(paths: &str) -> Vec<PathBuf> {
+    let separators: &[char] = if cfg!(windows) { &[';'] } else { &[';', ':'] };
+    paths
+        .split(separators)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+/// The options reference as plain text for the terminal.
+fn help_text() -> String {
+    ReferenceTopic::Options
+        .text()
+        .lines()
+        .map(|line| line.trim_start_matches("# ").replace('`', ""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 fn main() {
     let args = match parse(env::args().skip(1).collect()) {
         Ok(Some(a)) => a,
         Ok(None) => {
-            print!("{}", nesasm_core::reference(Some("options")).unwrap());
+            println!("{}", help_text());
             return;
         }
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            eprintln!("Run 'nesasm --help' for usage.");
+            // Usage errors are distinguished from assembly errors (error count).
+            std::process::exit(2);
         }
     };
     let mut result = run(&args);
@@ -260,13 +270,17 @@ fn main() {
         let (send, recv) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::BufRead;
+            // End of input or a read error ends the loop; the main loop then quits.
             for line in std::io::stdin().lock().lines() {
-                if send.send(line.unwrap_or_default()).is_err() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
                     break;
                 }
             }
         });
-        println!("Watching dependencies. H + Enter: help; R + Enter: rebuild; Q + Enter: quit.");
+        println!(
+            "Watching dependencies. H + Enter: help; R + Enter: rebuild; Q + Enter or end of input: quit."
+        );
         let mut paths = result.dependencies.clone();
         paths.push(args.request.working_directory.join(&args.request.input));
         // Watch include directories too, to recover from previously missing dependencies.
@@ -281,7 +295,11 @@ fn main() {
         let mut previous = fingerprint(&paths);
         loop {
             std::thread::sleep(Duration::from_millis(200));
-            let key = recv.try_recv().unwrap_or_default().to_ascii_uppercase();
+            let key = match recv.try_recv() {
+                Ok(key) => key.to_ascii_uppercase(),
+                Err(std::sync::mpsc::TryRecvError::Empty) => String::new(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            };
             if key == "Q" {
                 break;
             }
@@ -303,12 +321,7 @@ fn main() {
         }
     } else if !result.success {
         // As in the C# version the exit code is the error count (kept within 1..=255).
-        let errors = result
-            .diagnostics
-            .iter()
-            .filter(|d| d.severity == nesasm_core::Severity::Error)
-            .count();
-        std::process::exit(errors.clamp(1, 255) as i32);
+        std::process::exit(result.error_count().clamp(1, 255) as i32);
     }
 }
 
@@ -328,12 +341,35 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(a.request.options.list_level, 3);
+        assert_eq!(a.request.options.list_level, ListLevel::Full);
         assert!(a.request.options.raw);
         assert_eq!(a.request.input, Path::new("demo.asm"));
     }
     #[test]
     fn missing_argument() {
         assert!(parse(vec!["-e".into()]).is_err());
+    }
+    #[test]
+    fn help_is_recognized_only_as_an_option() {
+        assert!(parse(vec!["-?".into()]).unwrap().is_none());
+        assert!(
+            parse(vec!["demo".into(), "--help".into()])
+                .unwrap()
+                .is_none()
+        );
+        let a = parse(vec!["--output".into(), "-?".into(), "demo".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.output.as_deref(), Some(Path::new("-?")));
+    }
+    #[test]
+    fn include_directories_accept_semicolons() {
+        assert_eq!(
+            include_dirs("a;b;;c"),
+            ["a", "b", "c"].map(PathBuf::from).to_vec()
+        );
+        if !cfg!(windows) {
+            assert_eq!(include_dirs("a:b").len(), 2);
+        }
     }
 }
