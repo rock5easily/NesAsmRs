@@ -18,7 +18,11 @@ Directive names are case insensitive and accept a leading dot.
 - RSSET address, label RS size: allocate symbolic storage.
 - PROC name ... ENDP, PROCGROUP name ... ENDPROCGROUP: relocate procedures.
 - CALL name: emit a procedure call.
-- DEFCHR row0,...,row7: eight hexadecimal rows containing pixels 0 through 3.
+- DEFCHR row0,...,row7: eight hexadecimal rows, one per tile row; each row holds
+  eight pixels 0 through 3, leftmost pixel in the most significant digit
+  (for example `$01230123`).
+- Inside a macro, `\#` is the number of the last non-empty argument (0 without arguments).
+- A line ending in `\` (outside comments) continues on the next line.
 - INCCHR "image.pcx"[, x, y, width, height]: convert PCX to NES tiles.
 - LIST/NOLIST, MLIST/NOMLIST: control listing output.
 - OPT l+/l-,m+/m-,w+/w-,o+/o-: assembler options.

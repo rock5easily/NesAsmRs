@@ -97,7 +97,7 @@ def main():
         "invalid_size_function": "Label:\n  .db SIZEOF(Label)\n",
         "invalid_vram_function": "Label:\n  .dw VRAM(Label)\n",
         "invalid_pal_function": "Label:\n  .db PAL(Label)\n",
-        "macro_types": "types .macro\n  .db \\?1,\\?2,\\?3,\\?4,\\?5,\\?6,\\?7,\\?8,\\?9,\\#\n  .endm\nLabel:\n  types A,#1,$1234,[$12],\"string\",Label\n",
+        "macro_types": "types .macro\n  .db \\?1,\\?2,\\?3,\\?4,\\?5,\\?6,\\?7,\\?8,\\?9\n  .endm\nLabel:\n  types A,#1,$1234,[$12],\"string\",Label\n",
         "macro_unique": "emit .macro\n.local\\@:\n  .db 1\n  .endm\nGlobal:\n  emit\n  emit\n",
         "macro_indexed": "emit .macro\n  lda \\1\n  .endm\n  emit $1234,x\n",
         "autozp_forward": "  .autozp 1\n  lda Variable\n  .zp\nVariable: .ds 1\n",

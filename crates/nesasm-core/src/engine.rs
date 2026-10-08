@@ -557,13 +557,16 @@ impl Engine<'_> {
                     break;
                 }
                 self.macro_counter += 1;
+                // \# is the index of the last non-empty argument.
+                let arg_count = args
+                    .iter()
+                    .rposition(|a| !a.is_empty())
+                    .map_or(0, |i| i + 1);
                 let mut expanded = Vec::new();
                 for mut next in body {
                     next.trace = line.trace.clone();
                     next.trace.push(line.location.clone());
                     next.expanded = true;
-                    // The legacy \# loop returns 9 when the ninth argument is absent.
-                    let arg_count = if args.len() < 9 { 9 } else { 0 };
                     next.text = next
                         .text
                         .replace("\\@", &format!("{:05}", self.macro_counter))

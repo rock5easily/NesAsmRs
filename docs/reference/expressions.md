@@ -2,7 +2,8 @@
 
 Decimal numbers, `$` hexadecimal, `%` binary, character literals and symbols
 are accepted. `*` in operand position is the current CPU address.
-Operators: `+ - * / % << >> | ^ & ~ ! = <> < <= > >=` and parentheses.
+Operators: `+ - * / % << >> | ^ & ~ ! = == <> < <= > >=` and parentheses.
+Unary `<` and `>` return the low and high byte of a value.
 Values use wrapping 32-bit arithmetic; division by zero is an error.
 
 Functions: LOW(value), HIGH(value), BANK(symbol), PAGE(symbol),

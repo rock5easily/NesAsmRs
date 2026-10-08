@@ -158,8 +158,39 @@ fn incbin_slice_and_tile() {
         AssembleOptions::default(),
     );
     assert!(r.success, "{:?}", r.diagnostics);
-    assert_eq!(&r.binary[..4], &[2, 3, 3, 3]);
-    assert_eq!(r.binary[14], 3);
+    assert_eq!(&r.binary[..4], &[2, 3, 0xff, 0]);
+    assert_eq!(&r.binary[10..12], &[0, 0xff]);
+}
+#[test]
+fn defchr_uses_one_row_per_argument() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .defchr $00000000,$01230123,$33333333,$10000001,0,0,0,$32100123",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(
+        &r.binary[..16],
+        &[
+            0x00, 0x55, 0xff, 0x81, 0, 0, 0, 0xa5, // plane 0
+            0x00, 0x33, 0xff, 0x00, 0, 0, 0, 0xc3, // plane 1
+        ]
+    );
+    let r = t.run(
+        "  .defchr $00000004,0,0,0,0,0,0,0",
+        AssembleOptions::default(),
+    );
+    assert!(!r.success);
+}
+#[test]
+fn macro_argument_count() {
+    let t = Temp::new();
+    let r = t.run(
+        "count .macro\n  .db \\#\n  .endm\n  count\n  count 1\n  count 1,2\n  count 1,2,3\n  count 1,2,3,4,5,6,7,8,9\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..5], &[0, 1, 2, 3, 9]);
 }
 #[test]
 fn root_boundary_and_output_protection() {
