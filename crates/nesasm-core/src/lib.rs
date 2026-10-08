@@ -6,7 +6,7 @@ mod output;
 mod source;
 mod state;
 
-pub use engine::assemble;
+pub use engine::{assemble, assemble_with_cancel};
 pub use output::{Artifact, ArtifactKind, write_artifacts};
 pub use source::resolve_path;
 

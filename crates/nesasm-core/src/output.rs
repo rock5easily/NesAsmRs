@@ -35,6 +35,9 @@ pub fn write_artifacts(
         return Err("Cannot write artifacts for a failed assembly".into());
     }
     let rom = resolve_path(output.unwrap_or(&input.with_extension("nes")), base, root)?;
+    if let Some(root) = root {
+        check_rooted_output(&rom, root)?;
+    }
     let mut files = if options.srec {
         Vec::new()
     } else {
@@ -95,6 +98,30 @@ pub fn write_artifacts(
         .into_iter()
         .map(|artifact| artifact.commit().map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Restricts root-confined (MCP) output to ROM artifact names outside hidden
+/// directories, so a request cannot replace source, configuration or VCS files.
+/// The listing and S-record paths are derived from the ROM path.
+fn check_rooted_output(rom: &Path, root: &Path) -> Result<(), String> {
+    let extension = rom
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(extension.as_deref(), Some("nes" | "bin")) {
+        return Err("Output file must have a .nes or .bin extension".into());
+    }
+    let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let relative = rom
+        .strip_prefix(&root)
+        .map_err(|_| "Path is outside the project root")?;
+    if relative
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return Err("Output path must not contain hidden files or directories".into());
+    }
+    Ok(())
 }
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);

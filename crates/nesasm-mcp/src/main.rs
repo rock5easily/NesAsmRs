@@ -10,7 +10,17 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +83,7 @@ struct ReferenceReport {
 #[derive(Clone)]
 struct Server {
     root: PathBuf,
+    timeout: Duration,
     gate: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<Self>,
 }
@@ -89,9 +100,10 @@ fn schema<T: JsonSchema>() -> Arc<serde_json::Map<String, serde_json::Value>> {
 
 #[tool_router]
 impl Server {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, timeout: Duration) -> Self {
         Self {
             root,
+            timeout,
             gate: Arc::new(tokio::sync::Mutex::new(())),
             tool_router: Self::tool_router(),
         }
@@ -104,7 +116,9 @@ impl Server {
     ) -> CallToolResult {
         let guard = self.gate.clone().lock_owned().await;
         let root = self.root.clone();
-        let report = tokio::task::spawn_blocking(move || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let request = AssembleRequest {
                 input: input.input,
@@ -113,7 +127,7 @@ impl Server {
                 allowed_root: Some(root.clone()),
                 options: input.options,
             };
-            let mut result = nesasm_core::assemble(&request);
+            let mut result = nesasm_core::assemble_with_cancel(&request, &worker_cancel);
             let mut artifacts = Vec::new();
             if write && result.success {
                 match nesasm_core::write_artifacts(
@@ -144,9 +158,16 @@ impl Server {
             let mut report = Report::from(result);
             report.artifacts = artifacts;
             report
-        })
-        .await
-        .unwrap_or_else(|e| Report {
+        });
+        // On timeout the engine stops at its next source line; the gate is held until then.
+        let (joined, timed_out) = match tokio::time::timeout(self.timeout, &mut task).await {
+            Ok(joined) => (joined, false),
+            Err(_) => {
+                cancel.store(true, Ordering::Relaxed);
+                (task.await, true)
+            }
+        };
+        let mut report = joined.unwrap_or_else(|e| Report {
             success: false,
             diagnostics: vec![Diagnostic {
                 severity: nesasm_core::Severity::Error,
@@ -157,6 +178,20 @@ impl Server {
             }],
             ..Report::default()
         });
+        if timed_out {
+            report.success = false;
+            report.artifacts.clear();
+            report.diagnostics.push(Diagnostic {
+                severity: nesasm_core::Severity::Error,
+                code: "E_TIMEOUT".into(),
+                message: format!(
+                    "Assembly exceeded the {} second time limit",
+                    self.timeout.as_secs()
+                ),
+                location: SourceLocation::default(),
+                expansion_trace: Vec::new(),
+            });
+        }
         let summary = if report.success {
             format!(
                 "Assembly succeeded; {} artifacts, {} symbols",
@@ -235,6 +270,7 @@ impl ServerHandler for Server {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut root = None;
+    let mut timeout = DEFAULT_TIMEOUT_SECONDS;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => {
@@ -242,8 +278,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.next().ok_or("--root requires a directory")?,
                 ))
             }
+            "--timeout" => {
+                timeout = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&s| s > 0)
+                    .ok_or("--timeout requires a positive number of seconds")?;
+            }
             "--help" | "-?" => {
-                println!("nesasm-mcp --root <project-directory>");
+                println!(
+                    "nesasm-mcp --root <project-directory> [--timeout <seconds, default {DEFAULT_TIMEOUT_SECONDS}>]"
+                );
                 return Ok(());
             }
             _ => return Err(format!("Unknown option '{arg}'").into()),
@@ -253,7 +298,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !root.is_dir() {
         return Err("Project root must be a directory".into());
     }
-    let service = Server::new(root).serve(rmcp::transport::stdio()).await?;
+    let service = Server::new(root, Duration::from_secs(timeout))
+        .serve(rmcp::transport::stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }

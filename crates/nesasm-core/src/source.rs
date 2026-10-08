@@ -3,13 +3,14 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct Line {
     pub text: String,
     pub location: SourceLocation,
-    pub trace: Vec<SourceLocation>,
+    pub trace: Rc<[SourceLocation]>,
     pub expanded: bool,
 }
 
@@ -64,7 +65,7 @@ pub(crate) fn find_file(request: &AssembleRequest, name: &Path) -> Result<PathBu
 pub(crate) fn read_lines(
     request: &AssembleRequest,
     path: &Path,
-    trace: Vec<SourceLocation>,
+    trace: &Rc<[SourceLocation]>,
 ) -> Result<Vec<Line>, String> {
     const SOURCE_LIMIT: usize = 1024 * 1024;
     let mut bytes = Vec::new();
@@ -110,7 +111,7 @@ pub(crate) fn read_lines(
                     line: index + 1,
                     column: None,
                 },
-                trace: trace.clone(),
+                trace: Rc::clone(trace),
                 expanded: false,
             });
         }

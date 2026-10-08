@@ -221,6 +221,41 @@ fn root_boundary_and_output_protection() {
         )
         .is_err()
     );
+    fs::write(t.0.join("README.md"), "keep").unwrap();
+    for output in [
+        "README.md",
+        "other.asm",
+        ".git/hooks/pre-commit",
+        ".git/rom.nes",
+        "out/.hidden/rom.nes",
+    ] {
+        assert!(
+            nesasm_core::write_artifacts(
+                &r,
+                Path::new("test.asm"),
+                Some(Path::new(output)),
+                &t.0,
+                Some(&t.0),
+                &AssembleOptions::default()
+            )
+            .is_err(),
+            "{output}"
+        );
+    }
+    assert_eq!(fs::read_to_string(t.0.join("README.md")).unwrap(), "keep");
+    assert!(!t.0.join(".git").exists());
+    for output in ["out/rom.nes", "out/rom.BIN"] {
+        nesasm_core::write_artifacts(
+            &r,
+            Path::new("test.asm"),
+            Some(Path::new(output)),
+            &t.0,
+            Some(&t.0),
+            &AssembleOptions::default(),
+        )
+        .unwrap();
+        assert!(t.0.join(output).is_file());
+    }
 }
 #[test]
 fn explicit_sjis_and_invalid_utf8() {
@@ -456,4 +491,235 @@ fn nested_input_fails_without_panicking() {
         !t.run("  .include \"test.asm\"", AssembleOptions::default())
             .success
     );
+}
+
+#[test]
+fn if_condition_changed_between_passes_is_an_error() {
+    let t = Temp::new();
+    for text in [
+        "  .if later\nfoo = 5\n  .endif\nlater = 1\n",
+        "  .if later\nbar .rs 1\n  .endif\nlater = 1\n",
+        "  .if later\nlabel:\n  nop\n  .endif\nlater = 1\n",
+    ] {
+        let r = t.run(text, AssembleOptions::default());
+        assert!(!r.success, "{text}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("IF condition changed")),
+            "{text}: {:?}",
+            r.diagnostics
+        );
+    }
+    // A forward reference that evaluates the same in both passes stays valid.
+    let r = t.run(
+        "  .if later\n  .db 1\n  .endif\n  .db 2\nlater = 0\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[0], 2);
+}
+
+#[test]
+fn listing_values_without_listing_level() {
+    let t = Temp::new();
+    let options = AssembleOptions {
+        list_level: 0,
+        ..AssembleOptions::default()
+    };
+    for text in ["  .list\nX = 1\n", "  .list\n  .if 1\n  .db 1\n  .endif\n"] {
+        let r = t.run(text, options.clone());
+        assert!(r.success, "{text}: {:?}", r.diagnostics);
+    }
+    let r = t.run(
+        "  .list\nX = $1234\n  .if X\n  .endif\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let listing = r.listing.unwrap();
+    assert_eq!(listing.matches("1234").count(), 3, "{listing}");
+}
+
+#[test]
+fn procedure_ending_on_bank_boundary() {
+    let t = Temp::new();
+    fs::write(t.0.join("b8191.bin"), vec![1; 8191]).unwrap();
+    fs::write(t.0.join("b8192.bin"), vec![2; 8192]).unwrap();
+    // A group that fills its bank exactly is accepted; one more byte is rejected.
+    let r = t.run(
+        "  .procgroup\n  nop\nfoo .proc\n  .incbin \"b8191.bin\"\n  .endp\n  .endprocgroup\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let r = t.run(
+        "  .procgroup\n  nop\nfoo .proc\n  .incbin \"b8192.bin\"\n  .endp\n  .endprocgroup\n",
+        AssembleOptions::default(),
+    );
+    assert!(!r.success);
+    assert!(
+        r.diagnostics
+            .iter()
+            .any(|d| d.message.contains("too large") || d.message.contains("exceeds")),
+        "{:?}",
+        r.diagnostics
+    );
+    let r = t.run(
+        "foo .proc\n  .incbin \"b8192.bin\"\n  .endp\nbar .proc\n  rts\n  .endp\n  call foo\n  call bar\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let foo = &r.symbols["foo"];
+    let bar = &r.symbols["bar"];
+    assert_ne!((foo.bank, foo.value), (bar.bank, bar.value));
+}
+
+#[test]
+fn resource_limits_and_cancellation() {
+    let t = Temp::new();
+    // Exponential expression function expansion stops at the call budget.
+    let mut text = String::from("f0 .func \\1\n");
+    for i in 1..=12 {
+        let call = format!("f{}(\\1)", i - 1);
+        text.push_str(&format!("f{i} .func {}\n", [call.as_str(); 4].join("+")));
+    }
+    text.push_str("  .db f12(1)&255\n");
+    let r = t.run(&text, AssembleOptions::default());
+    assert!(
+        r.diagnostics
+            .iter()
+            .any(|d| d.message.contains("function evaluation limit")),
+        "{:?}",
+        r.diagnostics
+    );
+    // Oversized PCX files are rejected before they are read completely.
+    let mut pcx = vec![0u8; 8 * 1024 * 1024];
+    pcx[0] = 10;
+    fs::write(t.0.join("big.pcx"), pcx).unwrap();
+    let r = t.run("  .incchr \"big.pcx\"\n", AssembleOptions::default());
+    assert!(
+        r.diagnostics
+            .iter()
+            .any(|d| d.message.contains("too large")),
+        "{:?}",
+        r.diagnostics
+    );
+    fs::write(t.0.join("test.asm"), "  .db 1\n").unwrap();
+    let request = AssembleRequest {
+        input: "test.asm".into(),
+        working_directory: t.0.clone(),
+        include_paths: vec![],
+        allowed_root: Some(t.0.clone()),
+        options: AssembleOptions::default(),
+    };
+    let r = nesasm_core::assemble_with_cancel(&request, &std::sync::atomic::AtomicBool::new(true));
+    assert!(!r.success);
+    assert!(r.diagnostics.iter().any(|d| d.code == "E_CANCELLED"));
+}
+
+#[test]
+fn procedure_constants_are_not_relocated() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .bank 0\n  .org $8000\n  call bar\n  rts\n  .proc foo\n  nop\n  nop\n  rts\n  .endp\n  .proc bar\nCONST = 5\nSLOT .rs 1\n  lda #CONST\n  rts\n  .endp\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.symbols["CONST"].value, 5);
+    assert_eq!(r.symbols["SLOT"].value, 0);
+}
+
+#[test]
+fn parenthesized_operands_follow_csharp() {
+    let t = Temp::new();
+    let auto_zp = AssembleOptions {
+        auto_zp: true,
+        ..AssembleOptions::default()
+    };
+    let cases: [(&str, &AssembleOptions, &[u8]); 9] = [
+        // Without AUTOZP parentheses only group expressions.
+        (
+            "  jmp ($1234)\n",
+            &AssembleOptions::default(),
+            &[0x4c, 0x34, 0x12],
+        ),
+        (
+            "  lda ($10+1)*2,x\n",
+            &AssembleOptions::default(),
+            &[0xbd, 0x22, 0x00],
+        ),
+        // With AUTOZP `(zp,X)` and `(zp),Y` are indirect; `(zp)` is not.
+        (
+            "foo = $10\n  lda (foo)\n  sta (foo)\n",
+            &auto_zp,
+            &[0xa5, 0x10, 0x85, 0x10],
+        ),
+        ("foo = $10\n  lda (foo,x)\n", &auto_zp, &[0xa1, 0x10]),
+        ("foo = $10\n  lda (foo),y\n", &auto_zp, &[0xb1, 0x10]),
+        (
+            "foo = $10\n  lda (foo), y++\n",
+            &auto_zp,
+            &[0xb1, 0x10, 0xc8],
+        ),
+        (
+            "foo = $1000\n  lda (foo),y\n",
+            &auto_zp,
+            &[0xb9, 0x00, 0x10],
+        ),
+        ("  lda ($10+1)*2,x\n", &auto_zp, &[0xb5, 0x22]),
+        ("  jmp ($1234)\n", &auto_zp, &[0x4c, 0x34, 0x12]),
+    ];
+    for (text, options, expected) in cases {
+        let r = t.run(text, options.clone());
+        assert!(r.success, "{text}: {:?}", r.diagnostics);
+        assert_eq!(&r.binary[..expected.len()], expected, "{text}");
+    }
+    // The `(<zp),y` form needs AUTOZP; without it the operand is rejected.
+    let r = t.run("  lda (<$12),y\n", AssembleOptions::default());
+    assert!(!r.success);
+}
+
+#[test]
+fn immediate_low_high_and_indirect_tags() {
+    let t = Temp::new();
+    let r = t.run(
+        "zpv = $12\ntg = 3\n  lda #>zpv\n  lda #<$1234\n  lda #>$1234\n  lda [$10].tg\n  lda [$10], y\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(
+        &r.binary[..12],
+        &[
+            0xa9, 0x00, 0xa9, 0x34, 0xa9, 0x12, 0xa0, 0x03, 0xb1, 0x10, 0xb1, 0x10
+        ]
+    );
+    let r = t.run("  lda [$10].300\n", AssembleOptions::default());
+    assert!(!r.success);
+}
+
+#[test]
+fn label_bank_must_match_between_passes() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .bank 0\n  .org $c000\n  lda #BANK(foo)\n  .bank BNK\n  .org $8000\nfoo: nop\nBNK = 1\n",
+        AssembleOptions::default(),
+    );
+    assert!(!r.success);
+    assert!(
+        r.diagnostics
+            .iter()
+            .any(|d| d.message.contains("Bank mismatch")),
+        "{:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn first_error_is_not_followed_by_missing_block_errors() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .if 1\n  .proc foo\n  lda #300\n  .endp\n  .endif\n",
+        AssembleOptions::default(),
+    );
+    assert!(!r.success);
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
 }

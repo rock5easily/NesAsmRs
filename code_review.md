@@ -22,6 +22,16 @@
 
 ## 1. 最優先: セキュリティ・panic・黙った誤出力・DoS
 
+> **対応状況**: S1, P1–P3, D1–D3 はすべて修正済み（回帰テスト追加）。
+> - S1: MCP（root 指定時）の出力を `.nes`/`.bin` とその派生ファイルに限定し、隠しパスを拒否。
+> - P1: `.if` の結果をパス間で比較し、変化したらエラー。`define`/EQU/RS の `unwrap` を除去。
+> - P2: リスト値を行の生成時に埋める方式に変更（`insert_listing_value` を削除）。
+> - P3: PROC 内ではバンク繰り上げをせず、`checked_sub` で size を計算。名前なし PROCGROUP の
+>   自動名がパスごとに変わる不具合も修正。
+> - D1: 式関数の呼び出しを 1 回のアセンブルで 100 万回までに制限。
+> - D2: `Line.trace` を `Rc<[SourceLocation]>` で共有（32KB 入力で 1.2GB → 約 100MB）。
+> - D3: INCCHR を約 6MiB に制限。`assemble_with_cancel` と MCP の `--timeout`（既定 30 秒）を追加。
+
 ### S1【高】MCP `assemble` でルート配下の任意ファイルを任意内容で上書き・新規作成できる
 - **場所**: `crates/nesasm-core/src/output.rs:26-98`（`write_artifacts`）、`crates/nesasm-mcp/src/main.rs:34, 119`
 - **問題**:
@@ -146,6 +156,17 @@
 ---
 
 ## 2. 誤ったコードの生成・正当性
+
+> **対応状況**: C1–C5 を修正済み（回帰テスト追加）。同時に C8, C9, C10, C14 も解消。
+> - C1: EQU/RS 定数と RAM ラベル（`RESERVED_BANK`）をリロケーション対象から除外。
+> - C2/C3: `(` の扱いを C# に合わせた。autozp なしは常に式、autozp ありは `(zp,X)`／`(zp),Y` のみ間接
+>   （`(addr),Y` が 255 超なら abs,Y）。autozp なしの `(<..` はエラー。`instructions.md` を修正。
+> - C4: 即値では `<`/`>` を単項 low/high として評価。
+> - C5: pass2 でアドレスラベルのバンク不一致を `Bank mismatch` エラーに。
+> - C8: `[zp].tag` の tag が 255 超ならエラー。C9: tag を大文字化せずに評価。C10: `], y` の空白を許容。
+> - C14: 先行エラーで中断したときは `Missing ENDIF/ENDP` を出さない。
+> - C6 は P1（パス間で条件が変わればエラー）により無言の誤出力が解消されたため、警告の追加は未実施。
+> - 修正前後の全フィクスチャ（`Tests/` 30 本 × 4 オプション）で出力が一致することを確認済み。
 
 ### C1【高】PROC 内の EQU / RS 定数がリロケーションされ、Phase error になる
 - **場所**: `engine.rs:417-419`（frames が空でなければ無条件で `symbol_proc` に登録する）、`engine.rs:1627-1640`（relocate）

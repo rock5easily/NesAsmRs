@@ -12,11 +12,16 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom},
+    iter,
     path::Path,
+    rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 const BANK_SIZE: usize = 8192;
 const LIMIT: usize = 128 * BANK_SIZE;
+/// Largest PCX accepted: 1024x768 with up to four 8-bit planes, RLE worst case.
+const PCX_LIMIT: u64 = 128 + 2 * 4 * 1024 * 768 + 769;
 
 #[derive(Clone, Default)]
 struct Position {
@@ -52,6 +57,7 @@ enum PendingLine {
 
 struct Engine<'a> {
     request: &'a AssembleRequest,
+    cancel: &'a AtomicBool,
     result: AssembleResult,
     pass: Pass,
     position: Position,
@@ -85,12 +91,25 @@ struct Engine<'a> {
     input_names: BTreeMap<std::path::PathBuf, (usize, String)>,
     bank_names: BTreeMap<usize, String>,
     if_undefined: BTreeSet<String>,
+    /// IF results from the layout pass, compared in order during the emit pass.
+    if_results: Vec<bool>,
+    if_index: usize,
+    /// Unnamed PROCGROUP counter, reset each pass so both passes agree on names.
+    unnamed_groups: usize,
+    function_calls: std::cell::Cell<usize>,
     max_bss: usize,
 }
 
 pub fn assemble(request: &AssembleRequest) -> AssembleResult {
+    assemble_with_cancel(request, &AtomicBool::new(false))
+}
+
+/// Assembles like [`assemble`], stopping with an `E_CANCELLED` error once
+/// `cancel` is set. The flag is checked before each source line.
+pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> AssembleResult {
     let mut engine = Engine {
         request,
+        cancel,
         result: AssembleResult::default(),
         pass: Pass::Layout,
         position: Position::default(),
@@ -124,6 +143,10 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
         input_names: BTreeMap::new(),
         bank_names: BTreeMap::new(),
         if_undefined: BTreeSet::new(),
+        if_results: Vec::new(),
+        if_index: 0,
+        unnamed_groups: 0,
+        function_calls: std::cell::Cell::new(0),
         max_bss: 0x201,
     };
     let location = SourceLocation {
@@ -158,7 +181,7 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
             return engine.result;
         }
     };
-    let lines = match engine.load(&path, Vec::new()) {
+    let lines = match engine.load(&path, &Rc::from([])) {
         Ok(lines) => lines,
         Err(e) => {
             engine.error_at(&location, &[], "E_IO", &e);
@@ -176,10 +199,16 @@ pub fn assemble(request: &AssembleRequest) -> AssembleResult {
         engine.pass = pass;
         engine.reset();
         engine.run(lines);
-        if !engine.conditions.is_empty() {
+        // After an earlier error the open blocks are an artifact of stopping early.
+        let stopped = engine
+            .result
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error);
+        if !stopped && !engine.conditions.is_empty() {
             engine.error_at(&location, &[], "E_CONDITIONAL", "Missing ENDIF");
         }
-        if !engine.frames.is_empty() {
+        if !stopped && !engine.frames.is_empty() {
             engine.error_at(&location, &[], "E_PROC", "Missing ENDP/ENDPROCGROUP");
         }
         if engine
@@ -261,6 +290,11 @@ impl Engine<'_> {
         self.functions.clear();
         self.defined.clear();
         self.if_undefined.clear();
+        if self.pass.is_layout() {
+            self.if_results.clear();
+        }
+        self.if_index = 0;
+        self.unnamed_groups = 0;
         self.cat.clear();
         self.rs = 0;
         self.list = false;
@@ -304,7 +338,7 @@ impl Engine<'_> {
             expansion_trace: trace.into(),
         });
     }
-    fn load(&mut self, path: &Path, trace: Vec<SourceLocation>) -> Result<Vec<Line>, String> {
+    fn load(&mut self, path: &Path, trace: &Rc<[SourceLocation]>) -> Result<Vec<Line>, String> {
         if !self.result.dependencies.iter().any(|p| p == path) {
             self.result.dependencies.push(path.into());
         }
@@ -325,6 +359,7 @@ impl Engine<'_> {
                 global: &self.position.global,
                 pc: self.pc(),
                 allow_undefined: self.pass.is_layout(),
+                function_calls: &self.function_calls,
             },
         )
     }
@@ -338,6 +373,7 @@ impl Engine<'_> {
                 global: &self.position.global,
                 pc: self.pc(),
                 allow_undefined: false,
+                function_calls: &self.function_calls,
             },
         )
     }
@@ -417,9 +453,23 @@ impl Engine<'_> {
             if let Some(frame) = self.frames.last() {
                 self.symbol_proc.insert(key.clone(), frame.name.clone());
             }
-        } else if let Some(s) = self.result.symbols.get_mut(&key) {
+        } else {
+            let s = self
+                .result
+                .symbols
+                .get_mut(&key)
+                .ok_or_else(|| format!("Phase error for symbol '{key}'"))?;
             if s.value != value {
                 return Err(format!("Phase error for symbol '{key}'"));
+            }
+            // Constants and RAM labels carry RESERVED_BANK; address labels must stay in their bank.
+            let bank = if self.section.is_ram() {
+                RESERVED_BANK
+            } else {
+                self.position.bank
+            };
+            if s.bank != RESERVED_BANK && s.bank != bank {
+                return Err(format!("Bank mismatch for symbol '{key}'"));
             }
             s.public |= public;
         }
@@ -433,6 +483,15 @@ impl Engine<'_> {
         let mut steps = 0usize;
         while let Some(line) = self.next_source_line(&mut queue) {
             steps += 1;
+            if self.cancel.load(Ordering::Relaxed) {
+                self.error_at(
+                    &line.location,
+                    &line.trace,
+                    "E_CANCELLED",
+                    "Assembly cancelled",
+                );
+                break;
+            }
             if steps > 1_000_000 {
                 self.error_at(
                     &line.location,
@@ -469,10 +528,7 @@ impl Engine<'_> {
                     && parent_active
                     && (!line.expanded || self.mlist)
                 {
-                    self.list_line(&line, &self.position.clone(), &op, &[], false);
-                    if let Some(value) = display {
-                        self.insert_listing_value(value);
-                    }
+                    self.list_line(&line, &self.position.clone(), &op, &[], false, display);
                 }
                 continue;
             }
@@ -482,7 +538,7 @@ impl Engine<'_> {
             if op == "MACRO" || op == "MAC" {
                 let name = label.clone().unwrap_or_else(|| operand.trim().into());
                 if self.pass.is_emitting() && self.list {
-                    self.list_line(&line, &self.position.clone(), "MACRO", &[], false);
+                    self.list_line(&line, &self.position.clone(), "MACRO", &[], false, None);
                 }
                 let mut body = Vec::new();
                 let mut found = false;
@@ -492,7 +548,7 @@ impl Engine<'_> {
                         self.line_number = next.location.line;
                     }
                     if self.pass.is_emitting() && self.list {
-                        self.list_line(&next, &self.position.clone(), "MACRO", &[], false);
+                        self.list_line(&next, &self.position.clone(), "MACRO", &[], false, None);
                     }
                     let (_, next_op, _) = self.parse(source::strip_comment(&next.text));
                     if next_op == "ENDM" {
@@ -523,7 +579,7 @@ impl Engine<'_> {
                     if !self.mlist {
                         position.offset += position.page * 8192;
                     }
-                    self.list_line(&line, &position, "MACRO_CALL", &[], !self.mlist);
+                    self.list_line(&line, &position, "MACRO_CALL", &[], !self.mlist, None);
                 }
                 if line.trace.len() > 32 {
                     self.error_at(
@@ -562,10 +618,16 @@ impl Engine<'_> {
                     .iter()
                     .rposition(|a| !a.is_empty())
                     .map_or(0, |i| i + 1);
+                // Expanded lines share one trace instead of copying it per line.
+                let trace: Rc<[SourceLocation]> = line
+                    .trace
+                    .iter()
+                    .cloned()
+                    .chain(iter::once(line.location.clone()))
+                    .collect();
                 let mut expanded = Vec::new();
                 for mut next in body {
-                    next.trace = line.trace.clone();
-                    next.trace.push(line.location.clone());
+                    next.trace = Rc::clone(&trace);
                     next.expanded = true;
                     next.text = next
                         .text
@@ -631,8 +693,12 @@ impl Engine<'_> {
                         name.push_str(".asm");
                     }
                     let path = source::find_file(self.request, Path::new(&name))?;
-                    let mut trace = line.trace.clone();
-                    trace.push(line.location.clone());
+                    let trace: Rc<[SourceLocation]> = line
+                        .trace
+                        .iter()
+                        .cloned()
+                        .chain(iter::once(line.location.clone()))
+                        .collect();
                     if trace.len() > 32 {
                         return Err("Include nesting limit exceeded".into());
                     }
@@ -650,10 +716,17 @@ impl Engine<'_> {
                         self.listing
                             .push_str(&format!("#[{}]   {name}\n", depth + 1));
                         if self.list {
-                            self.list_line(&line, &self.position.clone(), "INCLUDE", &[], false);
+                            self.list_line(
+                                &line,
+                                &self.position.clone(),
+                                "INCLUDE",
+                                &[],
+                                false,
+                                None,
+                            );
                         }
                     }
-                    self.load(&path, trace)
+                    self.load(&path, &trace)
                 })();
                 match loaded {
                     Ok(lines) => {
@@ -686,12 +759,12 @@ impl Engine<'_> {
                         && (!line.expanded || self.mlist)
                         && !["LIST", "MLIST", "NOMLIST"].contains(&op.as_str())
                     {
-                        self.list_line(&line, &start, &op, &bytes, label.is_some());
-                        if (op == "=" || op == "EQU")
-                            && let Ok(value) = self.value(&operand)
-                        {
-                            self.insert_listing_value(value);
-                        }
+                        let value = if op == "=" || op == "EQU" {
+                            self.value(&operand).ok()
+                        } else {
+                            None
+                        };
+                        self.list_line(&line, &start, &op, &bytes, label.is_some(), value);
                     }
                 }
                 Err(e) => {
@@ -775,7 +848,19 @@ impl Engine<'_> {
                 let condition = if !parent {
                     false
                 } else if op == "IF" {
-                    self.value(operand)? != 0
+                    let condition = self.value(operand)? != 0;
+                    if self.pass.is_layout() {
+                        self.if_results.push(condition);
+                    } else {
+                        let layout = self.if_results.get(self.if_index).copied();
+                        self.if_index += 1;
+                        if layout != Some(condition) {
+                            return Err(
+                                "IF condition changed between passes (forward reference)".into()
+                            );
+                        }
+                    }
+                    condition
                 } else {
                     let key = if operand.starts_with('.') {
                         format!("{}{operand}", self.position.global)
@@ -836,7 +921,11 @@ impl Engine<'_> {
             let value = self.value(operand)?;
             let global = self.position.global.clone();
             let key = self.define(name, value, line, false)?;
-            let symbol = self.result.symbols.get_mut(&key).unwrap();
+            let symbol = self
+                .result
+                .symbols
+                .get_mut(&key)
+                .ok_or_else(|| format!("Phase error for symbol '{key}'"))?;
             symbol.bank = RESERVED_BANK;
             symbol.page = 0;
             self.position.global = global;
@@ -891,7 +980,11 @@ impl Engine<'_> {
         if op == "RS"
             && let Some(key) = &key
         {
-            self.result.symbols.get_mut(key).unwrap().bank = RESERVED_BANK;
+            self.result
+                .symbols
+                .get_mut(key)
+                .ok_or_else(|| format!("Phase error for symbol '{key}'"))?
+                .bank = RESERVED_BANK;
         }
         if op == "RS" {
             self.position.global = global;
@@ -1123,20 +1216,26 @@ impl Engine<'_> {
                 if end > length {
                     return Err("INCBIN range out of bounds".into());
                 }
-                let available = if self.frames.is_empty() {
-                    LIMIT.checked_sub(self.linear())
+                let (available, limit_error) = if self.frames.is_empty() {
+                    (LIMIT.checked_sub(self.linear()), "ROM limit exceeded")
                 } else {
-                    BANK_SIZE.checked_sub(self.position.offset)
-                }
-                .ok_or("ROM limit exceeded")?;
-                if size > available as u64 {
-                    return Err("ROM limit exceeded".into());
+                    (
+                        BANK_SIZE.checked_sub(self.position.offset),
+                        "Procedure exceeds 8 KiB",
+                    )
+                };
+                if available.is_none_or(|a| size > a as u64) {
+                    return Err(limit_error.into());
                 }
                 file.seek(SeekFrom::Start(offset))
                     .map_err(|e| e.to_string())?;
                 bytes = vec![0; size as usize];
                 file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
-                let page = (self.position.page + (self.position.offset + bytes.len()) / 8192) & 7;
+                let page = if self.frames.is_empty() {
+                    (self.position.page + (self.position.offset + bytes.len()) / 8192) & 7
+                } else {
+                    self.position.page
+                };
                 self.emit_buffer(&bytes)?;
                 self.position.page = page;
             }
@@ -1166,7 +1265,14 @@ impl Engine<'_> {
                     .iter()
                     .map(|a| self.value(a).map(|v| v as usize))
                     .collect::<Result<Vec<_>, _>>()?;
-                bytes = image::pcx_tiles(&fs::read(path).map_err(|e| e.to_string())?, &nums)?;
+                let mut data = Vec::new();
+                fs::File::open(path)
+                    .and_then(|f| f.take(PCX_LIMIT + 1).read_to_end(&mut data))
+                    .map_err(|e| e.to_string())?;
+                if data.len() as u64 > PCX_LIMIT {
+                    return Err("PCX file is too large".into());
+                }
+                bytes = image::pcx_tiles(&data, &nums)?;
                 self.emit_buffer(&bytes)?;
             }
             "INESPRG" | "INESCHR" | "INESMAP" | "INESMIR" => {
@@ -1263,7 +1369,7 @@ impl Engine<'_> {
                     code: "W_BANK_OVERFLOW".into(),
                     message: format!("Bank overflow by {overflow} bytes"),
                     location: line.location.clone(),
-                    expansion_trace: line.trace.clone(),
+                    expansion_trace: line.trace.to_vec(),
                 });
             }
         }
@@ -1341,7 +1447,11 @@ impl Engine<'_> {
             pos.offset += 1;
         }
         self.position = pos;
-        if self.position.offset == 8192 && (buffer || self.cat.contains(&self.position.bank)) {
+        // A procedure keeps offset 8192 at its end so ENDP records the full size.
+        if self.position.offset == 8192
+            && self.frames.is_empty()
+            && (buffer || self.cat.contains(&self.position.bank))
+        {
             self.position.bank += 1;
             self.position.page = (self.position.page + 1) & 7;
             self.position.offset = 0;
@@ -1389,18 +1499,51 @@ impl Engine<'_> {
         let mut mode;
         let mut auto_increment = None;
         let mut auto_tag = None;
+        // Parenthesized indirect forms exist only with AUTOZP, as in the C# version:
+        // `(zp,X)` and `(zp),Y`. Anything else in parentheses is an expression.
+        let paren_indirect = if let Some(after_paren) = compact.strip_prefix('(') {
+            if !self.auto_zp {
+                if after_paren.trim_start().starts_with('<') {
+                    return Err(
+                        "Use [..] for indirect addressing, or enable AUTOZP for (..)".into(),
+                    );
+                }
+                None
+            } else {
+                matching_paren(compact).and_then(|end| {
+                    let inner = &compact[1..end];
+                    let tail = compact[end + 1..].replace(' ', "").to_ascii_uppercase();
+                    let parts = source::arguments(inner).ok()?;
+                    let pre_indexed =
+                        tail.is_empty() && parts.len() == 2 && parts[1].eq_ignore_ascii_case("X");
+                    let post_indexed = parts.len() == 1 && (tail == ",Y" || tail == ",Y++");
+                    (pre_indexed || post_indexed).then_some((inner, tail))
+                })
+            }
+        } else {
+            None
+        };
         if let Some(rest) = compact.strip_prefix('#') {
             expr = rest;
             mode = Mode::Imm;
         } else {
             let upper = compact.to_ascii_uppercase().replace(' ', "");
             let brackets = compact.starts_with('[');
-            let parens = compact.starts_with('(') && (self.auto_zp || name == "JMP");
-            if brackets || parens {
-                let close = if brackets { ']' } else { ')' };
-                let index = compact.rfind(close).ok_or("Missing indirect delimiter")?;
+            if let Some((inner, tail)) = &paren_indirect {
+                if tail.is_empty() {
+                    expr = &inner[..inner.rfind(',').ok_or("Invalid indirect operand")?];
+                    mode = if name == "JMP" { Mode::Ix } else { Mode::Zix };
+                } else {
+                    expr = inner;
+                    mode = Mode::Ziy;
+                    if tail == ",Y++" {
+                        auto_increment = Some(0xc8);
+                    }
+                }
+            } else if brackets {
+                let index = compact.rfind(']').ok_or("Missing indirect delimiter")?;
                 let inner = &compact[1..index];
-                let tail = compact[index + 1..].trim().to_ascii_uppercase();
+                let tail = compact[index + 1..].replace(' ', "");
                 let parts = source::arguments(inner)?;
                 if parts.len() == 2 && parts[1].eq_ignore_ascii_case("X") {
                     expr = &inner[..inner.rfind(',').unwrap()];
@@ -1408,8 +1551,13 @@ impl Engine<'_> {
                 } else if let Some(tag) = tail.strip_prefix('.') {
                     expr = inner;
                     mode = Mode::Ziy;
-                    auto_tag = Some(self.value(tag)? as u8);
-                } else if tail.starts_with(",Y") {
+                    let tag = self.value(tag)?;
+                    if self.pass.is_emitting() && tag > 255 {
+                        return Err("Indirect tag out of range".into());
+                    }
+                    auto_tag = Some(tag as u8);
+                } else if tail.to_ascii_uppercase().starts_with(",Y") {
+                    let tail = tail.to_ascii_uppercase();
                     expr = inner;
                     mode = Mode::Ziy;
                     if tail == ",Y++" {
@@ -1443,10 +1591,19 @@ impl Engine<'_> {
                 mode = Mode::Abs;
             }
         }
-        let forced = expr.trim().starts_with('<');
-        let absolute = expr.trim().starts_with('>');
-        expr = expr.trim().trim_start_matches(['<', '>']);
+        // In immediate mode `<`/`>` are the unary low/high byte operators.
+        let immediate = mode == Mode::Imm;
+        let forced = !immediate && expr.trim().starts_with('<');
+        let absolute = !immediate && expr.trim().starts_with('>');
+        expr = expr.trim();
+        if !immediate {
+            expr = expr.trim_start_matches(['<', '>']);
+        }
         let mut value = self.value(expr)?;
+        // C#-compatible fallback: AUTOZP `(addr),Y` above zero page is absolute,Y.
+        if paren_indirect.is_some() && mode == Mode::Ziy && value > 255 {
+            mode = Mode::Ay;
+        }
         if forced || (self.auto_zp && !absolute && value <= 255) {
             let zp = match mode {
                 Mode::Abs => Mode::Zp,
@@ -1521,7 +1678,8 @@ impl Engine<'_> {
         }
         let name = label.unwrap_or(operand).trim().to_string();
         let name = if name.is_empty() && group {
-            format!("__group_{}__", self.procedures.len() + 1)
+            self.unnamed_groups += 1;
+            format!("__group_{}__", self.unnamed_groups)
         } else {
             name
         };
@@ -1578,8 +1736,8 @@ impl Engine<'_> {
                 .procedures
                 .iter_mut()
                 .find(|p| p.name == frame.name)
-                .unwrap();
-            p.size = end - p.base;
+                .ok_or("Procedure not found")?;
+            p.size = end.checked_sub(p.base).ok_or("Procedure too large")?;
             if p.size > 8192 {
                 return Err("Procedure too large".into());
             }
@@ -1633,7 +1791,10 @@ impl Engine<'_> {
                 .iter()
                 .find(|p| &p.name == proc_name)
                 .unwrap();
-            if let Some(s) = self.result.symbols.get_mut(name) {
+            // Constants (EQU/RS) and RAM labels are not procedure addresses.
+            if let Some(s) = self.result.symbols.get_mut(name)
+                && s.bank != RESERVED_BANK
+            {
                 s.value = s
                     .value
                     .wrapping_add(p.org as u32)
@@ -1703,14 +1864,6 @@ impl Engine<'_> {
         };
         Ok(vec![0x20, target as u8, (target >> 8) as u8])
     }
-    fn insert_listing_value(&mut self, value: u32) {
-        let start = self.listing[..self.listing.len() - 1]
-            .rfind('\n')
-            .map_or(0, |i| i + 1);
-        self.listing.replace_range(start + 7..start + 14, "       ");
-        self.listing
-            .replace_range(start + 16..start + 20, &format!("{:04X}", value & 65535));
-    }
     fn list_line(
         &mut self,
         line: &Line,
@@ -1718,6 +1871,7 @@ impl Engine<'_> {
         op: &str,
         bytes: &[u8],
         has_label: bool,
+        value: Option<u32>,
     ) {
         if self.request.options.list_level == 0 {
             return;
@@ -1760,6 +1914,11 @@ impl Engine<'_> {
             for (j, b) in chunk.iter().enumerate() {
                 put(&mut prefix, 16 + j * 3, &format!("{b:02X}"));
             }
+            // EQU and IF lines show their value instead of an address.
+            if let Some(value) = value {
+                put(&mut prefix, 7, "       ");
+                put(&mut prefix, 16, &format!("{:04X}", value & 65535));
+            }
             self.listing.extend(prefix);
             if i == 0 {
                 self.listing.push_str(&line.text);
@@ -1767,6 +1926,27 @@ impl Engine<'_> {
             self.listing.push('\n');
         }
     }
+}
+/// Index of the `)` closing the operand's leading `(`, skipping quoted text.
+fn matching_paren(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (i, c) in text.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 fn put(buffer: &mut [char], offset: usize, text: &str) {
     for (out, c) in buffer[offset..].iter_mut().zip(text.chars()) {

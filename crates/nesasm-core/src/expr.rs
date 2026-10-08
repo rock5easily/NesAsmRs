@@ -1,6 +1,9 @@
 use crate::state::RESERVED_BANK;
 use crate::{Region, Symbol};
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap};
+
+/// Expression function calls allowed in one assembly, across both passes.
+pub(crate) const FUNCTION_CALL_LIMIT: usize = 1_000_000;
 
 pub(crate) struct Context<'a> {
     pub symbols: &'a BTreeMap<String, Symbol>,
@@ -9,6 +12,8 @@ pub(crate) struct Context<'a> {
     pub global: &'a str,
     pub pc: u32,
     pub allow_undefined: bool,
+    /// Expression function calls made so far in this assembly.
+    pub function_calls: &'a Cell<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,6 +293,11 @@ impl<'ctx, 'symbols> Parser<'ctx, 'symbols> {
         }
         self.expect(")")?;
         if let Some(body) = self.ctx.functions.get(name) {
+            let calls = self.ctx.function_calls.get() + 1;
+            if calls > FUNCTION_CALL_LIMIT {
+                return Err("Expression function evaluation limit exceeded".into());
+            }
+            self.ctx.function_calls.set(calls);
             let mut body = body.clone();
             for (i, n) in args.iter().enumerate() {
                 body = body.replace(&format!("\\{}", i + 1), &format!("({n})"));
