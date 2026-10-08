@@ -355,6 +355,13 @@ impl<'t, 'b> Parser<'t, '_, 'b> {
         let upper = name.to_ascii_uppercase();
         if upper == "REGIONSIZE" {
             let Token::String(region) = self.peek() else {
+                // Reported in the emit pass, as in C#, so later lines are checked too.
+                if self.ctx.allow_undefined
+                    && self.expr(0).is_ok()
+                    && self.expect(Op::Close).is_ok()
+                {
+                    return Ok(0);
+                }
                 return Err("REGIONSIZE requires a string".into());
             };
             let size = self.ctx.regions.get(region).and_then(|r| r.size);

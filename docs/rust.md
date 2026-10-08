@@ -63,7 +63,11 @@ iNES/raw/S-record、リスト出力、watchを提供します。PCE専用機能�
     `$11111111` が `$01` 相当になります。
   - マクロの `\#` は、空でない最後の引数の番号（引数がなければ0）を返します。
     C#版は9番目の引数が空だと常に9を返します。
-  - これらはC#との比較ハーネスの対象外とし、Rustのテストで検証します。
+  - `CATBANK` で次のバンクへ続いたデータも `_nb_bank` に数えます。C#版は数えません。
+  - DB文字列の非ASCII文字は、ソースの文字コードのバイト列で出力します（UTF-8の `あ` は
+    `E3 81 82`、`-e SJIS` では `82 A0`）。C#版は文字コードの下位1バイトだけを出力します。
+  - 2番目以降の文字列引数に含まれる `\"` を正しく扱います。C#版はエラーまたは例外になります。
+  - これらは比較ハーネスの既知の差分（`KNOWN_DIFFERENCES`）として扱い、Rustのテストで検証します。
 
 ### Rust版の拡張仕様
 
@@ -72,8 +76,9 @@ iNES/raw/S-record、リスト出力、watchを提供します。PCE専用機能�
 - `.DS count, fill` で領域を `fill` の値で埋めます。省略時は0です。
 - 行末の `\`（コメントを除いた末尾）で次の行に継続します。継続行は空白1つで連結します。
   ファイル末尾で継続が終わらない場合はエラーです。
-- 式で単項 `<`（下位バイト）と `>`（上位バイト）を使えます。命令オペランド先頭の
-  `<`／`>` は従来どおりゼロページ／絶対アドレスの指定です。
+- 式で単項 `<`（下位バイト）と `>`（上位バイト）を使えます。即値（`#<value`、`#>value`）でも
+  使えます。それ以外の命令オペランド先頭の `<`／`>` は従来どおりゼロページ／絶対アドレスの指定です。
+- `lda.l`／`lda.h` は `low_byte`／`high_byte` と同じ意味です（C#版にはありません）。
 - 式で `==` を `=` と同じ等値比較として使えます。
 - `X`、`Y`、`A` をシンボル名として定義・参照できます。命令オペランドで単独の
   `A` は従来どおりアキュムレータ指定です。
@@ -132,11 +137,15 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
-CIはWindows x64、Linux x64、macOS ARM64、macOS Intelで同じ検証を実施します。
+CIはWindows x64、Linux x64、macOS ARM64、macOS Intelでclippy・テスト・リリースビルドを実施し、
+`cargo fmt` の確認は1つのジョブで行います。テストにはgolden.jsonとの互換性比較と、
+Windowsではジャンクション経由のルート脱出の拒否を含みます。
 成功したバイナリをOS別のActions artifactとして保存します。
-ワークフローはpush、PR、手動実行に対応します。公開先へのアップロードは行いません。
+ワークフローは `develop/2.x`・`rustdev` へのpush、PR、手動実行に対応します。
+公開先へのアップロードは行いません。ActionsはコミットSHAで固定し、
+Rustツールチェーンは `rust-toolchain.toml` だけで指定します。
 
-WindowsでC#との比較を実行するには.NET SDKとPythonが必要です。
+WindowsでC#との比較を実行するには.NET SDK（またはVisual StudioのRoslyn `csc`）とPythonが必要です。
 比較ハーネスは.NET Framework 4.8を対象に、元のAssemblerソースを変更せずリンクして
 ビルドします。参照アセンブリはNuGetから取得するため、古い4.5.2開発環境は不要です。
 
@@ -144,12 +153,23 @@ WindowsでC#との比較を実行するには.NET SDKとPythonが必要です。
 dotnet build tools/compat/Oracle.csproj --configuration Release
 cargo build --workspace --locked
 python tools/compat/compare.py --oracle tools/compat/bin/Release/net48/NesAsmOracle.exe --rust target/debug/nesasm.exe
+# C#の結果を記録し直す場合
+python tools/compat/compare.py ... --write-golden tools/compat/golden.json
 ```
 
 各fixtureを別プロセスで実行し、成功・失敗、ROM全バイト、配置map、ヘッダ、
-シンボル値・バンク・データサイズ、領域サイズ、S-record、リストを比較します。
-リストは入力パスと改行を正規化します。失敗時の診断文言は完全一致を求めません。
+シンボル（両方向に名前と値・バンク・データサイズ）、領域サイズ、S-record、リストを比較します。
+さらにRustが書き出した `.nes`／`.s28`／`.lst` ファイルを、改行コードと文字コードを含めて
+バイト単位で比較します。失敗するケースではエラーの行番号を比較し、終了コードがエラー件数で
+あることも確認します。診断文言は完全一致を求めません。
+Rustが意図的に異なる動作をするケースは `KNOWN_DIFFERENCES`（シンボル単位は
+`KNOWN_SYMBOL_DIFFERENCES`）に理由とともに列挙し、FAILではなくKNOWNとして報告します。
 比較結果は `target/compat/cases` に保存し、CI失敗時にはartifactとして回収します。
+
+`--write-golden tools/compat/golden.json` で、一致したケースのC#の結果を記録します。
+`cargo test` の `golden` テストがこのファイルと比較するため、C#を実行できない
+Linux・macOSでも同じ互換性ケースを検証できます。CIの互換性ジョブは、記録済みの
+golden.jsonが最新のC#の結果と一致することも確認します。
 
 既存fixtureに加え、全命令・アドレッシング形式、式、マクロ引数、前方参照、
 プロシージャ・グループ、バンク境界と復帰、リストのレベル、文字コードを検証します。

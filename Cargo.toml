@@ -24,3 +24,4 @@ encoding_rs = "0.8"
 schemars = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
 rmcp = { version = "3", features = ["server", "transport-io"] }
+tempfile = "3"

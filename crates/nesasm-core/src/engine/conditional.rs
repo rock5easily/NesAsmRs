@@ -71,6 +71,17 @@ impl Engine<'_> {
             _ => None,
         };
         let parent_active = self.conditions.parent_active();
+        // Like the C# DoIf/DoIfdef, an active IF line defines its label.
+        if let Some(name) = statement.label.as_deref()
+            && matches!(
+                directive,
+                Directive::If | Directive::Ifdef | Directive::Ifndef
+            )
+            && self.conditions.active()
+            && let Err(e) = self.define(name, self.pc(), line, false)
+        {
+            self.line_error(line, DiagnosticCode::Symbol, &e.message);
+        }
         if let Err(e) = self.conditional(directive, operand, line) {
             self.line_error(line, DiagnosticCode::Conditional, &e.message);
             return;

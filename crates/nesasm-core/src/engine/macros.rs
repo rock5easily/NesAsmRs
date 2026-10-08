@@ -4,7 +4,7 @@ use super::{Engine, PendingLine, Statement, extend_trace};
 use crate::error::AsmError;
 use crate::source::{self, Line};
 use crate::state::{BANK_SIZE, MAX_NESTING};
-use crate::{BankRef, DiagnosticCode};
+use crate::{BankRef, DiagnosticCode, SourceLocation};
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Write,
@@ -50,16 +50,23 @@ enum ArgumentKind {
 impl Engine<'_> {
     /// Reads a macro body up to ENDM. The definition must close before its
     /// source file returns.
+    /// Returns true when the definition is unterminated, which is fatal.
     pub(super) fn define_macro(
         &mut self,
         line: &Line,
         statement: &Statement,
         queue: &mut VecDeque<PendingLine>,
-    ) {
+    ) -> bool {
         let name = statement
             .label
             .clone()
             .unwrap_or_else(|| statement.operand.trim().into());
+        // As in the C# version an invalid name is a label error: the body is not
+        // read, so its lines are assembled (and a later ENDM is unexpected).
+        if !name.is_empty() && !valid_macro_name(&name) {
+            self.line_error(line, DiagnosticCode::Macro, "Invalid macro name");
+            return false;
+        }
         let listed = self.pass.is_emitting() && self.listing.enabled;
         if listed {
             self.list_line(line, self.position, None, &[], false, None);
@@ -79,16 +86,36 @@ impl Engine<'_> {
             }
             body.push(next);
         }
-        let key = name.to_ascii_uppercase();
-        if !found || name.is_empty() || name.contains('.') || self.macros.contains(&key) {
-            self.line_error(
-                line,
+        if !found {
+            // Reported, like C#, at the end of the file the definition started in.
+            let end = self
+                .cache
+                .sources
+                .get(&*line.file)
+                .and_then(|(_, text)| text.last().map(|(n, _)| n + 1))
+                .unwrap_or(line.line);
+            let at = SourceLocation {
+                line: end,
+                ..line.location()
+            };
+            self.error_at(
+                &at,
+                &line.trace,
                 DiagnosticCode::Macro,
-                "Invalid, duplicate or unterminated macro",
+                &format!(
+                    "Incomplete MACRO definition (started at line {})",
+                    line.line
+                ),
             );
-            return;
+            return true;
+        }
+        let key = name.to_ascii_uppercase();
+        if name.is_empty() || self.macros.contains(&key) {
+            self.line_error(line, DiagnosticCode::Macro, "Invalid or duplicate macro");
+            return false;
         }
         self.macros.definitions.insert(key, body.into());
+        false
     }
 
     /// Expands a macro call into the lines to assemble next.
@@ -175,6 +202,13 @@ impl Engine<'_> {
             ArgumentKind::Constant
         }
     }
+}
+
+/// A macro name is a global label name.
+fn valid_macro_name(name: &str) -> bool {
+    name.len() <= 64
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Replaces `\1`-`\9`, `\?1`-`\?9`, `\#` and `\@` in one pass, so text that an

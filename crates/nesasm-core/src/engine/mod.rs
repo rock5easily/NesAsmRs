@@ -518,7 +518,9 @@ impl<'a> Engine<'a> {
                 continue;
             }
             if directive == Some(Directive::Macro) {
-                self.define_macro(&line, &statement, &mut queue);
+                if self.define_macro(&line, &statement, &mut queue) {
+                    return true;
+                }
                 continue;
             }
             if let Some(body) = self.macros.get(&statement.op) {

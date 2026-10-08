@@ -35,12 +35,16 @@ public static class Oracle
         catch (Exception e) { stdout.WriteLine(e.ToString()); }
         listingWriter.Flush();
         var symbols = new SortedDictionary<string, object>();
+        // Only defined labels and constants: the table also holds macro and
+        // function names and symbols that were referenced but never defined.
         foreach (var s in assembler.Context.GLablHashTbl.Values)
         {
             if (s.Name == null) continue;
-            symbols[s.Name] = new { value = unchecked((uint)s.Value), bank = s.Bank, size = s.DataSize };
+            if (s.Type == SymbolFlag.DEFABS)
+                symbols[s.Name] = new { value = unchecked((uint)s.Value), bank = s.Bank, size = s.DataSize };
             if (s.Local != null) foreach (var local in s.Local)
-                symbols[s.Name + local.Name] = new { value = unchecked((uint)local.Value), bank = local.Bank, size = local.DataSize };
+                if (local.Type == SymbolFlag.DEFABS)
+                    symbols[s.Name + local.Name] = new { value = unchecked((uint)local.Value), bank = local.Bank, size = local.DataSize };
         }
         var regions = assembler.Context.RegionTbl.ToDictionary(p => p.Key, p => (object)new {
             size = p.Value.BeginBank >= 0 && p.Value.EndBank >= 0 ? (long?)p.Value.RegionSize : null

@@ -15,3 +15,6 @@ serde_json.workspace = true
 schemars.workspace = true
 tokio.workspace = true
 rmcp.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,11 +1,20 @@
 name: Rust build, test and compatibility
 on:
   push:
+    branches: [develop/2.x, rustdev]
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
+# Actions are pinned to commit SHAs (tag in the comment). The Rust toolchain
+# and its components come from rust-toolchain.toml.
 jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install
+      - run: cargo fmt --all -- --check
   rust:
     strategy:
       fail-fast: false
@@ -13,16 +22,16 @@ jobs:
         os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Clippy runs on every OS because some code is platform specific.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Includes the golden C# compatibility cases (tools/compat/golden.json)
+      # and, on Windows, the junction escape test.
       - run: cargo test --workspace --locked
       - run: cargo build --workspace --release --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nesasm-${{ matrix.os }}
           path: |
@@ -34,19 +43,21 @@ jobs:
   compatibility:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '8.0.x'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - run: dotnet build tools/compat/Oracle.csproj --configuration Release
       - run: cargo build --workspace --locked
-      - run: python tools/compat/compare.py --oracle tools/compat/bin/Release/net48/NesAsmOracle.exe --rust target/debug/nesasm.exe
-      - uses: actions/upload-artifact@v4
+      - run: python tools/compat/compare.py --oracle tools/compat/bin/Release/net48/NesAsmOracle.exe --rust target/debug/nesasm.exe --write-golden target/compat/golden.json
+      - name: Recorded golden results are current
+        run: python tools/compat/check_golden.py tools/compat/golden.json target/compat/golden.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
           name: compatibility-results

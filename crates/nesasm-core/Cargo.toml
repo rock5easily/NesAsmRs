@@ -17,3 +17,6 @@ schemars = { workspace = true, optional = true }
 [features]
 # JSON schemas for the public types (used by the MCP server).
 schema = ["dep:schemars"]
+
+[dev-dependencies]
+tempfile.workspace = true

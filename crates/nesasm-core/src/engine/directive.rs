@@ -4,7 +4,7 @@ use super::{Cursor, Engine, Position, Statement};
 use crate::error::{AsmError, AsmResult};
 use crate::source::{self, Line};
 use crate::state::{BANK_SIZE, BSS_LIMIT, MAX_BANKS, PCX_LIMIT, ROM_LIMIT, Section, ZP_LIMIT};
-use crate::{DataType, Diagnostic, DiagnosticCode, Region, Severity, image};
+use crate::{DataType, Diagnostic, DiagnosticCode, Region, Severity, SourceEncoding, image};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},
@@ -530,6 +530,29 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// Appends a string character as it is encoded in the source file: ASCII as
+    /// one byte, other characters as their UTF-8 or SJIS bytes. (C# keeps only
+    /// the low byte of the character code.)
+    fn push_char(&self, bytes: &mut Vec<u8>, c: char) -> AsmResult<()> {
+        if c.is_ascii() {
+            bytes.push(c as u8);
+            return Ok(());
+        }
+        let mut buffer = [0; 4];
+        let text = c.encode_utf8(&mut buffer);
+        match self.request.options.encoding {
+            SourceEncoding::Utf8 => bytes.extend_from_slice(text.as_bytes()),
+            SourceEncoding::Sjis => {
+                let (encoded, _, unmappable) = encoding_rs::SHIFT_JIS.encode(text);
+                if unmappable {
+                    return Err(format!("Character '{c}' cannot be encoded as SJIS").into());
+                }
+                bytes.extend_from_slice(&encoded);
+            }
+        }
+        Ok(())
+    }
+
     /// DB/DW operands: numbers and (for DB) strings with `\` escapes.
     fn data(&mut self, operand: &str, wide: bool) -> AsmResult<Vec<u8>> {
         if self.section.is_ram() {
@@ -553,7 +576,7 @@ impl Engine<'_> {
                             x => x,
                         };
                     }
-                    bytes.push(c as u8);
+                    self.push_char(&mut bytes, c)?;
                 }
             } else {
                 let n = self.value(&arg)?;

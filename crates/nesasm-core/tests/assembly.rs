@@ -2,19 +2,13 @@ use nesasm_core::{AssembleOptions, AssembleRequest, AssembleResult, SourceEncodi
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
 };
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-struct Temp(PathBuf);
+/// A project directory that is removed when the test ends, even on panic.
+struct Temp(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 impl Temp {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "nesasm-test-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
+        let dir = tempfile::tempdir().unwrap();
+        Self(dir.path().to_owned(), dir)
     }
     fn run(&self, text: &str, options: AssembleOptions) -> AssembleResult {
         fs::write(self.0.join("test.asm"), text).unwrap();
@@ -25,11 +19,6 @@ impl Temp {
             allowed_root: Some(self.0.clone()),
             options,
         })
-    }
-}
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 fn fixture(path: &Path) -> AssembleResult {
@@ -872,4 +861,228 @@ fn macro_arguments_are_substituted_once() {
     );
     assert!(r.success, "{:?}", r.diagnostics);
     assert_eq!(&r.binary[..2], b"a2");
+}
+
+fn error_codes(r: &AssembleResult) -> Vec<String> {
+    r.diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .map(|d| d.code.to_string())
+        .collect()
+}
+
+#[test]
+fn nested_conditionals_select_one_branch() {
+    let t = Temp::new();
+    let r = t.run(
+        concat!(
+            "ON = 1\n",
+            "  .if ON\n  .if 0\n  .db 1\n  .else\n  .db 2\n  .endif\n  .else\n  .db 3\n  .endif\n",
+            "  .ifdef ON\n  .db 4\n  .endif\n",
+            "  .ifndef ON\n  .db 5\n  .else\n  .db 6\n  .endif\n",
+            "  .ifndef missing\n  .db 7\n  .endif\n",
+        ),
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..4], &[2, 4, 6, 7]);
+    for (text, code) in [
+        ("  .else\n", "E_CONDITIONAL"),
+        ("  .endif\n", "E_CONDITIONAL"),
+        ("  .if 1\n  .else\n  .else\n  .endif\n", "E_CONDITIONAL"),
+    ] {
+        let r = t.run(text, AssembleOptions::default());
+        assert_eq!(error_codes(&r), [code], "{text}");
+    }
+}
+
+#[test]
+fn rs_allocates_consecutive_constants() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .rsset $10\na .rs 2\nb .rs 1\nc .rs 4\n  .db a, b, c\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..3], &[0x10, 0x12, 0x13]);
+    assert_eq!(r.symbols["c"].bank, nesasm_core::BankRef::Constant);
+    assert!(
+        !t.run("  .rsset $10000\n", AssembleOptions::default())
+            .success
+    );
+}
+
+#[test]
+fn call_uses_a_trampoline_for_another_bank() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .bank 0\n  .org $c000\n  call far\nfar .proc\n  rts\n  .endp\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let far = &r.symbols["far"];
+    assert_eq!(
+        (far.bank, far.value),
+        (nesasm_core::BankRef::Rom(1), 0xa000)
+    );
+    // JSR to the trampoline at $8000 in the bank after the procedures.
+    assert_eq!(&r.binary[..3], &[0x20, 0x00, 0x80]);
+    let call_bank = 2 * 0x2000;
+    assert_eq!(
+        r.binary[call_bank + 5],
+        1,
+        "trampoline selects the procedure bank"
+    );
+    assert_eq!(&r.binary[call_bank + 10..call_bank + 12], &[0x00, 0xa0]);
+    assert_eq!(r.binary[0x2000], 0x60);
+}
+
+#[test]
+fn fail_directive_reports_its_line() {
+    let t = Temp::new();
+    let r = t.run("  nop\n  .fail \"stop here\"\n", AssembleOptions::default());
+    assert!(!r.success);
+    let d = &r.diagnostics[0];
+    assert_eq!((d.message.as_str(), d.location.line), ("\"stop here\"", 2));
+}
+
+#[test]
+fn nesting_and_size_limits_are_errors() {
+    let t = Temp::new();
+    let r = t.run("  .include \"test.asm\"\n", AssembleOptions::default());
+    assert_eq!(error_codes(&r), ["E_INCLUDE"]);
+    assert!(r.diagnostics[0].message.contains("nesting limit"));
+    let r = t.run(
+        "loop .macro\n  loop\n  .endm\n  loop\n",
+        AssembleOptions::default(),
+    );
+    assert_eq!(error_codes(&r), ["E_LIMIT"]);
+    let r = t.run(
+        &format!(";{}\n", "x".repeat(1024 * 1024)),
+        AssembleOptions::default(),
+    );
+    assert_eq!(error_codes(&r), ["E_IO"]);
+    assert!(r.diagnostics[0].message.contains("1 MiB"));
+    let r = t.run("  .db 1, \\\n", AssembleOptions::default());
+    assert_eq!(error_codes(&r), ["E_IO"]);
+    assert!(r.diagnostics[0].message.contains("continuation"));
+    let deep = "  .if 1\n".repeat(70);
+    assert!(!t.run(&deep, AssembleOptions::default()).success);
+}
+
+#[test]
+fn srec_records_have_valid_checksums() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .bank 0\n  .org $8000\nStart:\n  lda #1\n  .ds 40, $ea\n  rts\n",
+        AssembleOptions {
+            srec: true,
+            ..AssembleOptions::default()
+        },
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert!(r.header.is_empty());
+    let srec = r.srec.unwrap();
+    let mut records = 0;
+    for line in srec.lines() {
+        let bytes: Vec<u8> = (2..line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(usize::from(bytes[0]), bytes.len() - 1, "{line}");
+        let sum = bytes.iter().fold(0u8, |s, b| s.wrapping_add(*b));
+        assert_eq!(sum, 0xff, "checksum of {line}");
+        records += 1;
+    }
+    assert!(srec.lines().last().unwrap().starts_with("S8"));
+    assert!(records >= 3);
+}
+
+#[test]
+fn listing_level_is_validated_when_deserialized() {
+    let parse = |json: &str| serde_json::from_str::<AssembleOptions>(json);
+    assert!(parse(r#"{"list_level":3}"#).is_ok());
+    assert!(parse(r#"{"list_level":4}"#).is_err());
+    assert!(parse(r#"{"unknown":1}"#).is_err());
+}
+
+#[test]
+fn directive_aliases_and_header_settings() {
+    let t = Temp::new();
+    let r = t.run(
+        concat!(
+            "  .ineschr 2\n  .inesmir 1\n  .inesmap 4\n",
+            "VALUE .equ $1234\n",
+            "emit .mac\n  .byte \\1\n  .endm\n",
+            "  .bank 0\n  .org $8000\n",
+            "  .word VALUE\n  emit 9\n",
+            "  .autozp 1\n  lda $0010\n",
+            "  .zp\nzp1: .ds 1\n  .bss\nram: .ds 2\n  .code\n  lda zp1\n",
+            // DATA keeps its own cursor, which starts at offset 0 of the bank.
+            "  .data\n  .db 5\n",
+        ),
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.header[4..8], &[0, 2, 0x41, 0]);
+    assert_eq!(&r.binary[..7], &[5, 0x12, 9, 0xa5, 0x10, 0xa5, 0x00]);
+    assert_eq!(r.symbols["ram"].value, 0x200);
+    assert_eq!(r.ram.bss_end, 0x202);
+}
+
+#[cfg(windows)]
+#[test]
+fn junction_escape_is_rejected() {
+    let t = Temp::new();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.asm"), "  .db 1\n").unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(t.0.join("link"))
+        .arg(outside.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let r = t.run(
+        "  .include \"link/secret.asm\"\n",
+        AssembleOptions::default(),
+    );
+    assert!(!r.success);
+    assert!(
+        r.diagnostics[0]
+            .message
+            .contains("outside the project root"),
+        "{:?}",
+        r.diagnostics
+    );
+    let ok = nesasm_core::assemble(&AssembleRequest {
+        input: "test.asm".into(),
+        working_directory: t.0.clone(),
+        include_paths: vec![],
+        allowed_root: None,
+        options: AssembleOptions::default(),
+    });
+    assert!(ok.success, "without a root the junction is followed");
+}
+
+#[test]
+fn db_strings_keep_source_encoding_bytes() {
+    let t = Temp::new();
+    let r = t.run("  .db \"aあé\", 1\n", AssembleOptions::default());
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..7], &[0x61, 0xe3, 0x81, 0x82, 0xc3, 0xa9, 1]);
+    let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode("  .db \"aあ\\\"\", 1\n");
+    fs::write(t.0.join("test.asm"), &sjis).unwrap();
+    let r = nesasm_core::assemble(&AssembleRequest {
+        input: "test.asm".into(),
+        working_directory: t.0.clone(),
+        include_paths: vec![],
+        allowed_root: None,
+        options: AssembleOptions {
+            encoding: SourceEncoding::Sjis,
+            ..AssembleOptions::default()
+        },
+    });
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..5], &[0x61, 0x82, 0xa0, b'"', 1]);
 }
