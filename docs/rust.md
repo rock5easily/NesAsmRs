@@ -176,7 +176,8 @@ WindowsでC#との比較を実行するには.NET SDK（またはVisual Studio�
 ビルドします。参照アセンブリはNuGetから取得するため、古い4.5.2開発環境は不要です。
 
 ```powershell
-dotnet build tools/compat/Oracle.csproj --configuration Release
+# C#版（NesAsmSharp）のチェックアウト先を CSharpRoot で指定します（既定は ../..）
+dotnet build tools/compat/Oracle.csproj --configuration Release -p:CSharpRoot=<NesAsmSharpのパス>
 cargo build --workspace --locked
 python tools/compat/compare.py --oracle tools/compat/bin/Release/net48/NesAsmOracle.exe --rust target/debug/nesasm.exe
 # C#の結果を記録し直す場合

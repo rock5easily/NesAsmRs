@@ -35,9 +35,9 @@ fn fixture(path: &Path) -> AssembleResult {
 
 #[test]
 fn existing_fixture_success_and_failure() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/compat/fixtures");
     for folder in ["AdditionalDirectiveTest", "AdditionalFunctionTest"] {
-        for file in fs::read_dir(root.join(folder).join("TestData")).unwrap() {
+        for file in fs::read_dir(root.join(folder)).unwrap() {
             let path = file.unwrap().path();
             if path.extension().is_none_or(|e| e != "asm") {
                 continue;

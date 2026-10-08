@@ -26,6 +26,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = ROOT / "tools/compat/fixtures"
 
 RUST_FLAGS = {"--sjis": ["-e", "SJIS"], "--raw": ["-raw"], "--autozp": ["-autozp"],
               "--srec": ["-srec"], "--list3": ["-l3"], "--list1": ["-l1"],
@@ -254,11 +255,11 @@ def compare_files(rust, fixture, output, flags, old):
 def cases(work):
     """(fixture, flags, name, golden source) for every case."""
     result = []
-    for folder in sorted((ROOT / "Tests").glob("*/TestData")):
+    for folder in sorted(p for p in FIXTURES.iterdir() if p.is_dir() and p.name != "general"):
         for fixture in sorted(folder.glob("*.asm")):
-            result.append((fixture, (), folder.parent.name + "_" + fixture.stem,
+            result.append((fixture, (), folder.name + "_" + fixture.stem,
                            {"file": fixture.relative_to(ROOT).as_posix()}))
-    for fixture in sorted((ROOT / "Tests/fixtures").glob("*.asm")):
+    for fixture in sorted((FIXTURES / "general").glob("*.asm")):
         source = {"file": fixture.relative_to(ROOT).as_posix()}
         result.append((fixture, (), fixture.stem, source))
         if fixture.name == "instructions.asm":

@@ -51,7 +51,7 @@
   {
    "name": "AdditionalDirectiveTest_catbank_sample",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/catbank_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/catbank_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -119,7 +119,7 @@
   {
    "name": "AdditionalDirectiveTest_empty_region_sample",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/empty_region_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/empty_region_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -193,7 +193,7 @@
   {
    "name": "AdditionalDirectiveTest_incbin_catbank_sample",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/incbin_catbank_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/incbin_catbank_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -264,7 +264,7 @@
   {
    "name": "AdditionalDirectiveTest_insufficient_region_sample",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/insufficient_region_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/insufficient_region_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -338,7 +338,7 @@
   {
    "name": "AdditionalDirectiveTest_invalid_label_definition_public_sample1",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/invalid_label_definition_public_sample1.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/invalid_label_definition_public_sample1.asm"
    },
    "flags": [],
    "expected": {
@@ -351,7 +351,7 @@
   {
    "name": "AdditionalDirectiveTest_invalid_label_definition_public_sample2",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/invalid_label_definition_public_sample2.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/invalid_label_definition_public_sample2.asm"
    },
    "flags": [],
    "expected": {
@@ -364,7 +364,7 @@
   {
    "name": "AdditionalDirectiveTest_invalid_region_sample1",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/invalid_region_sample1.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/invalid_region_sample1.asm"
    },
    "flags": [],
    "expected": {
@@ -378,7 +378,7 @@
   {
    "name": "AdditionalDirectiveTest_invalid_region_sample2",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/invalid_region_sample2.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/invalid_region_sample2.asm"
    },
    "flags": [],
    "expected": {
@@ -392,7 +392,7 @@
   {
    "name": "AdditionalDirectiveTest_no_catbank_sample",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/no_catbank_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/no_catbank_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -405,7 +405,7 @@
   {
    "name": "AdditionalDirectiveTest_no_public_sample1",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/no_public_sample1.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/no_public_sample1.asm"
    },
    "flags": [],
    "expected": {
@@ -421,7 +421,7 @@
   {
    "name": "AdditionalDirectiveTest_no_public_sample2",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/no_public_sample2.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/no_public_sample2.asm"
    },
    "flags": [],
    "expected": {
@@ -437,7 +437,7 @@
   {
    "name": "AdditionalDirectiveTest_public_sample1",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/public_sample1.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/public_sample1.asm"
    },
    "flags": [],
    "expected": {
@@ -523,7 +523,7 @@
   {
    "name": "AdditionalDirectiveTest_public_sample2",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/public_sample2.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/public_sample2.asm"
    },
    "flags": [],
    "expected": {
@@ -609,7 +609,7 @@
   {
    "name": "AdditionalDirectiveTest_undefined_public_sample1",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/undefined_public_sample1.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/undefined_public_sample1.asm"
    },
    "flags": [],
    "expected": {
@@ -625,7 +625,7 @@
   {
    "name": "AdditionalDirectiveTest_undefined_public_sample2",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/undefined_public_sample2.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/undefined_public_sample2.asm"
    },
    "flags": [],
    "expected": {
@@ -641,7 +641,7 @@
   {
    "name": "AdditionalDirectiveTest_various_region_sample",
    "source": {
-    "file": "Tests/AdditionalDirectiveTest/TestData/various_region_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalDirectiveTest/various_region_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -719,7 +719,7 @@
   {
    "name": "AdditionalFunctionTest_insufficient_regionsize_sample",
    "source": {
-    "file": "Tests/AdditionalFunctionTest/TestData/insufficient_regionsize_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalFunctionTest/insufficient_regionsize_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -733,7 +733,7 @@
   {
    "name": "AdditionalFunctionTest_invalid_argument_regionsize_sample1",
    "source": {
-    "file": "Tests/AdditionalFunctionTest/TestData/invalid_argument_regionsize_sample1.asm"
+    "file": "tools/compat/fixtures/AdditionalFunctionTest/invalid_argument_regionsize_sample1.asm"
    },
    "flags": [],
    "expected": {
@@ -746,7 +746,7 @@
   {
    "name": "AdditionalFunctionTest_invalid_argument_regionsize_sample2",
    "source": {
-    "file": "Tests/AdditionalFunctionTest/TestData/invalid_argument_regionsize_sample2.asm"
+    "file": "tools/compat/fixtures/AdditionalFunctionTest/invalid_argument_regionsize_sample2.asm"
    },
    "flags": [],
    "expected": {
@@ -760,7 +760,7 @@
   {
    "name": "AdditionalFunctionTest_no_defined_regionsize_sample",
    "source": {
-    "file": "Tests/AdditionalFunctionTest/TestData/no_defined_regionsize_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalFunctionTest/no_defined_regionsize_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -773,7 +773,7 @@
   {
    "name": "AdditionalFunctionTest_various_regionsize_sample",
    "source": {
-    "file": "Tests/AdditionalFunctionTest/TestData/various_regionsize_sample.asm"
+    "file": "tools/compat/fixtures/AdditionalFunctionTest/various_regionsize_sample.asm"
    },
    "flags": [],
    "expected": {
@@ -881,7 +881,7 @@
   {
    "name": "expressions",
    "source": {
-    "file": "Tests/fixtures/expressions.asm"
+    "file": "tools/compat/fixtures/general/expressions.asm"
    },
    "flags": [],
    "expected": {
@@ -962,7 +962,7 @@
   {
    "name": "instructions",
    "source": {
-    "file": "Tests/fixtures/instructions.asm"
+    "file": "tools/compat/fixtures/general/instructions.asm"
    },
    "flags": [],
    "expected": {
@@ -1043,7 +1043,7 @@
   {
    "name": "instructions_options",
    "source": {
-    "file": "Tests/fixtures/instructions.asm"
+    "file": "tools/compat/fixtures/general/instructions.asm"
    },
    "flags": [
     "--raw",
@@ -1111,7 +1111,7 @@
   {
    "name": "instructions_srec",
    "source": {
-    "file": "Tests/fixtures/instructions.asm"
+    "file": "tools/compat/fixtures/general/instructions.asm"
    },
    "flags": [
     "--srec"
@@ -1177,7 +1177,7 @@
   {
    "name": "invalid_branch",
    "source": {
-    "file": "Tests/fixtures/invalid_branch.asm"
+    "file": "tools/compat/fixtures/general/invalid_branch.asm"
    },
    "flags": [],
    "expected": {
@@ -1190,7 +1190,7 @@
   {
    "name": "invalid_condition",
    "source": {
-    "file": "Tests/fixtures/invalid_condition.asm"
+    "file": "tools/compat/fixtures/general/invalid_condition.asm"
    },
    "flags": [],
    "expected": {
@@ -1203,7 +1203,7 @@
   {
    "name": "invalid_opcode",
    "source": {
-    "file": "Tests/fixtures/invalid_opcode.asm"
+    "file": "tools/compat/fixtures/general/invalid_opcode.asm"
    },
    "flags": [],
    "expected": {
@@ -1216,7 +1216,7 @@
   {
    "name": "listing",
    "source": {
-    "file": "Tests/fixtures/listing.asm"
+    "file": "tools/compat/fixtures/general/listing.asm"
    },
    "flags": [],
    "expected": {
@@ -1292,7 +1292,7 @@
   {
    "name": "listing_list0",
    "source": {
-    "file": "Tests/fixtures/listing.asm"
+    "file": "tools/compat/fixtures/general/listing.asm"
    },
    "flags": [
     "--list0"
@@ -1370,7 +1370,7 @@
   {
    "name": "listing_list1",
    "source": {
-    "file": "Tests/fixtures/listing.asm"
+    "file": "tools/compat/fixtures/general/listing.asm"
    },
    "flags": [
     "--list1"
@@ -1448,7 +1448,7 @@
   {
    "name": "listing_list3",
    "source": {
-    "file": "Tests/fixtures/listing.asm"
+    "file": "tools/compat/fixtures/general/listing.asm"
    },
    "flags": [
     "--list3"
@@ -1526,7 +1526,7 @@
   {
    "name": "listing_mlist",
    "source": {
-    "file": "Tests/fixtures/listing.asm"
+    "file": "tools/compat/fixtures/general/listing.asm"
    },
    "flags": [
     "--mlist"
@@ -1604,7 +1604,7 @@
   {
    "name": "macros",
    "source": {
-    "file": "Tests/fixtures/macros.asm"
+    "file": "tools/compat/fixtures/general/macros.asm"
    },
    "flags": [],
    "expected": {
@@ -1680,7 +1680,7 @@
   {
    "name": "procedures",
    "source": {
-    "file": "Tests/fixtures/procedures.asm"
+    "file": "tools/compat/fixtures/general/procedures.asm"
    },
    "flags": [],
    "expected": {
@@ -1771,7 +1771,7 @@
   {
    "name": "sections",
    "source": {
-    "file": "Tests/fixtures/sections.asm"
+    "file": "tools/compat/fixtures/general/sections.asm"
    },
    "flags": [],
    "expected": {
