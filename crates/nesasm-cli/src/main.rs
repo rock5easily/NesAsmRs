@@ -218,6 +218,19 @@ fn print_segment_usage(result: &AssembleResult, detail: bool) {
     println!("\t\t\t\t    ---- ----");
     println!("\t\t\t\t    {:4}K{:4}K", (used + 1023) >> 10, free >> 10);
 }
+/// Whether a source file changed after `started`, i.e. while or just after it
+/// was assembled, before its state was recorded; such a change would otherwise
+/// be missed. Directories are skipped: writing the artifacts updates them.
+/// Timestamps in the future are ignored.
+fn changed_since(
+    files: &BTreeMap<PathBuf, Option<(SystemTime, u64)>>,
+    started: SystemTime,
+) -> bool {
+    let now = SystemTime::now();
+    files.iter().any(|(path, state)| {
+        path.is_file() && state.is_some_and(|(modified, _)| modified >= started && modified <= now)
+    })
+}
 fn fingerprint(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<(SystemTime, u64)>> {
     paths
         .iter()
@@ -264,6 +277,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let mut started = SystemTime::now();
     let mut result = run(&args);
     if args.watch {
         // Keyboard handling uses a separate thread, so polling works on all three OSes.
@@ -293,6 +307,7 @@ fn main() {
             }
         }));
         let mut previous = fingerprint(&paths);
+        let mut stale = changed_since(&previous, started);
         loop {
             std::thread::sleep(Duration::from_millis(200));
             let key = match recv.try_recv() {
@@ -307,9 +322,10 @@ fn main() {
                 println!("H: help, R: rebuild, Q: quit (press Enter after key)");
             }
             let current = fingerprint(&paths);
-            if current != previous || key == "R" {
+            if current != previous || stale || key == "R" {
                 // Debounce bursts from editors replacing files.
                 std::thread::sleep(Duration::from_millis(100));
+                started = SystemTime::now();
                 result = run(&args);
                 for p in result.dependencies {
                     if !paths.contains(&p) {
@@ -317,6 +333,7 @@ fn main() {
                     }
                 }
                 previous = fingerprint(&paths);
+                stale = changed_since(&previous, started);
             }
         }
     } else if !result.success {
