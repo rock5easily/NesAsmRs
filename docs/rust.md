@@ -167,7 +167,7 @@ CIはWindows x64、Linux x64、macOS ARM64、macOS Intelでclippy・テスト・
 `cargo fmt` の確認は1つのジョブで行います。テストにはgolden.jsonとの互換性比較と、
 Windowsではジャンクション経由のルート脱出の拒否を含みます。
 成功したバイナリをOS別のActions artifactとして保存します。
-ワークフローは `develop/2.x`・`rustdev` へのpush、PR、手動実行に対応します。
+ワークフローは `main` へのpush、PR、手動実行に対応します。
 公開先へのアップロードは行いません。ActionsはコミットSHAで固定し、
 Rustツールチェーンは `rust-toolchain.toml` だけで指定します。
 
@@ -176,7 +176,7 @@ WindowsでC#との比較を実行するには.NET SDK（またはVisual Studio�
 ビルドします。参照アセンブリはNuGetから取得するため、古い4.5.2開発環境は不要です。
 
 ```powershell
-# C#版（NesAsmSharp）のチェックアウト先を CSharpRoot で指定します（既定は ../..）
+# C#版（NesAsmSharp）のチェックアウト先を CSharpRoot で指定します
 dotnet build tools/compat/Oracle.csproj --configuration Release -p:CSharpRoot=<NesAsmSharpのパス>
 cargo build --workspace --locked
 python tools/compat/compare.py --oracle tools/compat/bin/Release/net48/NesAsmOracle.exe --rust target/debug/nesasm.exe

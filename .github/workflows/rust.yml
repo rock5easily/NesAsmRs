@@ -1,7 +1,7 @@
 name: Rust build, test and compatibility
 on:
   push:
-    branches: [develop/2.x, rustdev]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:

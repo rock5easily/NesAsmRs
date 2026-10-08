@@ -1,0 +1,8 @@
+/target/
+__pycache__/
+*.nes
+*.lst
+*.s28
+# C# oracle build output (tools/compat)
+bin/
+obj/
