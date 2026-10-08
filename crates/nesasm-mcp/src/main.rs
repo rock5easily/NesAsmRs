@@ -3,9 +3,14 @@ use nesasm_core::{
     ReferenceTopic, Region, SourceLocation, Symbol,
 };
 use rmcp::{
-    ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ServerCapabilities, ServerConfig,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -21,6 +26,8 @@ use std::{
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+/// Reference documents are resources at `nesasm://reference/<topic>`.
+const REFERENCE_URI: &str = "nesasm://reference/";
 
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -240,10 +247,60 @@ impl Server {
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         let mut config = ServerConfig::default();
-        config.capabilities = ServerCapabilities::builder().enable_tools().build();
+        config.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         config.server_info = Implementation::new("nesasm-mcp", env!("CARGO_PKG_VERSION"));
-        config.instructions=Some("NESASM assembler. Start with get_reference; use check to inspect diagnostics before assemble. All paths are relative to the configured project root.".into());
+        config.instructions = Some(
+            concat!(
+                "NESASM assembler. Read the syntax reference first (get_reference, or the ",
+                "nesasm://reference/* resources); use check to inspect diagnostics before ",
+                "assemble. All paths are relative to the configured project root."
+            )
+            .into(),
+        );
         config
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let resources = ReferenceTopic::ALL
+            .iter()
+            .map(|topic| {
+                Resource::new(
+                    format!("{REFERENCE_URI}{}", topic.name()),
+                    format!("reference/{}", topic.name()),
+                )
+                .with_title(format!("NESASM reference: {}", topic.name()))
+                .with_description(topic.summary())
+                .with_mime_type("text/markdown")
+                .with_size(topic.text().len() as u64)
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let topic = request
+            .uri
+            .strip_prefix(REFERENCE_URI)
+            .and_then(|name| name.parse::<ReferenceTopic>().ok())
+            .filter(|topic| request.uri == format!("{REFERENCE_URI}{}", topic.name()))
+            .ok_or_else(|| {
+                ErrorData::resource_not_found(format!("Unknown resource '{}'", request.uri), None)
+            })?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(topic.text(), request.uri).with_mime_type("text/markdown"),
+        ])
+        .into())
     }
 }
 

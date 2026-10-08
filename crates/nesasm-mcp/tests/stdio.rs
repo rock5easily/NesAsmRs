@@ -342,3 +342,55 @@ fn structured_content_matches_output_schema() {
         }
     }
 }
+
+#[test]
+fn reference_documents_are_resources() {
+    let mut c = Client::start();
+    assert!(c.server_info["capabilities"]["resources"].is_object());
+    let listed = c.request("resources/list", json!({}));
+    let resources = listed["result"]["resources"].as_array().unwrap();
+    let uris: Vec<&str> = resources
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            "nesasm://reference/index",
+            "nesasm://reference/instructions",
+            "nesasm://reference/directives",
+            "nesasm://reference/expressions",
+            "nesasm://reference/options",
+        ]
+    );
+    for resource in resources {
+        assert_eq!(resource["mimeType"], "text/markdown");
+        assert!(
+            resource["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty())
+        );
+        let uri = resource["uri"].as_str().unwrap();
+        let read = c.request("resources/read", json!({"uri":uri}));
+        let contents = &read["result"]["contents"][0];
+        assert_eq!(contents["uri"], uri, "{read}");
+        // The same text as the get_reference tool.
+        let topic = uri.rsplit('/').next().unwrap();
+        let tool = c.call("get_reference", json!({"topic":topic}));
+        assert_eq!(contents["text"], tool["structuredContent"]["text"]);
+        assert_eq!(
+            resource["size"].as_u64(),
+            Some(contents["text"].as_str().unwrap().len() as u64)
+        );
+    }
+    for uri in [
+        "nesasm://reference/unknown",
+        "nesasm://reference/INDEX",
+        "file:///etc/passwd",
+    ] {
+        let read = c.request("resources/read", json!({"uri":uri}));
+        assert_eq!(read["error"]["code"], -32002, "{uri}: {read}");
+    }
+    let templates = c.request("resources/templates/list", json!({}));
+    assert_eq!(templates["result"]["resourceTemplates"], json!([]));
+}

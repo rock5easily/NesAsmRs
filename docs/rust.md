@@ -126,6 +126,10 @@ includeパスは各要求の `include_paths` で渡します。サーバは `NES
 stdoutにはMCP通信だけを出力します。JSONとして解析できない行にはJSON-RPCの
 `-32700 Parse error` を返します。サーバ名は `nesasm-mcp` として通知します。ROMバイト列は応答に含めず、成果物パスを返します。
 `check` は同じ処理を実行して結果だけを返します。
+リファレンス文書は `get_reference` ツールに加えて、resources（`nesasm://reference/<topic>`、
+`text/markdown`）としても公開します。`resources/list` で5つのトピックの一覧、
+`resources/read` で本文を返します。未知のURIは `-32002`（resource not found）です。
+promptsとresource templatesは提供しません。
 
 MCPの `assemble` が書き込めるのは、拡張子が `.nes` か `.bin` のROMと、その名前から
 派生する `.lst`／`.s28` だけです。`.` で始まるファイルやディレクトリ（`.git` など）を

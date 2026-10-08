@@ -509,6 +509,8 @@ classDiagram
         -assemble(input)
         -check(input)
         -get_reference(input)
+        list_resources()
+        read_resource(uri)
     }
     class StdioRelay {
         <<module>>

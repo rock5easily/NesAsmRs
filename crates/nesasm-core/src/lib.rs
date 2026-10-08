@@ -480,6 +480,23 @@ pub enum ReferenceTopic {
 }
 
 impl ReferenceTopic {
+    pub const ALL: [Self; 5] = [
+        Self::Index,
+        Self::Instructions,
+        Self::Directives,
+        Self::Expressions,
+        Self::Options,
+    ];
+    /// A one-line summary of the topic.
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::Index => "Overview of the NESASM syntax and a minimal program",
+            Self::Instructions => "6502 instructions, addressing modes and operand extensions",
+            Self::Directives => "Assembler directives and assembler limits",
+            Self::Expressions => "Numbers, operators, functions and labels in expressions",
+            Self::Options => "Command-line options, include paths and exit status",
+        }
+    }
     pub const fn name(self) -> &'static str {
         match self {
             Self::Index => "index",
