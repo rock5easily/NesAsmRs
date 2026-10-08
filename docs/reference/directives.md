@@ -3,6 +3,10 @@
 Directive names are case insensitive and accept a leading dot.
 
 - BANK bank[, name], ORG address: select 8 KiB bank and CPU address.
+- PAGE index: select the CPU page (0-7, address index * $2000) without changing
+  the bank offset; not allowed inside procedures.
+- A word in column 1 is always a label, even when it spells an instruction,
+  directive or macro; indent instructions and directives.
 - ZP, BSS, CODE, DATA: switch allocation sections.
 - DB/BYTE values or strings, DW/WORD values, DS count[, fill]: emit data.
 - label EQU expression, label = expression: define a constant.

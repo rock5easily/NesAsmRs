@@ -105,7 +105,8 @@ pub struct Symbol {
     pub name: String,
     pub value: u32,
     pub bank: usize,
-    pub page: usize,
+    /// CPU page of an address label; `None` for constants (C# page -1).
+    pub page: Option<usize>,
     pub location: SourceLocation,
     pub public: bool,
     pub size: usize,
@@ -123,8 +124,38 @@ pub struct Region {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BankUsage {
     pub bank: usize,
+    /// Name given by `.BANK bank, "name"`.
+    #[serde(default)]
+    pub name: Option<String>,
     pub used: usize,
     pub capacity: usize,
+    /// Contiguous runs of one section, in bank order.
+    #[serde(default)]
+    pub segments: Vec<Segment>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionKind {
+    ZeroPage,
+    Bss,
+    Code,
+    Data,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Segment {
+    pub section: SectionKind,
+    /// CPU address of the first byte.
+    pub start: usize,
+    pub size: usize,
+}
+
+/// Highest RAM addresses used (exclusive), as offsets from the RAM base.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RamUsage {
+    pub zero_page_end: usize,
+    pub bss_end: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -138,6 +169,8 @@ pub struct AssembleResult {
     pub symbols: BTreeMap<String, Symbol>,
     pub regions: BTreeMap<String, Region>,
     pub banks: Vec<BankUsage>,
+    #[serde(default)]
+    pub ram: RamUsage,
     pub dependencies: Vec<PathBuf>,
     pub listing: Option<String>,
     pub srec: Option<String>,

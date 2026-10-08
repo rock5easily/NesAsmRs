@@ -15,6 +15,7 @@ Parentheses group expressions (`jmp ($1234)` is an absolute jump). With autozp,
 absolute,Y. In immediate operands `#<value` / `#>value` take the low/high byte.
 `lda low_byte #$1234` / `lda high_byte #$1234` select the low/high byte
 of an immediate value. For memory operands, high_byte increments the address.
+`lda.l` / `lda.h` are equivalent to low_byte / high_byte.
 `lda [$12].3` inserts `ldy #3` before indirect-indexed loading; `,x++` / `,y++`
 append an index increment after an instruction.
 

@@ -1,6 +1,6 @@
 use crate::{
-    AssembleRequest, AssembleResult, BankUsage, DataType, Diagnostic, Region, Severity,
-    SourceLocation, Symbol,
+    AssembleRequest, AssembleResult, BankUsage, DataType, Diagnostic, RamUsage, Region,
+    SectionKind, Segment, Severity, SourceLocation, Symbol,
 };
 use crate::{
     expr, image,
@@ -94,10 +94,14 @@ struct Engine<'a> {
     /// IF results from the layout pass, compared in order during the emit pass.
     if_results: Vec<bool>,
     if_index: usize,
+    /// Bytes each executed line advanced in the layout pass, replayed on emit errors.
+    line_sizes: Vec<Option<usize>>,
+    line_index: usize,
     /// Unnamed PROCGROUP counter, reset each pass so both passes agree on names.
     unnamed_groups: usize,
     function_calls: std::cell::Cell<usize>,
     max_bss: usize,
+    max_zp: usize,
 }
 
 pub fn assemble(request: &AssembleRequest) -> AssembleResult {
@@ -146,8 +150,11 @@ pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> A
         if_results: Vec::new(),
         if_index: 0,
         unnamed_groups: 0,
+        line_sizes: Vec::new(),
+        line_index: 0,
         function_calls: std::cell::Cell::new(0),
         max_bss: 0x201,
+        max_zp: 1,
     };
     let location = SourceLocation {
         file: request.input.clone(),
@@ -198,13 +205,8 @@ pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> A
     for (pass, lines) in [(Pass::Layout, lines.clone()), (Pass::Emit, lines)] {
         engine.pass = pass;
         engine.reset();
-        engine.run(lines);
-        // After an earlier error the open blocks are an artifact of stopping early.
-        let stopped = engine
-            .result
-            .diagnostics
-            .iter()
-            .any(|d| d.severity == Severity::Error);
+        // After a fatal error the open blocks are an artifact of stopping early.
+        let stopped = engine.run(lines);
         if !stopped && !engine.conditions.is_empty() {
             engine.error_at(&location, &[], "E_CONDITIONAL", "Missing ENDIF");
         }
@@ -239,15 +241,12 @@ pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> A
             engine.result.header = engine.header.to_vec();
         }
         engine.result.banks = (0..=engine.max_bank)
-            .map(|bank| BankUsage {
-                bank,
-                used: engine.occupied[bank * BANK_SIZE..(bank + 1) * BANK_SIZE]
-                    .iter()
-                    .filter(|b| **b)
-                    .count(),
-                capacity: BANK_SIZE,
-            })
+            .map(|bank| engine.bank_usage(bank))
             .collect();
+        engine.result.ram = RamUsage {
+            zero_page_end: engine.max_zp,
+            bss_end: engine.max_bss,
+        };
         if engine.any_list && request.options.list_level > 0 {
             engine.result.listing = Some(engine.listing);
         }
@@ -265,6 +264,42 @@ pub fn assemble_with_cancel(request: &AssembleRequest, cancel: &AtomicBool) -> A
 }
 
 impl Engine<'_> {
+    /// Used bytes and section runs of one bank, for the segment usage report.
+    fn bank_usage(&self, bank: usize) -> BankUsage {
+        let base = bank * BANK_SIZE;
+        let occupied = &self.occupied[base..base + BANK_SIZE];
+        let map = &self.result.map[base..base + BANK_SIZE];
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut offset = 0;
+        while offset < BANK_SIZE {
+            if !occupied[offset] {
+                offset += 1;
+                continue;
+            }
+            let section = map[offset] & 0x0f;
+            let start = offset;
+            while offset < BANK_SIZE && occupied[offset] && map[offset] & 0x0f == section {
+                offset += 1;
+            }
+            segments.push(Segment {
+                section: match section {
+                    0 => SectionKind::ZeroPage,
+                    1 => SectionKind::Bss,
+                    3 => SectionKind::Data,
+                    _ => SectionKind::Code,
+                },
+                start: (usize::from(map[start] >> 5) << 13) + start,
+                size: offset - start,
+            });
+        }
+        BankUsage {
+            bank,
+            name: self.bank_names.get(&bank).cloned(),
+            used: occupied.iter().filter(|b| **b).count(),
+            capacity: BANK_SIZE,
+            segments,
+        }
+    }
     fn reset(&mut self) {
         self.position = Position {
             page: 7,
@@ -292,7 +327,9 @@ impl Engine<'_> {
         self.if_undefined.clear();
         if self.pass.is_layout() {
             self.if_results.clear();
+            self.line_sizes.clear();
         }
+        self.line_index = 0;
         self.if_index = 0;
         self.unnamed_groups = 0;
         self.cat.clear();
@@ -315,7 +352,7 @@ impl Engine<'_> {
                 name: name.into(),
                 value,
                 bank: RESERVED_BANK,
-                page: 0,
+                page: None,
                 location: SourceLocation::default(),
                 public: true,
                 size: 0,
@@ -394,6 +431,9 @@ impl Engine<'_> {
         if local && self.position.global.is_empty() {
             return Err("Local label has no global scope".into());
         }
+        if !local && self.macros.contains_key(&name.to_ascii_uppercase()) {
+            return Err("Symbol already used by a macro".into());
+        }
         if name.is_empty()
             || name.len() > 64
             || !name
@@ -443,7 +483,7 @@ impl Engine<'_> {
                     } else {
                         self.position.bank
                     },
-                    page: self.position.page,
+                    page: Some(self.position.page),
                     location: line.location.clone(),
                     public: public || !local,
                     size: 0,
@@ -478,7 +518,9 @@ impl Engine<'_> {
         }
         Ok(key)
     }
-    fn run(&mut self, lines: Vec<Line>) {
+    /// Runs one pass. Line errors are reported and the pass continues, as in the
+    /// C# version; returns true when a fatal error stopped the pass early.
+    fn run(&mut self, lines: Vec<Line>) -> bool {
         let mut queue: VecDeque<PendingLine> = lines.into_iter().map(PendingLine::Source).collect();
         let mut steps = 0usize;
         while let Some(line) = self.next_source_line(&mut queue) {
@@ -490,7 +532,7 @@ impl Engine<'_> {
                     "E_CANCELLED",
                     "Assembly cancelled",
                 );
-                break;
+                return true;
             }
             if steps > 1_000_000 {
                 self.error_at(
@@ -499,7 +541,7 @@ impl Engine<'_> {
                     "E_LIMIT",
                     "Expanded source limit exceeded",
                 );
-                break;
+                return true;
             }
             if !line.expanded {
                 self.line_number = line.location.line;
@@ -521,7 +563,7 @@ impl Engine<'_> {
                 let parent_active = self.conditions.last().is_none_or(|c| c.parent);
                 if let Err(e) = self.conditional(&op, &operand) {
                     self.error_at(&line.location, &line.trace, "E_CONDITIONAL", &e);
-                    break;
+                    continue;
                 }
                 if self.pass.is_emitting()
                     && self.list
@@ -568,7 +610,7 @@ impl Engine<'_> {
                         "E_MACRO",
                         "Invalid, duplicate or unterminated macro",
                     );
-                    break;
+                    continue;
                 }
                 self.macros.insert(name.to_ascii_uppercase(), body);
                 continue;
@@ -588,19 +630,19 @@ impl Engine<'_> {
                         "E_LIMIT",
                         "Macro nesting limit exceeded",
                     );
-                    break;
+                    return true;
                 }
                 if let Some(name) = label.as_deref()
                     && let Err(e) = self.define(name, self.pc(), &line, false)
                 {
                     self.error_at(&line.location, &line.trace, "E_SYMBOL", &e);
-                    break;
+                    continue;
                 }
                 let args = match source::macro_arguments(&operand) {
                     Ok(a) => a,
                     Err(e) => {
                         self.error_at(&line.location, &line.trace, "E_MACRO", &e);
-                        break;
+                        continue;
                     }
                 };
                 if args.len() > 9 {
@@ -610,7 +652,7 @@ impl Engine<'_> {
                         "E_MACRO",
                         "Maximum nine macro arguments",
                     );
-                    break;
+                    continue;
                 }
                 self.macro_counter += 1;
                 // \# is the index of the last non-empty argument.
@@ -745,13 +787,31 @@ impl Engine<'_> {
                     }
                     Err(e) => {
                         self.error_at(&line.location, &line.trace, "E_INCLUDE", &e);
-                        break;
+                        return true;
                     }
                 }
                 continue;
             }
             let start = self.position.clone();
+            let rs_before = self.rs;
             let data = self.execute(label.as_deref(), &op, &operand, &line);
+            // Keep later addresses stable when an emit-pass line fails: advance by the
+            // size the layout pass recorded for it instead of emitting nothing.
+            let advanced = (self.position.bank == start.bank)
+                .then(|| self.position.offset.checked_sub(start.offset))
+                .flatten();
+            if self.pass.is_layout() {
+                self.line_sizes.push(advanced);
+            } else {
+                let layout = self.line_sizes.get(self.line_index).copied().flatten();
+                self.line_index += 1;
+                if data.is_err()
+                    && let Some(size) = layout
+                {
+                    self.position = start.clone();
+                    self.position.offset += size;
+                }
+            }
             match data {
                 Ok(bytes) => {
                     if self.pass.is_emitting()
@@ -759,20 +819,26 @@ impl Engine<'_> {
                         && (!line.expanded || self.mlist)
                         && !["LIST", "MLIST", "NOMLIST"].contains(&op.as_str())
                     {
-                        let value = if op == "=" || op == "EQU" {
-                            self.value(&operand).ok()
-                        } else {
-                            None
+                        // Like the C# listing: constants and RS show their value,
+                        // FUNC definitions show no address.
+                        let value = match op.as_str() {
+                            "=" | "EQU" => self.value(&operand).ok(),
+                            "RS" => Some(rs_before),
+                            _ => None,
                         };
-                        self.list_line(&line, &start, &op, &bytes, label.is_some(), value);
+                        let has_label = label.is_some() && op != "FUNC";
+                        self.list_line(&line, &start, &op, &bytes, has_label, value);
                     }
                 }
                 Err(e) => {
                     self.error_at(&line.location, &line.trace, "E_ASSEMBLY", &e);
-                    break;
+                    if is_fatal(&e) {
+                        return true;
+                    }
                 }
             }
         }
+        false
     }
     fn next_source_line(&mut self, queue: &mut VecDeque<PendingLine>) -> Option<Line> {
         loop {
@@ -824,10 +890,9 @@ impl Engine<'_> {
                 "=".into(),
                 rest.trim_start()[1..].trim().into(),
             );
-        } else if !indented
-            && !is_operation(first)
-            && !self.macros.contains_key(&first.to_ascii_uppercase())
-        {
+        } else if !indented {
+            // As in the C# version, a word in column 1 is always a label,
+            // even when it spells an instruction, directive or macro.
             label = Some(first.into());
             text = rest;
         }
@@ -927,7 +992,7 @@ impl Engine<'_> {
                 .get_mut(&key)
                 .ok_or_else(|| format!("Phase error for symbol '{key}'"))?;
             symbol.bank = RESERVED_BANK;
-            symbol.page = 0;
+            symbol.page = None;
             self.position.global = global;
             return Ok(Vec::new());
         }
@@ -959,6 +1024,20 @@ impl Engine<'_> {
             }
             return Ok(Vec::new());
         }
+        if op == "PAGE" {
+            if !self.frames.is_empty() {
+                return Err("PAGE can not be changed in procs".into());
+            }
+            if let Some(label) = label {
+                self.define(label, self.pc(), line, false)?;
+            }
+            let page = self.value(operand)? as usize;
+            if page > 7 {
+                return Err("Invalid page index".into());
+            }
+            self.position.page = page;
+            return Ok(Vec::new());
+        }
         if op == "PROC" || op == "PROCGROUP" {
             return self.begin_proc(label, operand, line, op == "PROCGROUP");
         }
@@ -980,11 +1059,13 @@ impl Engine<'_> {
         if op == "RS"
             && let Some(key) = &key
         {
-            self.result
+            let symbol = self
+                .result
                 .symbols
                 .get_mut(key)
-                .ok_or_else(|| format!("Phase error for symbol '{key}'"))?
-                .bank = RESERVED_BANK;
+                .ok_or_else(|| format!("Phase error for symbol '{key}'"))?;
+            symbol.bank = RESERVED_BANK;
+            symbol.page = None;
         }
         if op == "RS" {
             self.position.global = global;
@@ -1164,6 +1245,8 @@ impl Engine<'_> {
                     self.position.offset += count;
                     if self.section == Section::Bss {
                         self.max_bss = self.max_bss.max(self.position.offset);
+                    } else {
+                        self.max_zp = self.max_zp.max(self.position.offset);
                     }
                     self.save();
                 } else {
@@ -1325,11 +1408,10 @@ impl Engine<'_> {
                         return Err("Invalid OPT flag".into());
                     }
                     match &opt[..opt.len() - 1] {
-                        "l" => {
-                            self.list = flag;
-                            self.any_list |= flag;
-                        }
-                        "m" => self.mlist = flag || self.request.options.macro_listing,
+                        // As in C#, only .LIST requests a listing file; OPT l+ just
+                        // toggles listing, and OPT m overrides the -m default.
+                        "l" => self.list = flag,
+                        "m" => self.mlist = flag,
                         "w" => self.warn = flag,
                         "o" => {}
                         _ => return Err("Unknown OPT".into()),
@@ -1463,8 +1545,18 @@ impl Engine<'_> {
     }
     fn instruction(&self, op: &str, operand: &str) -> Result<Vec<u8>, String> {
         let (name, extension) = op.split_once('.').map_or((op, None), |(n, e)| (n, Some(e)));
-        if extension.is_some() {
-            return Err("Unknown instruction extension; use low_byte/high_byte".into());
+        // `lda.l` / `lda.h` are the C# spellings of low_byte / high_byte.
+        let suffix_ext = match extension {
+            None => None,
+            Some("L") => Some("L"),
+            Some("H") => Some("H"),
+            Some(_) => return Err("Unknown instruction extension; use .l or .h".into()),
+        };
+        if suffix_ext.is_some()
+            && (opcode::opcode(name, Mode::Imp).is_some()
+                || opcode::opcode(name, Mode::Rel).is_some())
+        {
+            return Err("Instruction extension not supported".into());
         }
         if opcode::opcode(name, Mode::Imp).is_some() {
             if !operand.is_empty() {
@@ -1481,7 +1573,7 @@ impl Engine<'_> {
             return Ok(vec![code, delta as u8]);
         }
         let mut compact = operand.trim();
-        let ext = if compact.to_ascii_lowercase().starts_with("low_byte ") {
+        let prefix_ext = if compact.to_ascii_lowercase().starts_with("low_byte ") {
             compact = compact[9..].trim_start();
             Some("L")
         } else if compact.to_ascii_lowercase().starts_with("high_byte ") {
@@ -1490,6 +1582,10 @@ impl Engine<'_> {
         } else {
             None
         };
+        if suffix_ext.is_some() && prefix_ext.is_some() {
+            return Err("Duplicate instruction extension".into());
+        }
+        let ext = suffix_ext.or(prefix_ext);
         if compact.eq_ignore_ascii_case("A") {
             return opcode::opcode(name, Mode::Acc)
                 .map(|c| vec![c])
@@ -1884,18 +1980,22 @@ impl Engine<'_> {
             0
         };
         let width = if op == "DW" || op == "WORD" { 2 } else { 3 };
-        let chunks =
-            if bytes.is_empty() || (level > self.request.options.list_level && bytes.len() > 3) {
-                vec![&[][..]]
-            } else {
-                bytes.chunks(width).collect::<Vec<_>>()
-            };
+        // Like the C# version, file includes and reserved space list only their address.
+        let address_only = ["INCBIN", "INCCHR", "DS"].contains(&op);
+        let chunks = if bytes.is_empty()
+            || address_only
+            || (level > self.request.options.list_level && bytes.len() > 3)
+        {
+            vec![&[][..]]
+        } else {
+            bytes.chunks(width).collect::<Vec<_>>()
+        };
         for (i, chunk) in chunks.iter().enumerate() {
             let mut prefix = vec![' '; 26];
             if i == 0 && !line.expanded {
                 put(&mut prefix, 0, &format!("{:5}", self.line_number));
             }
-            let bank = if start.bank < 128 {
+            let bank = if start.bank < 128 && !self.section.is_ram() {
                 format!("{:02X}", start.bank)
             } else {
                 "--".into()
@@ -1903,9 +2003,10 @@ impl Engine<'_> {
             if !bytes.is_empty() || has_label || op == "PROC" || op == "PROCGROUP" {
                 let address = format!("{:04X}", start.page * 8192 + start.offset + i * width);
                 put(&mut prefix, 7, &format!("{bank}:{}", &address[..4]));
-            } else if ["BANK", "ORG", "ZP", "BSS", "CODE", "DATA", "RSSET"].contains(&op) {
+            } else if ["BANK", "ORG", "PAGE", "ZP", "BSS", "CODE", "DATA", "RSSET"].contains(&op) {
                 let value = match op {
                     "BANK" => self.position.bank,
+                    "PAGE" => self.position.page * BANK_SIZE,
                     "RSSET" => self.rs as usize,
                     _ => self.pc() as usize,
                 };
@@ -1921,11 +2022,45 @@ impl Engine<'_> {
             }
             self.listing.extend(prefix);
             if i == 0 {
-                self.listing.push_str(&line.text);
+                self.listing.push_str(&expand_tabs(&line.text));
             }
             self.listing.push('\n');
         }
     }
+}
+/// Expands tabs to 8-column stops measured from the start of the source text,
+/// as the C# version does when it reads a line.
+fn expand_tabs(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\t') {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut column = 0;
+    for c in text.chars() {
+        if c == '\t' {
+            let spaces = 8 - column % 8;
+            out.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            out.push(c);
+            column += 1;
+        }
+    }
+    out.into()
+}
+/// Errors after which the rest of the pass would only report follow-on errors.
+fn is_fatal(message: &str) -> bool {
+    [
+        "Bank overflow",
+        "ROM limit exceeded",
+        "Procedure exceeds",
+        "Procedure too large",
+        "limit exceeded",
+        "PAGE can not be changed",
+        "Call bank",
+    ]
+    .iter()
+    .any(|m| message.contains(m))
 }
 /// Index of the `)` closing the operand's leading `(`, skipping quoted text.
 fn matching_paren(text: &str) -> Option<usize> {
@@ -1957,60 +2092,4 @@ fn word(text: &str) -> (&str, &str) {
     let text = text.trim_start();
     text.split_once(char::is_whitespace)
         .map_or((text, ""), |(a, b)| (a, b.trim_start()))
-}
-fn is_operation(op: &str) -> bool {
-    let op = op.trim_start_matches('.').to_ascii_uppercase();
-    let base = op.split('.').next().unwrap_or("");
-    opcode::known(base)
-        || [
-            "=",
-            "BANK",
-            "BSS",
-            "BYTE",
-            "CALL",
-            "CODE",
-            "DATA",
-            "DB",
-            "DW",
-            "DS",
-            "ELSE",
-            "ENDIF",
-            "ENDM",
-            "ENDP",
-            "ENDPROCGROUP",
-            "EQU",
-            "FAIL",
-            "FUNC",
-            "IF",
-            "IFDEF",
-            "IFNDEF",
-            "INCBIN",
-            "INCLUDE",
-            "INCCHR",
-            "LIST",
-            "MAC",
-            "MACRO",
-            "MLIST",
-            "NOLIST",
-            "NOMLIST",
-            "OPT",
-            "ORG",
-            "PROC",
-            "PROCGROUP",
-            "RSSET",
-            "RS",
-            "WORD",
-            "ZP",
-            "CATBANK",
-            "BEGINREGION",
-            "ENDREGION",
-            "PUBLIC",
-            "DEFCHR",
-            "INESPRG",
-            "INESCHR",
-            "INESMAP",
-            "INESMIR",
-            "AUTOZP",
-        ]
-        .contains(&base)
 }

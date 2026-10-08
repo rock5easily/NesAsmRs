@@ -150,36 +150,84 @@ fn run(args: &Arguments) -> AssembleResult {
         if result.success {
             println!("Assembled {} bytes", result.binary.len());
         }
-        for r in result.regions.values() {
-            if let Some(size) = r.size {
-                println!("Region {}: {} bytes", r.name, size);
-            } else {
-                println!(
-                    "Region {}: {} not found",
-                    r.name,
-                    if r.begin.is_none() {
-                        "BEGINREGION"
-                    } else {
-                        "ENDREGION"
-                    }
-                );
-            }
-        }
-        if args.usage > 0 {
-            for bank in &result.banks {
-                println!(
-                    "Bank {:02X}: {} / {} bytes",
-                    bank.bank, bank.used, bank.capacity
-                );
-            }
-        }
-        if args.usage > 1 {
-            for s in result.symbols.values().filter(|s| s.location.line > 0) {
-                println!("{:02X}:{:04X} {}", s.bank, s.value, s.name);
-            }
+        print_regions(&result);
+        if args.usage > 0 && result.success {
+            print_segment_usage(&result, args.usage > 1);
         }
     }
     result
+}
+/// Region report in the C# format.
+fn print_regions(result: &AssembleResult) {
+    if result.regions.is_empty() {
+        return;
+    }
+    println!("==================== Region Info ====================");
+    for r in result.regions.values() {
+        match (r.begin, r.end, r.size) {
+            (None, _, _) => println!("Region {:<12}: BEGINREGION not found", r.name),
+            (_, None, _) | (_, _, None) => println!("Region {:<12}: ENDREGION not found", r.name),
+            (_, _, Some(size)) => println!(
+                "Region {:<12}: {size:>8} bytes (0x{:06X} bytes)",
+                r.name, size as u32
+            ),
+        }
+    }
+    println!("=====================================================");
+}
+/// Segment usage table in the C# format (`-s`; `-S` adds the section runs).
+fn print_segment_usage(result: &AssembleResult, detail: bool) {
+    const SECTION_NAMES: [&str; 4] = ["  ZP", " BSS", "CODE", "DATA"];
+    println!("segment usage:\n");
+    let ram = result.ram;
+    if ram.zero_page_end <= 1 {
+        println!("      ZP    -");
+    } else {
+        let stop = ram.zero_page_end - 1;
+        println!("      ZP    ${:04X}-${stop:04X}  [{:4}]", 0, stop + 1);
+    }
+    if ram.bss_end <= 0x201 {
+        println!("     BSS    -");
+    } else {
+        let stop = ram.bss_end - 1;
+        println!(
+            "     BSS    ${:04X}-${stop:04X}  [{:4}]",
+            0x200,
+            stop - 0x200 + 1
+        );
+    }
+    if result.banks.len() > 1 {
+        println!("\t\t\t\t    USED/FREE");
+    }
+    let (mut used, mut free) = (0, 0);
+    for bank in &result.banks {
+        let name = bank.name.as_deref().unwrap_or("");
+        if bank.used == 0 {
+            println!("BANK{:4}    {name:>20}       0/8192", bank.bank);
+            continue;
+        }
+        println!(
+            "BANK{:4}    {name:>20}    {:4}/{:4}",
+            bank.bank,
+            bank.used,
+            bank.capacity - bank.used
+        );
+        used += bank.used;
+        free += bank.capacity - bank.used;
+        if detail {
+            for segment in &bank.segments {
+                println!(
+                    "    {}    ${:04X}-${:04X}  [{:4}]",
+                    SECTION_NAMES[segment.section as usize],
+                    segment.start,
+                    segment.start + segment.size - 1,
+                    segment.size
+                );
+            }
+        }
+    }
+    println!("\t\t\t\t    ---- ----");
+    println!("\t\t\t\t    {:4}K{:4}K", (used + 1023) >> 10, free >> 10);
 }
 fn fingerprint(paths: &[PathBuf]) -> BTreeMap<PathBuf, Option<(SystemTime, u64)>> {
     paths
@@ -254,7 +302,13 @@ fn main() {
             }
         }
     } else if !result.success {
-        std::process::exit(1);
+        // As in the C# version the exit code is the error count (kept within 1..=255).
+        let errors = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == nesasm_core::Severity::Error)
+            .count();
+        std::process::exit(errors.clamp(1, 255) as i32);
     }
 }
 

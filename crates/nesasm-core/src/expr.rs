@@ -5,6 +5,9 @@ use std::{cell::Cell, collections::BTreeMap};
 /// Expression function calls allowed in one assembly, across both passes.
 pub(crate) const FUNCTION_CALL_LIMIT: usize = 1_000_000;
 
+/// Keywords whose argument is a symbol rather than an expression.
+const SYMBOL_KEYWORDS: [&str; 6] = ["DEFINED", "BANK", "PAGE", "SIZEOF", "VRAM", "PAL"];
+
 pub(crate) struct Context<'a> {
     pub symbols: &'a BTreeMap<String, Symbol>,
     pub regions: &'a BTreeMap<String, Region>,
@@ -63,7 +66,7 @@ fn evaluate_inner(text: &str, ctx: &Context<'_>, depth: usize) -> Result<u32, St
                     .last()
                     .is_none_or(|t| matches!(t, Token::Op(op) if op != ")")))
         {
-            let radix = if ch == '$' {
+            let mut radix = if ch == '$' {
                 16
             } else if ch == '%' {
                 2
@@ -71,11 +74,21 @@ fn evaluate_inner(text: &str, ctx: &Context<'_>, depth: usize) -> Result<u32, St
                 10
             };
             let mut value = String::new();
-            if ch.is_ascii_digit() {
+            if ch == '0' && chars.peek().is_some_and(|c| c.eq_ignore_ascii_case(&'x')) {
+                // C-style 0x1F hexadecimal.
+                chars.next();
+                radix = 16;
+            } else if ch.is_ascii_digit() {
                 value.push(ch);
             }
-            while chars.peek().is_some_and(|c| c.is_digit(radix)) {
-                value.push(chars.next().unwrap());
+            loop {
+                match chars.peek() {
+                    Some(c) if c.is_digit(radix) => value.push(*c),
+                    // Binary literals may group digits: %1100_0011.
+                    Some('_') if radix == 2 => {}
+                    _ => break,
+                }
+                chars.next();
             }
             tokens.push(Token::Number(
                 u32::from_str_radix(&value, radix).map_err(|_| "Invalid numeric literal")?,
@@ -151,9 +164,22 @@ impl<'ctx, 'symbols> Parser<'ctx, 'symbols> {
         let mut left = match token {
             Token::Number(n) => n,
             Token::Name(name) => {
+                let upper = name.to_ascii_uppercase();
                 if self.tokens[self.pos] == Token::Op("(".into()) {
                     self.pos += 1;
-                    self.function(&name)?
+                    self.function(&name, true)?
+                } else if upper == "HIGH" || upper == "LOW" {
+                    // C# keywords are also prefix operators: `HIGH foo + 1`.
+                    let n = self.expr(10)?;
+                    if upper == "HIGH" {
+                        (n >> 8) & 255
+                    } else {
+                        n & 255
+                    }
+                } else if SYMBOL_KEYWORDS.contains(&upper.as_str())
+                    && matches!(self.tokens[self.pos], Token::Name(_))
+                {
+                    self.function(&name, false)?
                 } else {
                     match self.symbol(&name) {
                         Ok(s) => s.value,
@@ -239,7 +265,9 @@ impl<'ctx, 'symbols> Parser<'ctx, 'symbols> {
         self.pos += 1;
         Ok(())
     }
-    fn function(&mut self, name: &str) -> Result<u32, String> {
+    /// Evaluates a function call; `parens` is false for the prefix keyword form
+    /// (`BANK label`), which has no closing parenthesis.
+    fn function(&mut self, name: &str, parens: bool) -> Result<u32, String> {
         let upper = name.to_ascii_uppercase();
         if upper == "REGIONSIZE" {
             let Token::String(region) = &self.tokens[self.pos] else {
@@ -254,13 +282,15 @@ impl<'ctx, 'symbols> Parser<'ctx, 'symbols> {
                 None => Err("Region is undefined or incomplete".into()),
             };
         }
-        if ["DEFINED", "BANK", "PAGE", "SIZEOF", "VRAM", "PAL"].contains(&upper.as_str()) {
+        if SYMBOL_KEYWORDS.contains(&upper.as_str()) {
             let Token::Name(symbol) = &self.tokens[self.pos] else {
                 return Err(format!("{name} requires a symbol"));
             };
             let symbol = self.symbol(symbol).ok();
             self.pos += 1;
-            self.expect(")")?;
+            if parens {
+                self.expect(")")?;
+            }
             if upper == "DEFINED" {
                 return Ok(symbol.is_some() as u32);
             }
@@ -281,7 +311,8 @@ impl<'ctx, 'symbols> Parser<'ctx, 'symbols> {
             }
             return Ok(match upper.as_str() {
                 "BANK" => s.bank as u32,
-                "PAGE" => s.page as u32,
+                // Constants have no page; C# reports -1.
+                "PAGE" => s.page.map_or(u32::MAX, |p| p as u32),
                 "SIZEOF" => s.size as u32,
                 _ => u32::MAX,
             });

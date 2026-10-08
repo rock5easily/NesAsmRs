@@ -47,6 +47,14 @@ pub fn write_artifacts(
         vec![(ArtifactKind::Rom, rom.clone(), binary)]
     };
     let encode = |text: &str| -> Result<Vec<u8>, String> {
+        // Text artifacts use the platform line ending, like the C# WriteLine output.
+        let native;
+        let text = if cfg!(windows) {
+            native = text.replace('\n', "\r\n");
+            native.as_str()
+        } else {
+            text
+        };
         match options.encoding {
             SourceEncoding::Utf8 => Ok(text.as_bytes().to_vec()),
             SourceEncoding::Sjis => {

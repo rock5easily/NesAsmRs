@@ -723,3 +723,92 @@ fn first_error_is_not_followed_by_missing_block_errors() {
     assert!(!r.success);
     assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
 }
+
+#[test]
+fn csharp_compatible_syntax() {
+    let t = Temp::new();
+    let r = t.run(
+        concat!(
+            "  .bank 0\n  .org $c000\n  .page 7\nlab:\n  nop\n  .page 4\n  .dw lab, *\n",
+            "  .db 0x1F, 0X0a, %1100_0011\n",
+            "  .db \"a\\\"b\"\n",
+            "  lda.h $1234\n  lda.l #$1234\n",
+            "  .db HIGH lab, LOW lab, HIGH lab+1, BANK lab, PAGE lab\n",
+            "K = $1234\n  .db PAGE(K), PAGE K\n",
+        ),
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(
+        &r.binary[..23],
+        &[
+            0xea, 0x00, 0xe0, 0x01, 0x80, // .page
+            0x1f, 0x0a, 0xc3, // literals
+            0x61, 0x22, 0x62, // escaped quote
+            0xad, 0x35, 0x12, 0xa9, 0x34, // .h / .l
+            0xe0, 0x00, 0xe1, 0x00, 0x07, // keyword operators
+            0xff, 0xff, // PAGE of a constant
+        ]
+    );
+    assert_eq!(r.symbols["K"].page, None);
+    assert!(!t.run("  .page 8\n", AssembleOptions::default()).success);
+}
+
+#[test]
+fn column_one_words_are_labels() {
+    let t = Temp::new();
+    let r = t.run("nop\n\trts\n", AssembleOptions::default());
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(&r.binary[..2], &[0x60, 0x00]);
+    assert!(r.symbols.contains_key("nop"));
+    assert!(
+        !t.run(".bank 0\n  nop\n", AssembleOptions::default())
+            .success
+    );
+    assert!(
+        !t.run("m .macro\n  nop\n  .endm\nm\n", AssembleOptions::default())
+            .success
+    );
+}
+
+#[test]
+fn line_errors_are_all_reported() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .bank 0\n  .org $8000\n  bne far\n  lda #$1234\n  lda missing\n  nop\n  .ds 200\nfar:\n  rts\n",
+        AssembleOptions::default(),
+    );
+    assert!(!r.success);
+    let lines: Vec<_> = r.diagnostics.iter().map(|d| d.location.line).collect();
+    assert_eq!(lines, [3, 4, 5], "{:?}", r.diagnostics);
+}
+
+#[test]
+fn listing_matches_csharp_layout() {
+    let t = Temp::new();
+    fs::write(t.0.join("data.bin"), vec![1; 100]).unwrap();
+    let r = t.run(
+        "  .list\n  .rsset $300\nv1 .rs 2\nsq .func 2\n  .zp\nzv: .ds 1\n  .code\n  .bank 0\n  .org $c000\n\tlda\t#1\n  .incbin \"data.bin\"\n  .ds 10\n",
+        AssembleOptions::default(),
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let listing = r.listing.unwrap();
+    let line = |n: usize| {
+        listing
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{n} ")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        line(3).contains("0300") && !line(3).contains(":"),
+        "{listing}"
+    );
+    assert!(!line(4).contains(":"), "{listing}");
+    assert!(line(6).contains("--:0000"), "{listing}");
+    assert!(line(10).ends_with("        lda     #1"), "{listing}");
+    assert_eq!(listing.lines().count(), 12, "{listing}");
+    // OPT l+ alone does not request a listing.
+    let r = t.run("  .opt l+\n  nop\n", AssembleOptions::default());
+    assert!(r.listing.is_none());
+}

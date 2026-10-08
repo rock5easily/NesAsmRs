@@ -125,8 +125,14 @@ pub(crate) fn read_lines(
 
 pub(crate) fn strip_comment(text: &str) -> &str {
     let mut quote = None;
+    let mut escaped = false;
     for (i, ch) in text.char_indices() {
-        if quote == Some(ch) {
+        if escaped {
+            escaped = false;
+        } else if quote == Some('"') && ch == '\\' {
+            // `\"` inside a string does not end it, as in the C# DB parser.
+            escaped = true;
+        } else if quote == Some(ch) {
             quote = None;
         } else if quote.is_none() && (ch == '"' || ch == '\'') {
             quote = Some(ch);
@@ -142,8 +148,13 @@ pub(crate) fn arguments(text: &str) -> Result<Vec<String>, String> {
     let mut start = 0;
     let mut depth = 0i32;
     let mut quote = None;
+    let mut escaped = false;
     for (i, ch) in text.char_indices() {
-        if quote == Some(ch) {
+        if escaped {
+            escaped = false;
+        } else if quote == Some('"') && ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
             quote = None;
         } else if quote.is_some() {
             continue;

@@ -213,9 +213,3 @@ pub(crate) fn opcode(name: &str, mode: Mode) -> Option<u8> {
     };
     row.iter().find_map(|(m, v)| (*m == mode).then_some(*v))
 }
-
-pub(crate) fn known(name: &str) -> bool {
-    [Mode::Imp, Mode::Rel, Mode::Abs, Mode::Acc]
-        .iter()
-        .any(|m| opcode(name, *m).is_some())
-}

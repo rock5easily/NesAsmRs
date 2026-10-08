@@ -2,7 +2,7 @@
 
 `nesasm [-options] infile[.asm]`
 
-`-s`/`-S`: bank usage; `-l 0..3` or `-l0`..`-l3`: listing level;
+`-s`/`-S`: segment usage per bank (`-S` adds section ranges); `-l 0..3` or `-l0`..`-l3`: listing level;
 `-m`: expanded macro listing; `-raw`: omit iNES header; `-autozp`: select
 zero page automatically; `-srec`: produce .s28 instead of .nes; `-e UTF8|SJIS`: encoding;
 `-wd`: suppress warnings; `-watch`: rebuild on source/dependency changes;
