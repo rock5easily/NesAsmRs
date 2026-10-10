@@ -27,13 +27,14 @@ fn keys_show_help_and_rebuild() {
 fn failed_builds_recover_when_a_missing_file_appears() {
     let p = Project::new();
     p.write("t.asm", "  .include \"later.asm\"\n");
-    let watch = Watch::start(&p, &["-watch", "t.asm"]);
-    watch.expect("Watching dependencies.");
+    let mut watch = Watch::start(&p, &["-watch", "t.asm"]);
+    watch.ready();
     // The project directory is watched, so a new file triggers a rebuild.
     p.write("later.asm", "  .db 7\n");
     watch.expect("Assembled");
     assert_eq!(fs::read(p.path("t.nes")).unwrap()[16], 7);
     // The new dependency is watched from now on.
+    watch.ready();
     p.write("later.asm", "  .db 8, 9\n");
     watch.expect("Assembled");
     assert_eq!(&fs::read(p.path("t.nes")).unwrap()[16..18], &[8, 9]);
@@ -48,11 +49,11 @@ fn include_directories_are_watched() {
     let lib = p.path("lib");
     let lib = lib.to_str().unwrap();
     // One absolute and one relative include directory.
-    let watch = Watch::start(
+    let mut watch = Watch::start(
         &p,
         &["-watch", "--include", lib, "--include", "other", "t.asm"],
     );
-    watch.expect("Watching dependencies.");
+    watch.ready();
     p.write("lib/lib.asm", "  .db 3\n");
     watch.expect("Assembled");
     assert_eq!(fs::read(p.path("t.nes")).unwrap()[16], 3);

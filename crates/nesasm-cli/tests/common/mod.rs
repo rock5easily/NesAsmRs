@@ -137,6 +137,14 @@ impl Watch {
         }
     }
 
+    /// Waits until the watch loop has recorded the state of the watched paths.
+    /// The loop prints the H help only after that, so a change made after
+    /// this returns is compared against the recorded state.
+    pub fn ready(&mut self) {
+        self.send("h");
+        self.expect("H:");
+    }
+
     pub fn send(&mut self, key: &str) {
         let input = self.input.as_mut().unwrap();
         writeln!(input, "{key}").unwrap();
