@@ -259,4 +259,37 @@ mod tests {
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir(root).unwrap();
     }
+
+    #[test]
+    fn staging_skips_existing_temporary_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("result.nes");
+        // Occupy the next names; another test may take some of the ids first.
+        let next = NEXT_TEMP_ID.load(Ordering::Relaxed);
+        for id in next..next + 16 {
+            let name = format!(".result.nes.{}.{id}.tmp", std::process::id());
+            fs::write(dir.path().join(name), b"taken").unwrap();
+        }
+        let staged = StagedArtifact::write(ArtifactKind::Rom, path.clone(), &[1]).unwrap();
+        assert!(NEXT_TEMP_ID.load(Ordering::Relaxed) >= next + 16);
+        let artifact = staged.commit().unwrap();
+        assert_eq!((artifact.path, artifact.size), (path.clone(), 1));
+        assert_eq!(fs::read(path).unwrap(), [1]);
+    }
+
+    #[test]
+    fn staging_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = StagedArtifact::write(ArtifactKind::Rom, PathBuf::from(".."), &[1]);
+        assert_eq!(invalid.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        let missing = dir.path().join("missing").join("result.nes");
+        assert!(StagedArtifact::write(ArtifactKind::Rom, missing, &[1]).is_err());
+        // A directory created at the destination after staging makes the
+        // rename fail; the temporary file is still removed.
+        let path = dir.path().join("result.nes");
+        let staged = StagedArtifact::write(ArtifactKind::Rom, path.clone(), &[1]).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(staged.commit().is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

@@ -157,3 +157,24 @@ fn negative_immediates_are_bytes() {
     );
     t.fails("  lda #-257\n", "Operand size error");
 }
+
+#[test]
+fn operand_edge_cases() {
+    let t = Temp::new();
+    assert_eq!(
+        t.bytes(
+            // AUTOZP keeps absolute mode when no zero page form exists, and
+            // `(..)` operands may nest parentheses or quote a `)`.
+            "  .autozp 1\n  jmp $12\n  lda ((1)),y\n  lda (')'),y\n",
+            7
+        ),
+        [0x4c, 0x12, 0x00, 0xb1, 0x01, 0xb1, 0x29]
+    );
+    for (text, needle) in [
+        ("  lda [$12)]\n", "Unbalanced parentheses"),
+        ("  lda [$12].missing\n", "Undefined symbol 'missing'"),
+        ("  .autozp 1\n  lda (1\n", "Expected ')'"),
+    ] {
+        t.fails(text, needle);
+    }
+}

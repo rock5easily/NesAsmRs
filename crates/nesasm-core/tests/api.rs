@@ -319,3 +319,95 @@ fn disassembly_names_branches_and_symbols_in_other_banks() {
     assert_eq!((dump[0].address, dump[1].address), (0x8000, 0x8010));
     assert!(rom.hexdump(5, 0x8000, 1).is_err());
 }
+
+#[test]
+fn list_level_rejects_other_json() {
+    for json in ["\"full\"", "-1", "256"] {
+        assert!(serde_json::from_str::<ListLevel>(json).is_err(), "{json}");
+    }
+}
+
+#[test]
+fn output_errors() {
+    let t = Temp::new();
+    t.write("test.asm", "  .db 1\n");
+    let request = t.request(AssembleOptions::default());
+    let cancel = AtomicBool::new(false);
+    // The default output path is reported when it cannot be written.
+    fs::create_dir(t.0.join("test.nes")).unwrap();
+    let (r, _) = nesasm_core::build(&request, None, &cancel);
+    let d = r.diagnostics.last().unwrap();
+    assert_eq!(d.code, DiagnosticCode::Output);
+    assert!(d.message.starts_with("Output path is a directory"), "{d:?}");
+    assert_eq!(d.location.file, Path::new("test.nes"));
+    let r = nesasm_core::assemble(&request);
+    let write = |output: &str| {
+        nesasm_core::write_artifacts(
+            &r,
+            Path::new("test.asm"),
+            Some(Path::new(output)),
+            &t.0,
+            None,
+            &AssembleOptions::default(),
+        )
+    };
+    assert_eq!(
+        write("test.asm").unwrap_err(),
+        "Output would overwrite an input dependency"
+    );
+    // The output directory cannot be created where a file is.
+    t.write("file.txt", "x");
+    assert!(write("file.txt/rom.nes").is_err());
+    assert!(t.0.join("file.txt").is_file());
+}
+
+#[test]
+fn sjis_listing_is_encoded() {
+    let t = Temp::new();
+    let (source, _, _) = encoding_rs::SHIFT_JIS.encode("  .list\n  .db 1 ; あ\n");
+    t.write("test.asm", &source);
+    let options = AssembleOptions {
+        encoding: SourceEncoding::Sjis,
+        ..AssembleOptions::default()
+    };
+    let (r, _) = nesasm_core::build(&t.request(options), None, &AtomicBool::new(false));
+    assert!(r.success, "{:?}", r.diagnostics);
+    let listing = fs::read(t.0.join("test.lst")).unwrap();
+    assert!(listing.windows(2).any(|w| w == [0x82, 0xa0]));
+}
+
+#[test]
+fn small_payloads_and_unrelocated_symbols() {
+    // Too small to hold $FFFA, or cut off inside the vectors: no vectors.
+    let rom = Rom::from_file(&[0xea; 0x100]).unwrap();
+    assert!(rom.vectors().is_empty());
+    assert!(
+        Rom::from_file(&[0xea; 0x1ffc])
+            .unwrap()
+            .vectors()
+            .is_empty()
+    );
+    assert!(
+        Rom::from_file(&[0xea; 0x1ffe])
+            .unwrap()
+            .vectors()
+            .is_empty()
+    );
+    let symbol = nesasm_core::Symbol {
+        name: "proc".into(),
+        value: 0x8000,
+        bank: BankRef::Procedure,
+        page: None,
+        location: nesasm_core::SourceLocation {
+            file: "a.asm".into(),
+            line: 1,
+            column: None,
+        },
+        public: true,
+        size: 0,
+        data_type: None,
+    };
+    let symbols = [("proc".to_owned(), symbol)].into_iter().collect();
+    let code = rom.disassemble(0, 0x8000, 1, &symbols).unwrap();
+    assert!(code[0].labels.is_empty());
+}

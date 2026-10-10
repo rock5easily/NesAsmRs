@@ -161,3 +161,24 @@ fn expression_errors() {
         t.fails(text, needle);
     }
 }
+
+#[test]
+fn incomplete_expressions() {
+    let t = Temp::new();
+    // A binary literal can follow an operator.
+    assert_eq!(t.bytes("  .db 1+%11\n", 1), [4]);
+    for (text, needle) in [
+        ("X = HIGH\n", "Expected expression"),
+        ("X = (+)\n", "Expected expression"),
+        ("X = -\n", "Expected expression"),
+        ("X = LOW(1,)\n", "Expected expression"),
+        ("X = LOW(1\n", "Expected ')'"),
+        ("L:\nX = BANK(L\n", "Expected ')'"),
+        ("X = REGIONSIZE(\"r\"\n", "Expected ')'"),
+        ("X = SIZEOF missing\n", "Undefined symbol"),
+        // A keyword not followed by a name is an ordinary symbol.
+        ("X = BANK + 1\n", "Undefined symbol 'BANK'"),
+    ] {
+        t.fails(text, needle);
+    }
+}

@@ -39,14 +39,14 @@ fn db_strings_must_be_encodable_as_sjis() {
     let r = nesasm_core::assemble(&t.request(options.clone()));
     assert!(r.success, "{:?}", r.diagnostics);
     assert_eq!(&r.binary[..2], &[0x82, 0xa0]);
-    // An in-memory UTF-8 string with a character SJIS cannot encode.
+    // UTF-8 bytes of a character SJIS cannot represent are not SJIS text.
     let mut request = t.request(options);
     request.files.insert(
         "test.asm".into(),
         "  .db \"\u{1F600}\"\n".as_bytes().to_vec(),
     );
     let r = nesasm_core::assemble(&request);
-    assert!(!r.success);
+    assert_eq!(common::messages(&r), ["Invalid SJIS source"]);
 }
 
 #[test]
@@ -463,4 +463,199 @@ fn stray_block_ends_and_fail() {
         "label: extra 1\n",
         "Unknown instruction or addressing mode 'EXTRA'",
     );
+}
+
+#[test]
+fn operands_that_do_not_evaluate() {
+    let t = Temp::new();
+    t.write("data.bin", [1, 2]);
+    for text in [
+        "  .catbank missing\n",
+        "  .rsset missing\n",
+        "R .rs missing\n",
+        "  .autozp missing\n",
+        "  .inesprg missing\n",
+        "  .page missing\n",
+        "  .bank missing\n",
+        "  .ds missing\n",
+        "  .ds 1, missing\n",
+        "  .incbin \"data.bin\", 0, missing\n",
+    ] {
+        t.fails(text, "Undefined symbol 'missing'");
+    }
+    let r = t.fails("  .if missing\n  .endif\n", "Undefined symbol 'missing'");
+    assert_eq!(common::error_codes(&r)[0], "E_CONDITIONAL");
+    for text in [
+        "  .db 1)\n",
+        "  .defchr 1)\n",
+        "  .bank 1)\n",
+        "  .ds 1)\n",
+        "  .incbin 1)\n",
+        "  .incchr 1)\n",
+        "  .opt l+)\n",
+    ] {
+        t.fails(text, "Unbalanced parentheses");
+    }
+}
+
+#[test]
+fn operands_that_are_not_allowed() {
+    let t = Temp::new();
+    t.write("data.bin", [1, 2]);
+    for (text, needle) in [
+        ("  .zp 1\n", "Unexpected section operand"),
+        ("  .bss 1\n", "Unexpected section operand"),
+        ("  . 5\n", "Unexpected text"),
+        ("  .db \"ab\" x\n", "Expected a quoted string"),
+        ("  .include inc.asm\n", "Expected a quoted string"),
+        ("  .else 1\n", "Unexpected ELSE operand"),
+        ("  .if 1\n  .endif 1\n", "Unexpected ENDIF operand"),
+        (
+            "  .zp\n  .defchr 0,0,0,0,0,0,0,0\n",
+            "Data emission not allowed in RAM section",
+        ),
+        (
+            "  .zp\n  .incbin \"data.bin\"\n",
+            "Data emission not allowed in RAM section",
+        ),
+        (
+            "  .zp\n  call x\nx:\n",
+            "Data emission not allowed in RAM section",
+        ),
+    ] {
+        t.fails(text, needle);
+    }
+}
+
+#[test]
+fn directive_labels_are_defined_once() {
+    let t = Temp::new();
+    t.write("inc.asm", "  nop\n");
+    let r = t.run(concat!(
+        "  .org $8000\n",
+        "Cond .if 1\n  .endif\n",
+        "Page .page 5\n",
+        "Inc: .include \"inc.asm\"\n",
+    ));
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.symbols["Cond"].value, 0x8000);
+    assert_eq!(r.symbols["Page"].value, 0x8000);
+    assert_eq!(r.symbols["Inc"].value, 0xa000);
+    for (text, code) in [
+        ("L:\n  nop\nL .if 1\n  .endif\n", "E_SYMBOL"),
+        ("G:\n.l: nop\n.l .public\n", "E_ASSEMBLY"),
+        ("L:\n  nop\nL .org $9000\n", "E_ASSEMBLY"),
+        ("L:\n  nop\nL .page 5\n", "E_ASSEMBLY"),
+        ("L:\n  nop\nL: .include \"inc.asm\"\n", "E_INCLUDE"),
+    ] {
+        let r = t.fails(text, "multiply defined");
+        assert_eq!(common::error_codes(&r)[0], code, "{text}");
+    }
+}
+
+#[test]
+fn conditionals_inside_inactive_blocks_and_local_names() {
+    let t = Temp::new();
+    assert_eq!(
+        t.bytes(
+            concat!(
+                "  .if 0\n  .if 1\n  .db 1\n  .endif\n  .endif\n  .db 2\n",
+                "G:\n.loc:\n  .ifdef .loc\n  .db 3\n  .endif\n",
+            ),
+            2
+        ),
+        [2, 3]
+    );
+}
+
+#[test]
+fn data_sizes_and_bank_boundaries() {
+    let t = Temp::new();
+    // SIZEOF counts following lines of the same kind only (DB and DW are one kind).
+    t.write("two.bin", [1, 2]);
+    let r = t.run("L: .db 1\n  .dw 2\n  .incbin \"two.bin\"\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.symbols["L"].size, 3);
+    // INCBIN that ends exactly at the bank end does not overflow it.
+    t.write("exact.bin", vec![7u8; 0x2000]);
+    let r = t.run("  .opt w+\n  .incbin \"exact.bin\"\n  .db 9\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert_eq!((r.binary[0x1fff], r.binary[0x2000]), (7, 9));
+}
+
+#[test]
+fn a_section_starts_at_bank_zero() {
+    let t = Temp::new();
+    let r = t.run("  .bank 2\n  .db 1\n  .data\n  .db 5\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!((r.binary[0], r.binary[0x4000]), (5, 1));
+}
+
+#[test]
+fn source_files_outside_the_root_and_absolute_paths() {
+    let t = Temp::new();
+    // An in-memory file must stay within the root.
+    let mut request = t.request(AssembleOptions::default());
+    request.files.insert("../x.asm".into(), b"  nop\n".to_vec());
+    let r = nesasm_core::assemble(&request);
+    assert_eq!(common::error_codes(&r), ["E_IO"]);
+    assert!(common::messages(&r)[0].starts_with("In-memory file '../x.asm'"));
+    // The allowed root must exist.
+    t.write("test.asm", "  nop\n");
+    let mut request = t.request(AssembleOptions::default());
+    request.allowed_root = Some(t.0.join("missing"));
+    assert!(!nesasm_core::assemble(&request).success);
+    // Absolute include paths and file names.
+    t.write("lib/inc.asm", "  .db 4\n");
+    let missing = t.0.join("nope.asm");
+    t.write(
+        "test.asm",
+        format!(
+            "  .include \"inc.asm\"\n  .include \"{}\"\n",
+            missing.display()
+        ),
+    );
+    let mut request = t.request(AssembleOptions::default());
+    request.include_paths = vec![t.0.join("lib")];
+    let r = nesasm_core::assemble(&request);
+    assert_eq!(common::messages(&r).len(), 1, "{:?}", r.diagnostics);
+    assert!(common::messages(&r)[0].starts_with("Cannot open file"));
+}
+
+#[test]
+fn expanded_source_limit() {
+    let t = Temp::new();
+    // Six levels of ten calls expand to a million lines.
+    let mut text = String::from("m0 .macro\n");
+    text.push_str(&"X = 1\n".repeat(10));
+    text.push_str("  .endm\n");
+    for level in 1..=6 {
+        text.push_str(&format!("m{level} .macro\n"));
+        text.push_str(&format!("  m{}\n", level - 1).repeat(10));
+        text.push_str("  .endm\n");
+    }
+    text.push_str("  m6\n");
+    let r = t.fails(&text, "Expanded source limit exceeded");
+    assert_eq!(common::error_codes(&r), ["E_LIMIT"]);
+}
+
+#[test]
+fn listing_of_page_and_unlisted_include() {
+    let t = Temp::new();
+    t.write("inc.asm", "  nop\n");
+    let r = t.run("  .list\n  .page 5\n  .nolist\n  .include \"inc\"\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    let listing = r.listing.unwrap();
+    // PAGE shows the CPU address of the page; an unlisted INCLUDE still
+    // records the file, with `.asm` added to the name.
+    let page = listing.lines().find(|l| l.contains(".page 5")).unwrap();
+    assert!(page.contains("A000"), "{listing}");
+    assert!(listing.contains("#[2]   inc.asm"), "{listing}");
+    assert!(!listing.contains("  nop"), "{listing}");
+}
+
+#[test]
+fn assignment_to_an_invalid_name() {
+    Temp::new().fails("a@ = 1\n", "Invalid label");
 }

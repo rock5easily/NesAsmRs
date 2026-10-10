@@ -206,3 +206,29 @@ fn trampoline_bank_overflows_after_455_procedures() {
     let r = t.run(&fits);
     assert!(r.success, "{:?}", r.diagnostics.first());
 }
+
+#[test]
+fn macro_local_constants_and_literal_backslashes() {
+    let t = Temp::new();
+    let r = t.run(concat!(
+        "G:\n.c = 1\n",
+        "k .macro\n  .db \\?1, \"\\?x\\n\"\n  .endm\n",
+        "  k .c\n",
+    ));
+    assert!(r.success, "{:?}", r.diagnostics);
+    // A local constant is a constant argument; `\?x` and `\n` are not substituted.
+    assert_eq!(&r.binary[..4], &[3, b'?', b'x', b'\n']);
+}
+
+#[test]
+fn procedure_labels_and_size() {
+    let t = Temp::new();
+    t.fails(
+        "p:\n  nop\np .proc\n  rts\n  .endp\n",
+        "Symbol 'p' is multiply defined",
+    );
+    t.fails(
+        "p .proc\n  .ds $2000\n  .db 1\n  .endp\n",
+        "Procedure exceeds 8 KiB",
+    );
+}
