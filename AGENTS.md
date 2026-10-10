@@ -71,14 +71,58 @@ cargo test --workspace --locked
 
 ## テスト
 
-| 対象 | 場所 |
-|---|---|
-| アセンブラの動作 | `crates/nesasm-core/tests/assembly.rs` |
-| C#版との互換（golden.json） | `crates/nesasm-core/tests/golden.rs` |
-| CLI | `crates/nesasm-cli/tests/cli.rs` |
-| MCP（実際のstdio通信） | `crates/nesasm-mcp/tests/stdio.rs` |
+### 置き場所
 
-不具合を修正したら回帰テストを追加してください。
+テストは領域別のファイルに分け、共通のヘルパーは各クレートの `tests/common/mod.rs` に置きます
+（各テストファイルから `mod common;` で使います）。新しいテストは内容に合うファイルに追加してください。
+
+| クレート | ファイル | 対象 |
+|---|---|---|
+| nesasm-core | `expressions.rs` | 演算子・優先順位、リテラル、式関数（FUNC・BANK など）、式のエラー |
+| | `directives.rs` | ディレクティブ、セクション・バンク、条件アセンブル、行の継続・コメント、入力パス |
+| | `instructions.rs` | 命令のエンコード、アドレッシング形式と拡張、全オペコードの逆アセンブル往復 |
+| | `macros_procedures.rs` | マクロ、プロシージャの配置と CALL |
+| | `images.rs` | PCX（INCCHR）の読み込みと検証 |
+| | `api.rs` | 公開API（serde表現、`build`、`write_artifacts`、`inspect`） |
+| | `assembly.rs` | 既存の総合テスト（新規は上の各ファイルへ） |
+| | `golden.rs` | C#版との互換（`tools/compat/golden.json`） |
+| nesasm-cli | `options.rs`／`reports.rs`／`watch.rs` | 引数・環境変数と出力ファイル／診断・JSON・使用量表／watch モード |
+| | `cli.rs` | 既存の総合テスト |
+| nesasm-mcp | `arguments.rs`／`tools.rs`／`stdio.rs` | サーバ引数／各ツールの詳細／プロトコル・パス制限・リソース |
+
+`src/` 内の `#[cfg(test)]` は、非公開の関数でしか検証できない場合（`output.rs` の一時ファイルなど）に限ります。
+
+### 書き方
+
+- 不具合を修正したら回帰テストを追加してください。
+- 期待値は仕様（docs）とコードから導いてください。テストが失敗したときは、実装の不具合か期待値の誤りかを
+  確かめ、**実際の出力をそのまま期待値にしないでください**。
+- エラーのテストは失敗したことだけでなく、メッセージ（必要なら診断コードと行番号）まで確認します。
+  core では `Temp::fails(ソース, "メッセージの一部")`、成功時のバイト列は `Temp::bytes` を使います。
+- golden.json で C#版の挙動を確認できない副次的な挙動（最初のエラーに続く連鎖エラーなど）は固定しないでください。
+  主となるエラーだけを確認し、気になる挙動は報告します。
+- CLI と MCP は実際のバイナリ（`env!("CARGO_BIN_EXE_…")`）を起動し、終了コード・stdout／stderr の書式・
+  書き出したファイルを確認します。ホストの環境に左右されないよう、CLI では `NES_INCLUDE` を消して起動します。
+- タイミングに依存させないでください。
+  - 固定の sleep で待たず、出力行を待ちます。
+  - watch のテストでは、監視中のファイルを変更する前に `Watch::ready()` を呼びます。H を送ってヘルプ行を待ち、
+    監視ループが状態を記録し終えたことを確かめます。
+  - 時間制限のテストは、制限より十分に長くかかる入力を使います（debug ビルドで数十秒など）。
+- 全OSで通るようにしてください（改行コードは `cfg!(windows)` で分ける、パスは `\\?\` なしで比較する、など）。
+- テストのためだけに依存クレートを増やさないでください（例: CLI の SJIS データはバイト列で書きます）。
+
+### カバレッジ
+
+CIでは計測しません。テストの穴を探すときは [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) を使います。
+
+```sh
+cargo llvm-cov -p nesasm-core --locked --summary-only
+```
+
+- 子プロセスとして起動したバイナリも計測されますが、プロセスが正常に終了した場合に限ります。
+  MCP のテストクライアントは、終了時に標準入力を閉じて正常終了を待ちます（強制終了しないでください）。
+- Windows では `std::process::exit` で終わる CLI の実行（引数エラー、アセンブル失敗）は記録されません。
+- 入力から到達できない防御的なコードや I/O の競合は、無理にテストしなくて構いません。
 
 ## MCPサーバの安全上の制約
 
