@@ -1,126 +1,8 @@
+mod common;
+
+use common::Client;
 use serde_json::{Value, json};
-use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
-    path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc,
-    time::Duration,
-};
-
-const TIMEOUT: Duration = Duration::from_secs(10);
-
-/// An MCP server process with a fresh project root. The process is killed and
-/// the root removed when the client is dropped, even if a test panics.
-struct Client {
-    server_info: Value,
-    child: Child,
-    input: ChildStdin,
-    /// Server messages; non-protocol output arrives as an error.
-    output: mpsc::Receiver<Result<Value, String>>,
-    root: PathBuf,
-    _dir: tempfile::TempDir,
-    id: u64,
-}
-
-impl Client {
-    /// Starts a server without initializing the session.
-    fn spawn() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_owned();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_nesasm-mcp"))
-            .arg("--root")
-            .arg(&root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (send, output) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let message = match line {
-                    Ok(text) => serde_json::from_str(&text)
-                        .map_err(|_| format!("non-protocol stdout: {text}")),
-                    Err(e) => Err(e.to_string()),
-                };
-                if send.send(message).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            server_info: Value::Null,
-            child,
-            input,
-            output,
-            root,
-            _dir: dir,
-            id: 0,
-        }
-    }
-    /// Starts a server and completes the initialization handshake.
-    fn start() -> Self {
-        Self::start_with_version("2025-11-25")
-    }
-    fn start_with_version(version: &str) -> Self {
-        let mut c = Self::spawn();
-        let init = c.request(
-            "initialize",
-            json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"integration-test","version":"1"}}),
-        );
-        assert!(
-            init["result"]["capabilities"]["tools"].is_object(),
-            "{init}"
-        );
-        c.server_info = init["result"].clone();
-        c.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
-        c
-    }
-    fn send(&mut self, value: Value) {
-        writeln!(self.input, "{value}").unwrap();
-        self.input.flush().unwrap();
-    }
-    fn next_message(&mut self) -> Value {
-        match self.output.recv_timeout(TIMEOUT) {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => panic!("{e}"),
-            Err(e) => panic!("MCP response timeout: {e}"),
-        }
-    }
-    /// Waits for the response to `id`, skipping other messages.
-    fn response(&mut self, id: &Value) -> Value {
-        loop {
-            let reply = self.next_message();
-            if &reply["id"] == id {
-                return reply;
-            }
-        }
-    }
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        self.id += 1;
-        let id = json!(self.id);
-        self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
-        self.response(&id)
-    }
-    fn call(&mut self, name: &str, arguments: Value) -> Value {
-        let reply = self.request("tools/call", json!({"name":name,"arguments":arguments}));
-        assert!(reply.get("error").is_none(), "{reply}");
-        reply["result"].clone()
-    }
-    fn messages(result: &Value) -> String {
-        result["structuredContent"]["diagnostics"].to_string()
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+use std::fs;
 
 #[test]
 fn stdio_lifecycle_validation_build_and_recovery() {
@@ -185,8 +67,7 @@ fn protocol_errors_identity_and_schemas() {
     let mut c = Client::start();
     assert_eq!(c.server_info["serverInfo"]["name"], "nesasm-mcp");
     // An unparsable line gets a JSON-RPC parse error and the server keeps working.
-    writeln!(c.input, "garbage{{").unwrap();
-    c.input.flush().unwrap();
+    c.send_line("garbage{");
     let error = c.next_message();
     assert_eq!(error["error"]["code"], -32700, "{error}");
     assert!(error["id"].is_null());
@@ -218,7 +99,7 @@ fn session_setup_rules() {
     );
     assert!(early.get("error").is_some(), "{early}");
     // An older protocol version is accepted and echoed.
-    let c = Client::start_with_version("2025-03-26");
+    let c = Client::start_with(&[], "2025-03-26");
     assert_eq!(c.server_info["protocolVersion"], "2025-03-26");
 }
 
