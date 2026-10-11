@@ -43,6 +43,7 @@ fn parse(args: Vec<String>) -> Result<Option<Arguments>, String> {
             "-watch" => watch = true,
             "--json" => json = true,
             "--check" => check = true,
+            "--compat-if" => options.compat_if = true,
             "--output" => output = Some(PathBuf::from(args.next().ok_or("Missing output path")?)),
             "--include" => includes.push(PathBuf::from(args.next().ok_or("Missing include path")?)),
             "-e" => {

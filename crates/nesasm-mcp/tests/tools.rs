@@ -249,3 +249,29 @@ fn inspect_rom_ranges_and_cmos_forms() {
         "{r}"
     );
 }
+
+#[test]
+fn forward_if_compatibility_is_an_assembly_option() {
+    let mut c = Client::start();
+    let source = "  .if later\n  .db 1\n  .else\n  .db 2\n  .endif\nlater = 1\n";
+    let r = c.call("check", project(source));
+    assert_eq!(r["isError"], true);
+    assert!(Client::messages(&r).contains("IF condition changed between passes"));
+    let mut input = project(source);
+    input["options"] = json!({"compat_if":true});
+    for tool in ["check", "assemble"] {
+        let r = c.call(tool, input.clone());
+        assert_eq!(r["isError"], false, "{r}");
+        let d = &r["structuredContent"]["diagnostics"][0];
+        assert_eq!(d["severity"], "warning");
+        assert_eq!(d["code"], "W_UNDEFINED_IF");
+        assert_eq!(d["message"], "Undefined label in IF condition.");
+    }
+    assert_eq!(std::fs::read(c.root.join("main.nes")).unwrap()[16], 1);
+    let r = c.call(
+        "inspect_rom",
+        json!({"project":input,"hexdump":{"bank":0,"address":0xe000,"length":1}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["hexdump"][0]["bytes"], "01");
+}

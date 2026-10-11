@@ -375,6 +375,7 @@ impl<'a> Engine<'a> {
             pc: self.pc(),
             allow_undefined,
             function_calls: &self.function_calls,
+            undefined_if: None,
         }
     }
 

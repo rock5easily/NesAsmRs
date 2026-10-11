@@ -1865,6 +1865,162 @@
    }
   },
   {
+   "name": "forward_if_value_compat",
+   "source": {
+    "text": "  .if later\n  .db 1\n  .else\n  .db 2\n  .endif\nlater = 1\n"
+   },
+   "flags": [
+    "--compat-if"
+   ],
+   "expected": {
+    "success": true,
+    "binary": "366b166c12342324",
+    "map": "e05159f5e8e5a3c7",
+    "header": [
+     78,
+     69,
+     83,
+     26,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "symbols": {
+     "_bank_base": [
+      0,
+      240,
+      0
+     ],
+     "_bss_end": [
+      513,
+      240,
+      0
+     ],
+     "_call_bank": [
+      0,
+      240,
+      0
+     ],
+     "_nb_bank": [
+      1,
+      240,
+      0
+     ],
+     "CDROM": [
+      0,
+      240,
+      0
+     ],
+     "DEVELO": [
+      0,
+      240,
+      0
+     ],
+     "later": [
+      1,
+      240,
+      0
+     ],
+     "MAGICKIT": [
+      1,
+      240,
+      0
+     ]
+    },
+    "ignored_symbols": [],
+    "regions": {},
+    "listing": null,
+    "srec": null
+   }
+  },
+  {
+   "name": "forward_if_bank_compat",
+   "source": {
+    "text": "emit .macro\n  .if BANK(\\1) != $1c\n  .db BANK(\\1)\n  .else\n  .db $1d\n  .endif\n  .endm\n  emit handler\n  .bank $1c\n  .org $9000\nhandler: nop\n"
+   },
+   "flags": [
+    "--compat-if"
+   ],
+   "expected": {
+    "success": true,
+    "binary": "0dc9d104d594a3d2",
+    "map": "06305128a0072345",
+    "header": [
+     78,
+     69,
+     83,
+     26,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "symbols": {
+     "_bank_base": [
+      0,
+      240,
+      0
+     ],
+     "_bss_end": [
+      513,
+      240,
+      0
+     ],
+     "_call_bank": [
+      0,
+      240,
+      0
+     ],
+     "_nb_bank": [
+      29,
+      240,
+      0
+     ],
+     "CDROM": [
+      0,
+      240,
+      0
+     ],
+     "DEVELO": [
+      0,
+      240,
+      0
+     ],
+     "handler": [
+      36864,
+      28,
+      0
+     ],
+     "MAGICKIT": [
+      1,
+      240,
+      0
+     ]
+    },
+    "ignored_symbols": [],
+    "regions": {},
+    "listing": null,
+    "srec": null
+   }
+  },
+  {
    "name": "extensions",
    "source": {
     "text": "  lda low_byte #$1234\n  lda high_byte #$1234\n  lda low_byte $1234\n  lda high_byte $1234\n  lda high_byte <$34\n  lda $1234,x++\n  lda [$34],y++\n  lda [$34].2\n"

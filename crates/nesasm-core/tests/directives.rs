@@ -659,3 +659,113 @@ fn listing_of_page_and_unlisted_include() {
 fn assignment_to_an_invalid_name() {
     Temp::new().fails("a@ = 1\n", "Invalid label");
 }
+
+#[test]
+fn forward_if_compatibility_warns_and_uses_each_pass_condition() {
+    let t = Temp::new();
+    let source = "  .if later\n  .db 1\n  .else\n  .db 2\n  .endif\nlater = 1\n";
+    t.fails(source, "IF condition changed between passes");
+    let options = AssembleOptions {
+        compat_if: true,
+        ..Default::default()
+    };
+    let r = t.run_with(source, options.clone());
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[0], 1);
+    assert_eq!(r.diagnostics.len(), 1);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.severity, Severity::Warning);
+    assert_eq!(d.code, DiagnosticCode::UndefinedIf);
+    assert_eq!(d.message, "Undefined label in IF condition.");
+    assert_eq!(d.location.line, 1);
+    let r = t.run_with(
+        source,
+        AssembleOptions {
+            warning_disabled: true,
+            ..options.clone()
+        },
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[0], 1);
+    assert!(r.diagnostics.is_empty());
+    // Undefined symbols still fail in the emit pass.
+    let r = t.run_with("  .if missing\n  nop\n  .endif\n", options);
+    assert!(!r.success);
+    assert!(
+        r.diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("Undefined symbol 'missing'")),
+        "{:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn compatible_if_tracks_macro_and_function_forward_references() {
+    let t = Temp::new();
+    let source = concat!(
+        "test .func BANK(handler)\n",
+        "emit .macro\n  .if test(1) = $f0\n  .db 1\n  .else\n  .db 2\n  .endif\n  .endm\n",
+        "  emit\n  .bank $1c\nhandler: nop\n",
+    );
+    let r = t.run_with(
+        source,
+        AssembleOptions {
+            compat_if: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[0], 2);
+    assert_eq!(r.diagnostics.len(), 1);
+    assert_eq!(r.diagnostics[0].location.line, 3);
+    assert_eq!(r.diagnostics[0].expansion_trace[0].line, 9);
+    // DEFINED intentionally tests absent symbols; inactive IFs do not evaluate them.
+    let r = t.run_with(
+        "  .if DEFINED(missing)\n  .if missing\n  .endif\n  .endif\n  nop\n",
+        AssembleOptions {
+            compat_if: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert!(r.diagnostics.is_empty());
+}
+
+#[test]
+fn compatible_if_keeps_phase_and_ifdef_errors() {
+    let t = Temp::new();
+    let options = AssembleOptions {
+        compat_if: true,
+        ..Default::default()
+    };
+    for (source, message) in [
+        (
+            "  .if later\n  .db 1\n  .else\n  .ds 2\n  .endif\nEnd: nop\nlater = 1\n",
+            "Phase error for symbol 'End'",
+        ),
+        (
+            "  .ifndef later\n  nop\n  .endif\nlater: nop\n",
+            "Cannot define a symbol declared undefined by IFDEF/IFNDEF",
+        ),
+    ] {
+        let r = t.run_with(source, options.clone());
+        assert!(!r.success, "{source}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.is_error() && d.message.contains(message)),
+            "{:?}",
+            r.diagnostics
+        );
+    }
+    // A changed outer branch may expose an IF that was inactive in the layout pass.
+    let r = t.run_with(
+        "  .if later\n  .if 1\n  .db 3\n  .endif\n  .else\n  .db 4\n  .endif\nlater = 1\n",
+        options,
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[0], 3);
+    assert_eq!(r.diagnostics.len(), 1);
+    assert_eq!(r.diagnostics[0].code, DiagnosticCode::UndefinedIf);
+}

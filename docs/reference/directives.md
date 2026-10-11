@@ -32,6 +32,14 @@ Directive names are case insensitive and accept a leading dot.
 - OPT l+/l-,m+/m-,w+/w-,o+/o-: assembler options.
 - FAIL "message": fail the assembly.
 
+An IF condition that changes between passes is an error by default. With
+`--compat-if` (library/MCP `options.compat_if: true`), each pass uses its own
+condition, as in NesAsmSharp. Pass 1 warns about undefined labels with
+`W_UNDEFINED_IF`; `-wd` suppresses the warning. Undefined labels in pass 2 and
+phase errors remain errors. In this mode, forward label attributes in IF use
+the C# placeholders: BANK = 240, PAGE/VRAM/PAL = -1, SIZEOF = 0; ordinary
+undefined label values are 0. DEFINED does not produce a forward-reference warning.
+
 ## Limits
 
 - ROM: 128 banks of 8 KiB (1 MiB); BANK and CATBANK take 0-127.

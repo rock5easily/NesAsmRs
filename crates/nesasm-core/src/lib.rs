@@ -110,6 +110,8 @@ pub struct AssembleOptions {
     pub srec: bool,
     /// Suppress warnings.
     pub warning_disabled: bool,
+    /// Allow IF conditions to change between passes, warning on forward references like C#.
+    pub compat_if: bool,
 }
 impl Default for AssembleOptions {
     fn default() -> Self {
@@ -121,6 +123,7 @@ impl Default for AssembleOptions {
             macro_listing: false,
             srec: false,
             warning_disabled: false,
+            compat_if: false,
         }
     }
 }
@@ -241,6 +244,8 @@ pub enum DiagnosticCode {
     Internal,
     #[serde(rename = "W_BANK_OVERFLOW")]
     BankOverflow,
+    #[serde(rename = "W_UNDEFINED_IF")]
+    UndefinedIf,
 }
 
 impl DiagnosticCode {
@@ -259,6 +264,7 @@ impl DiagnosticCode {
             Self::Timeout => "E_TIMEOUT",
             Self::Internal => "E_INTERNAL",
             Self::BankOverflow => "W_BANK_OVERFLOW",
+            Self::UndefinedIf => "W_UNDEFINED_IF",
         }
     }
 }

@@ -33,6 +33,7 @@ fn options(flags: &[Value]) -> AssembleOptions {
             "--list1" => options.list_level = ListLevel::Brief,
             "--list3" => options.list_level = ListLevel::Full,
             "--mlist" => options.macro_listing = true,
+            "--compat-if" => options.compat_if = true,
             other => panic!("unknown flag {other}"),
         }
     }

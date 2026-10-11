@@ -17,3 +17,10 @@ Exit status: 0 on success, the error count (up to 255) on assembly errors,
 
 Additional Rust options: `--output path`, `--include directory` (repeatable),
 `--json` (complete assembly result), `--check` (no file writes).
+
+`--compat-if`: match NesAsmSharp conditional assembly by allowing IF conditions
+to change between passes. Each pass evaluates the condition independently.
+Forward references in pass 1 produce `W_UNDEFINED_IF` (suppressed by `-wd`);
+symbols still undefined in pass 2 remain errors. Without this option, a changed
+IF condition is an error. IFDEF/IFNDEF behavior and phase checks are unchanged.
+The library and MCP expose this as `options.compat_if` (default `false`).

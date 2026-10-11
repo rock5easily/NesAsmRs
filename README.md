@@ -17,6 +17,10 @@ cargo run -p nesasm-mcp -- --root /absolute/path/to/project
 （Windowsでは `.exe`）です。Rustのバージョンは `rust-toolchain.toml` で固定しています。
 **既定の文字コードはUTF-8**です。従来のShift-JIS入力には `-e SJIS` を指定してください。
 
+前方参照で `.IF` の条件がパス間で変わるソースには `--compat-if` を指定すると、
+NesAsmSharpと同様に警告で処理を続行します。既定ではエラーです。
+MCP／公開APIでは `options.compat_if: true` を指定します。
+
 ## MCPサーバ
 
 MCPクライアントの設定例（実行ファイルとプロジェクトのパスは環境に合わせて変更）:

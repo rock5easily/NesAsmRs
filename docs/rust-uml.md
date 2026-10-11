@@ -89,6 +89,7 @@ classDiagram
         +bool macro_listing
         +bool srec
         +bool warning_disabled
+        +bool compat_if
     }
     class ListLevel {
         <<enumeration>>
@@ -142,6 +143,7 @@ classDiagram
         Timeout
         Internal
         BankOverflow
+        UndefinedIf
     }
     class Severity {
         <<enumeration>>
@@ -407,6 +409,7 @@ classDiagram
         u32 pc
         bool allow_undefined
         Cell function_calls_ref
+        Option~Cell~ undefined_if_ref
     }
     class Parser {
         -Vec~Token~ tokens

@@ -175,3 +175,28 @@ fn warnings_can_be_disabled() {
     run.success();
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }
+
+#[test]
+fn forward_if_compatibility_is_opt_in() {
+    let p = Project::new();
+    p.write(
+        "t.asm",
+        "  .if later\n  .db 1\n  .else\n  .db 2\n  .endif\nlater = 1\n",
+    );
+    let run = p.run(&["t.asm"]);
+    assert!(run.code.is_some_and(|code| code > 0));
+    assert!(run.stderr.contains("IF condition changed between passes"));
+    assert!(!p.path("t.nes").exists());
+    let run = p.run(&["--compat-if", "t.asm"]);
+    run.success();
+    assert!(
+        run.stderr
+            .contains("t.asm:1: warning [W_UNDEFINED_IF]: Undefined label in IF condition."),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(fs::read(p.path("t.nes")).unwrap()[16], 1);
+    let run = p.run(&["--compat-if", "-wd", "t.asm"]);
+    run.success();
+    assert!(run.stderr.is_empty());
+}

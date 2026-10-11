@@ -30,10 +30,12 @@ FIXTURES = ROOT / "tools/compat/fixtures"
 
 RUST_FLAGS = {"--sjis": ["-e", "SJIS"], "--raw": ["-raw"], "--autozp": ["-autozp"],
               "--srec": ["-srec"], "--list3": ["-l3"], "--list1": ["-l1"],
-              "--list0": ["-l0"], "--mlist": ["-m"]}
+              "--list0": ["-l0"], "--mlist": ["-m"], "--compat-if": ["--compat-if"]}
 
 # Cases where Rust deliberately does not reproduce the C# behavior.
 KNOWN_DIFFERENCES = {
+    "forward_if_value": "Rust rejects IF conditions that change between passes unless --compat-if is enabled",
+    "forward_if_bank": "Rust rejects IF conditions that change between passes unless --compat-if is enabled",
     # C# defects that Rust does not reproduce.
     "defchr_rows": "C# reads the eight DEFCHR values as one little-endian byte buffer",
     "macro_arg_count": "C# \\# returns 9 when the ninth argument is empty",
@@ -59,6 +61,8 @@ AUX_FILES = {
 }
 
 GENERATED = {
+    "forward_if_value": "  .if later\n  .db 1\n  .else\n  .db 2\n  .endif\nlater = 1\n",
+    "forward_if_bank": "emit .macro\n  .if BANK(\\1) != $1c\n  .db BANK(\\1)\n  .else\n  .db $1d\n  .endif\n  .endm\n  emit handler\n  .bank $1c\n  .org $9000\nhandler: nop\n",
     "extensions": "  lda low_byte #$1234\n  lda high_byte #$1234\n  lda low_byte $1234\n  lda high_byte $1234\n  lda high_byte <$34\n  lda $1234,x++\n  lda [$34],y++\n  lda [$34].2\n",
     "signed": "  .dw (-8 >> 1), (-8 / 2), (-8 % 3)\n  .db (-1 < 0), (-1 >= 0), (1 <> 2)\n",
     "symbol_functions": "  .bank 2\n  .org $a000\nData: .db 1,2,3\n  .db BANK(Data),PAGE(Data),SIZEOF(Data),DEFINED(missing)\n",
@@ -274,6 +278,8 @@ def cases(work):
         fixture = work / (name + ".asm")
         fixture.write_text(text, encoding="utf-8", newline="\n")
         result.append((fixture, (), name, {"text": text}))
+        if name in ("forward_if_value", "forward_if_bank"):
+            result.append((fixture, ("--compat-if",), name + "_compat", {"text": text}))
     sjis_text = "  ; 日本語のコメント\n  .bank 0\n  .org $8000\n  lda #$12\n"
     sjis = work / "sjis.asm"
     sjis.write_bytes(sjis_text.encode("cp932"))

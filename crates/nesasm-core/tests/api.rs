@@ -73,6 +73,7 @@ fn diagnostic_codes_and_severity_keep_their_json_names() {
         (Timeout, "E_TIMEOUT"),
         (Internal, "E_INTERNAL"),
         (BankOverflow, "W_BANK_OVERFLOW"),
+        (UndefinedIf, "W_UNDEFINED_IF"),
     ] {
         assert_eq!(code.as_str(), name);
         assert_eq!(code.to_string(), name);

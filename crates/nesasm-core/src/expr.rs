@@ -19,6 +19,8 @@ pub(crate) struct Context<'a> {
     pub allow_undefined: bool,
     /// Expression function calls made so far in this assembly.
     pub function_calls: &'a Cell<usize>,
+    /// Track forward references and use C# placeholder attributes in compatible IF conditions.
+    pub undefined_if: Option<&'a Cell<bool>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,7 +270,12 @@ impl<'t, 'b> Parser<'t, '_, 'b> {
                 } else {
                     match self.symbol(name) {
                         Ok(s) => s.value,
-                        Err(_) if self.ctx.allow_undefined => 0,
+                        Err(_) if self.ctx.allow_undefined => {
+                            if let Some(undefined) = self.ctx.undefined_if {
+                                undefined.set(true);
+                            }
+                            0
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -387,7 +394,16 @@ impl<'t, 'b> Parser<'t, '_, 'b> {
             }
             let Some(s) = symbol else {
                 return if self.ctx.allow_undefined {
-                    Ok(0)
+                    if let Some(undefined) = self.ctx.undefined_if {
+                        undefined.set(true);
+                        Ok(match upper.as_str() {
+                            "BANK" => u32::from(BankRef::Constant.number()),
+                            "PAGE" | "VRAM" | "PAL" => u32::MAX,
+                            _ => 0,
+                        })
+                    } else {
+                        Ok(0)
+                    }
                 } else {
                     Err("Undefined symbol".into())
                 };

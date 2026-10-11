@@ -1,4 +1,5 @@
 /target/
+/nesProjects/
 __pycache__/
 *.nes
 *.lst

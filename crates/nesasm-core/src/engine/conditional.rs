@@ -1,12 +1,12 @@
 //! IF / IFDEF / IFNDEF / ELSE / ENDIF.
 
 use super::{Directive, Engine, Statement};
-use crate::DiagnosticCode;
 use crate::SourceLocation;
 use crate::error::AsmResult;
 use crate::source::Line;
 use crate::state::{MAX_CONDITIONAL_NESTING, Pass};
-use std::collections::BTreeSet;
+use crate::{Diagnostic, DiagnosticCode, Severity, expr};
+use std::{cell::Cell, collections::BTreeSet};
 
 struct Conditional {
     /// Whether the enclosing block is active.
@@ -101,7 +101,7 @@ impl Engine<'_> {
                 let condition = if !parent {
                     false
                 } else if directive == Directive::If {
-                    self.if_condition(operand)?
+                    self.if_condition(operand, line)?
                 } else {
                     let key = if operand.starts_with('.') {
                         format!("{}{operand}", self.scope)
@@ -142,15 +142,33 @@ impl Engine<'_> {
         Ok(())
     }
 
-    /// Evaluates an IF condition; it must not change between the passes.
-    fn if_condition(&mut self, operand: &str) -> AsmResult<bool> {
-        let condition = self.value(operand)? != 0;
+    /// Evaluates an IF condition, requiring stable results unless C# compatibility is enabled.
+    fn if_condition(&mut self, operand: &str, line: &Line) -> AsmResult<bool> {
+        let compat = self.request.options.compat_if;
+        let condition = if compat && self.pass.is_layout() {
+            let undefined = Cell::new(false);
+            let mut context = self.context(true);
+            context.undefined_if = Some(&undefined);
+            let value = expr::evaluate(operand, &context)?;
+            if undefined.get() && !self.request.options.warning_disabled {
+                self.result.diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    code: DiagnosticCode::UndefinedIf,
+                    message: "Undefined label in IF condition.".into(),
+                    location: line.location(),
+                    expansion_trace: line.trace.to_vec(),
+                });
+            }
+            value != 0
+        } else {
+            self.value(operand)? != 0
+        };
         if self.pass.is_layout() {
             self.conditions.results.push(condition);
         } else {
             let layout = self.conditions.results.get(self.conditions.index).copied();
             self.conditions.index += 1;
-            if layout != Some(condition) {
+            if !compat && layout != Some(condition) {
                 return Err("IF condition changed between passes (forward reference)".into());
             }
         }
