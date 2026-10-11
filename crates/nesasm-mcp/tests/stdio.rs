@@ -106,12 +106,20 @@ fn session_setup_rules() {
 #[test]
 fn paths_stay_inside_the_root() {
     let mut c = Client::start();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(c.root.parent().unwrap()).unwrap();
     let secret = outside.path().join("secret.bin");
     fs::write(&secret, [1, 2, 3]).unwrap();
+    fs::write(outside.path().join("x.asm"), "  nop\n").unwrap();
+    let outside_input = format!(
+        "../{}/x.asm",
+        outside.path().file_name().unwrap().to_str().unwrap()
+    );
     fs::write(c.root.join("main.asm"), "  nop\n").unwrap();
     for (text, what) in [
-        ("  .include \"../x.asm\"\n", "relative include"),
+        (
+            &format!("  .include \"{outside_input}\"\n"),
+            "relative include",
+        ),
         (
             &format!("  .incbin \"{}\"\n", secret.display()),
             "absolute incbin",
@@ -120,15 +128,27 @@ fn paths_stay_inside_the_root() {
         fs::write(c.root.join("probe.asm"), text).unwrap();
         let r = c.call("check", json!({"input":"probe.asm"}));
         assert_eq!(r["isError"], true, "{what}: {r}");
+        assert!(
+            Client::messages(&r).contains("outside the project root"),
+            "{what}: {r}"
+        );
     }
-    let r = c.call("check", json!({"input":"../outside.asm"}));
+    let r = c.call("check", json!({"input":outside_input}));
     assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains("outside the project root"),
+        "{r}"
+    );
     fs::write(c.root.join("probe.asm"), "  .include \"x.asm\"\n").unwrap();
     let r = c.call(
         "check",
         json!({"input":"probe.asm","include_paths":[outside.path()]}),
     );
     assert_eq!(r["isError"], true, "include path outside the root: {r}");
+    assert!(
+        Client::messages(&r).contains("outside the project root"),
+        "include path outside the root: {r}"
+    );
     for output in [
         "main.asm",
         "notes.txt",

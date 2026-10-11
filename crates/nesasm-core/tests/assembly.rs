@@ -387,11 +387,16 @@ fn pcx_raw_rle_and_planar_tiles() {
         data[65] = planes;
         let stride = if bpp == 8 { 16 } else { 2 };
         data[66] = stride;
-        for _ in 0..16 {
+        // Each tile rotates the 0,1,2,3 stripe colors by a different amount.
+        for y in 0..16 {
             if bpp == 8 {
-                data.extend((0..16).map(|x| x % 4));
+                data.extend((0..16).map(|x| (x % 4 + x / 8 + 2 * (y / 8)) % 4));
             } else {
-                data.extend([0x55, 0x55, 0x33, 0x33]);
+                data.extend(if y < 8 {
+                    [0x55, 0xaa, 0x33, 0x66]
+                } else {
+                    [0x55, 0xaa, 0xcc, 0x99]
+                });
             }
         }
         if rle {
@@ -414,17 +419,22 @@ fn pcx_raw_rle_and_planar_tiles() {
         fs::write(t.0.join("image.pcx"), &data).unwrap();
         let r = t.run("Tiles: .incchr \"image.pcx\"", AssembleOptions::default());
         assert!(r.success, "{bpp}/{planes}/{rle}: {:?}", r.diagnostics);
-        for tile in r.binary[..64].chunks(16) {
-            assert_eq!(&tile[..8], &[0x55; 8]);
-            assert_eq!(&tile[8..], &[0x33; 8]);
+        let tiles = [(0x55, 0x33), (0xaa, 0x66), (0x55, 0xcc), (0xaa, 0x99)];
+        for (tile, (low, high)) in r.binary[..64].chunks(16).zip(tiles) {
+            assert_eq!(&tile[..8], &[low; 8]);
+            assert_eq!(&tile[8..], &[high; 8]);
         }
         assert_eq!(r.symbols["Tiles"].size, 64);
-        let cropped = t.run(
-            "  .incchr \"image.pcx\",8,8,1,1",
-            AssembleOptions::default(),
-        );
-        assert!(cropped.success);
-        assert_eq!(&cropped.binary[..16], &r.binary[..16]);
+        for ((x, y), (low, high)) in [(0, 0), (8, 0), (0, 8), (8, 8)].into_iter().zip(tiles) {
+            let cropped = t.run(
+                &format!("Crop: .incchr \"image.pcx\",{x},{y},1,1"),
+                AssembleOptions::default(),
+            );
+            assert!(cropped.success, "{:?}", cropped.diagnostics);
+            assert_eq!(&cropped.binary[..8], &[low; 8], "crop at {x},{y}");
+            assert_eq!(&cropped.binary[8..16], &[high; 8], "crop at {x},{y}");
+            assert_eq!(cropped.symbols["Crop"].size, 16);
+        }
         let invalid = t.run(
             "  .incchr \"image.pcx\",9,8,1,1",
             AssembleOptions::default(),
