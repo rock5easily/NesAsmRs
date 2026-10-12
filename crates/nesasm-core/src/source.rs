@@ -1,9 +1,10 @@
 use crate::{AssembleRequest, SourceEncoding, SourceLocation};
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs,
     io::{Read, Seek, SeekFrom},
-    path::{Component, Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
     rc::Rc,
 };
 
@@ -52,7 +53,14 @@ pub fn resolve_path(path: &Path, base: &Path, root: Option<&Path>) -> Result<Pat
     let mut ancestor = full.as_path();
     let mut tail = Vec::new();
     while !ancestor.exists() {
-        tail.push(ancestor.file_name().ok_or("Invalid path")?.to_owned());
+        let name = ancestor.file_name().ok_or("Invalid path")?;
+        // A name from a verbatim path (`\\?\`) is appended to a canonical path
+        // that may have dropped the prefix, where `a/../..` would become `..`
+        // and `link.` a junction `link` that leads outside the root.
+        if !is_plain_name(name) {
+            return Err("Invalid path".into());
+        }
+        tail.push(name.to_owned());
         ancestor = ancestor.parent().ok_or("Invalid path")?;
     }
     let mut resolved = canonicalize(ancestor)?;
@@ -61,30 +69,79 @@ pub fn resolve_path(path: &Path, base: &Path, root: Option<&Path>) -> Result<Pat
     }
     if let Some(root) = root {
         let root = canonicalize(root)?;
-        if !resolved.starts_with(root) {
+        if relative_to_root(&resolved, &root).is_none() {
             return Err("Path is outside the project root".into());
         }
     }
     Ok(resolved)
 }
 
+/// `path` relative to `root`, or `None` if it is not within `root`. Both are
+/// expected to be canonical, as `resolve_path` returns them. They are compared
+/// by component, ignoring the Windows verbatim prefix (`\\?\`) that only the
+/// longer of them may keep.
+pub fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    fn plain(prefix: Prefix<'_>) -> Prefix<'_> {
+        match prefix {
+            Prefix::VerbatimDisk(disk) => Prefix::Disk(disk),
+            Prefix::VerbatimUNC(server, share) => Prefix::UNC(server, share),
+            prefix => prefix,
+        }
+    }
+    let mut components = path.components();
+    for expected in root.components() {
+        let same = match (components.next()?, expected) {
+            (Component::Prefix(a), Component::Prefix(b)) => plain(a.kind()) == plain(b.kind()),
+            (a, b) => a == b,
+        };
+        if !same {
+            return None;
+        }
+    }
+    Some(components.as_path().to_owned())
+}
+
+/// Whether Windows reads `name` as the same single name in a path without the
+/// verbatim prefix (`\\?\`), which keeps `/` and trailing dots and spaces
+/// literal.
+fn is_plain_name(name: &OsStr) -> bool {
+    Path::new(name).components().eq([Component::Normal(name)])
+        && !(cfg!(windows) && matches!(name.as_encoded_bytes().last(), Some(b'.' | b' ')))
+}
+
 /// `fs::canonicalize` without the Windows verbatim prefix (`\\?\`) when the
-/// path stays valid without it, so diagnostics show ordinary paths that editors
-/// recognize. Root checks compare paths produced by this same function.
+/// path stays valid and means the same without it, so diagnostics show
+/// ordinary paths that editors recognize. A long path keeps the prefix, so
+/// root checks compare paths with `relative_to_root`.
 pub(crate) fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
     #[cfg(windows)]
     {
+        use std::{ffi::OsString, os::windows::ffi::OsStrExt};
         const MAX_PATH: usize = 260;
-        let text = path.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            if let Some(share) = rest.strip_prefix(r"UNC\") {
-                if share.len() + 2 < MAX_PATH {
-                    return Ok(PathBuf::from(format!(r"\\{share}")));
-                }
-            } else if rest.len() < MAX_PATH && rest.as_bytes().get(1) == Some(&b':') {
-                return Ok(PathBuf::from(rest));
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return Ok(path);
+        };
+        let mut plain = match prefix.kind() {
+            Prefix::VerbatimDisk(disk) => OsString::from(format!("{}:", char::from(disk))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut plain = OsString::from(r"\\");
+                plain.push(server);
+                plain.push(r"\");
+                plain.push(share);
+                plain
             }
+            _ => return Ok(path),
+        };
+        // Joined as `OsStr`, so that names that are not valid Unicode stay intact.
+        plain.push(components.as_path());
+        let same = components.all(|c| match c {
+            Component::Normal(name) => is_plain_name(name),
+            _ => true,
+        });
+        if same && plain.encode_wide().count() < MAX_PATH {
+            return Ok(plain.into());
         }
     }
     Ok(path)

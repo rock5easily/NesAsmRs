@@ -160,6 +160,66 @@ fn build_writes_artifacts_or_reports_output_errors() {
 }
 
 #[test]
+fn build_overwrites_long_paths_within_the_root() {
+    // Existing files whose canonical paths are long, in a directory whose
+    // path is not: on Windows, only the files' paths keep the `\\?\` prefix.
+    let t = Temp::new();
+    let dir = common::long_dir(&t.0);
+    t.write(&format!("{dir}source_file.asm"), "  .list\n  .db 1\n");
+    let mut request = t.request(AssembleOptions::default());
+    request.input = format!("{dir}source_file.asm").into();
+    let output = format!("{dir}output_file.nes");
+    let cancel = AtomicBool::new(false);
+    for _ in 0..2 {
+        let (r, artifacts) = nesasm_core::build(&request, Some(Path::new(&output)), &cancel);
+        assert!(r.success, "{:?}", r.diagnostics);
+        let kinds: Vec<_> = artifacts.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [ArtifactKind::Rom, ArtifactKind::Listing]);
+    }
+    assert!(t.0.join(&dir).join("output_file.lst").is_file());
+    // Hidden directories stay rejected.
+    let hidden = format!("{dir}.hidden_directory/output_file.nes");
+    t.write(&hidden, "");
+    let (r, artifacts) = nesasm_core::build(&request, Some(Path::new(&hidden)), &cancel);
+    assert!(artifacts.is_empty());
+    let message = &r.diagnostics.last().unwrap().message;
+    assert!(
+        message.contains("must not contain hidden files"),
+        "{message}"
+    );
+}
+
+#[test]
+fn relative_to_root_compares_components() {
+    let relative =
+        |path: &str, root: &str| nesasm_core::relative_to_root(Path::new(path), Path::new(root));
+    let (root, inside, sibling) = if cfg!(windows) {
+        (r"C:\project", r"C:\project\src\a.asm", r"C:\project2\a.asm")
+    } else {
+        ("/project", "/project/src/a.asm", "/project2/a.asm")
+    };
+    assert_eq!(relative(inside, root), Some(Path::new("src").join("a.asm")));
+    assert_eq!(relative(root, root), Some(Path::new("").to_owned()));
+    assert_eq!(relative(sibling, root), None);
+    assert_eq!(relative(root, inside), None);
+    if cfg!(windows) {
+        // The verbatim prefix of either path is ignored.
+        let a = Path::new("a.asm").to_owned();
+        assert_eq!(relative(r"\\?\C:\project\a.asm", root), Some(a.clone()));
+        assert_eq!(
+            relative(r"C:\project\a.asm", r"\\?\C:\project"),
+            Some(a.clone())
+        );
+        assert_eq!(
+            relative(r"\\?\UNC\server\share\a.asm", r"\\server\share"),
+            Some(a)
+        );
+        assert_eq!(relative(r"\\?\D:\project\a.asm", root), None);
+        assert_eq!(relative(r"\\?\C:\project2\a.asm", root), None);
+    }
+}
+
+#[test]
 fn write_artifacts_rejects_failed_and_conflicting_results() {
     let t = Temp::new();
     let write = |result: &AssembleResult, output: &str, options: &AssembleOptions| {
@@ -863,22 +923,13 @@ fn export_disassembly_migrates_files_with_long_paths() {
     // A directory below 260 characters whose files are longer: on Windows,
     // their canonical paths keep the `\\?\` prefix and the directory's does not.
     let t = Temp::new();
-    let root = fs::canonicalize(&t.0).unwrap();
-    let root = root.to_string_lossy();
-    let length = root.strip_prefix(r"\\?\").unwrap_or(&root).len();
-    let mut dir = String::new();
-    while length + 1 + dir.len() < 250 {
-        dir.push(if dir.len() % 50 == 49 { '/' } else { 'd' });
-    }
-    if dir.ends_with('/') {
-        dir.push('d');
-    }
-    dir.push('/');
+    let dir = common::long_dir(&t.0);
     let (_, d) = eighteen_banks(&t, &dir);
     write_old_format(&t, &d, &dir);
     let never = AtomicBool::new(false);
-    // Without a root: with one, such paths fail its check (a separate limit).
-    let e = nesasm_core::export_disassembly(&d, &t.0, None, Path::new("game.nes"), &never).unwrap();
+    // Within a root, whose own path is short.
+    let e = nesasm_core::export_disassembly(&d, &t.0, Some(&t.0), Path::new("game.nes"), &never)
+        .unwrap();
     assert_eq!(e.removed.len(), 6, "{:?}", e.removed);
     let text = fs::read_to_string(t.0.join(&dir).join("game_bank10.asm")).unwrap();
     assert_eq!(text.lines().nth(1), Some("\t.bank 16"));

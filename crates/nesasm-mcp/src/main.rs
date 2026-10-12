@@ -425,7 +425,7 @@ fn diagnostics_summary(diagnostics: &[Diagnostic]) -> String {
 
 impl Server {
     fn relative(root: &Path, path: &Path) -> PathBuf {
-        path.strip_prefix(root).unwrap_or(path).to_owned()
+        nesasm_core::relative_to_root(path, root).unwrap_or_else(|| path.to_owned())
     }
 
     /// The core request for a project; in-memory sources are encoded in the

@@ -2,7 +2,10 @@
 #![allow(dead_code)]
 
 use nesasm_core::{AssembleOptions, AssembleRequest, AssembleResult};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// A project directory that is removed when the test ends, even on panic.
 pub struct Temp(pub PathBuf, #[allow(dead_code)] tempfile::TempDir);
@@ -61,6 +64,25 @@ impl Temp {
         );
         r
     }
+}
+
+/// A relative directory, ending in `/`, whose canonical path within `root`
+/// stays below 260 characters while a file in it with a name of 12 or more
+/// characters exceeds that. On Windows, canonical paths keep the verbatim
+/// prefix (`\?\`) only from that length.
+pub fn long_dir(root: &Path) -> String {
+    let root = fs::canonicalize(root).unwrap();
+    let root = root.to_string_lossy();
+    let length = root.strip_prefix(r"\?\").unwrap_or(&root).len();
+    let mut dir = String::new();
+    while length + 1 + dir.len() < 250 {
+        dir.push(if dir.len() % 50 == 49 { '/' } else { 'd' });
+    }
+    if dir.ends_with('/') {
+        dir.push('d');
+    }
+    dir.push('/');
+    dir
 }
 
 pub fn messages(r: &AssembleResult) -> Vec<&str> {

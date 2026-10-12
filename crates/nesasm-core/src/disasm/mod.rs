@@ -813,11 +813,8 @@ impl Disassembly {
                                     && address < l.address + l.size as u32
                             })
                             .map(|l| {
-                                let file = l
-                                    .location
-                                    .file
-                                    .strip_prefix(&base)
-                                    .unwrap_or(&l.location.file);
+                                let file = crate::relative_to_root(&l.location.file, &base)
+                                    .unwrap_or_else(|| l.location.file.clone());
                                 format!("{}:{}", file.display(), l.location.line)
                             })
                     });

@@ -623,6 +623,120 @@ fn source_files_outside_the_root_and_absolute_paths() {
     assert!(common::messages(&r)[0].starts_with("Cannot open file"));
 }
 
+#[cfg(windows)]
+#[test]
+fn verbatim_paths_do_not_leave_the_root_through_slashes() {
+    // In a `\\?\` path, `/` is not a separator: `a/../../secret.bin` is one
+    // missing name, which must not become `..` once the prefix is removed.
+    let t = Temp::new();
+    t.write("secret.bin", [9]);
+    t.write("project/a/keep.txt", "");
+    let root = nesasm_core::resolve_path(&t.0.join("project"), &t.0, None).unwrap();
+    let escape = format!(r"\\?\{}\a/../../secret.bin", root.display());
+    assert_eq!(
+        nesasm_core::resolve_path(std::path::Path::new(&escape), &root, Some(&root)),
+        Err("Invalid path".into())
+    );
+    // As an INCBIN file.
+    t.write("project/test.asm", format!("  .incbin \"{escape}\"\n"));
+    let mut request = t.request(AssembleOptions::default());
+    request.working_directory = root.clone();
+    request.allowed_root = Some(root);
+    let r = nesasm_core::assemble(&request);
+    assert_eq!(
+        common::messages(&r),
+        ["Invalid path"],
+        "{:?}",
+        r.diagnostics
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn verbatim_paths_do_not_leave_the_root_through_trailing_dots() {
+    // In a `\\?\` path, `link.` is a missing name, while without the prefix
+    // Windows drops the dot and follows the junction `link` outside the root.
+    use std::path::Path;
+    let t = Temp::new();
+    t.write("outside/secret.bin", [9]);
+    t.write("project/keep.txt", "");
+    let root = nesasm_core::resolve_path(&t.0.join("project"), &t.0, None).unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("link"))
+        .arg(t.0.join("outside"))
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let resolve = |path: &str| nesasm_core::resolve_path(Path::new(path), &root, Some(&root));
+    let root_text = root.display();
+    for name in [
+        r"link.\secret.bin",
+        r"link \secret.bin",
+        r"link\secret.bin.",
+    ] {
+        let path = format!(r"\\?\{root_text}\{name}");
+        assert_eq!(resolve(&path), Err("Invalid path".into()), "{path}");
+    }
+    // Without the prefix, the junction is followed and rejected.
+    let path = format!(r"{root_text}\link.\secret.bin");
+    assert_eq!(
+        resolve(&path),
+        Err("Path is outside the project root".into())
+    );
+    // An existing name with a trailing dot keeps the prefix in canonical paths.
+    let dotted = format!(r"\\?\{root_text}\dots.");
+    std::fs::create_dir(&dotted).unwrap();
+    std::fs::write(format!(r"{dotted}\data.bin"), [1]).unwrap();
+    let path = format!(r"{dotted}\data.bin");
+    assert_eq!(resolve(&path), Ok(Path::new(&path).to_owned()));
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_paths_keep_names_that_are_not_unicode() {
+    // An unpaired surrogate must not become U+FFFD, which would name another file.
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    let t = Temp::new();
+    let root = nesasm_core::resolve_path(&t.0, &t.0, None).unwrap();
+    let name = OsString::from_wide(&[u16::from(b'r'), 0xD800]);
+    std::fs::create_dir(root.join(&name)).unwrap();
+    std::fs::write(root.join(&name).join("data.bin"), [7]).unwrap();
+    std::fs::create_dir(root.join("r\u{FFFD}")).unwrap();
+    let path = root.join(&name).join("data.bin");
+    let resolved = nesasm_core::resolve_path(&path, &root, Some(&root)).unwrap();
+    assert_eq!(resolved, path);
+    assert_eq!(std::fs::read(&resolved).unwrap(), [7]);
+}
+
+#[test]
+fn long_source_paths_within_the_root() {
+    // Files whose canonical paths are long, in a directory whose path is not:
+    // on Windows, only the files' paths keep the `\\?\` prefix.
+    let t = Temp::new();
+    let dir = common::long_dir(&t.0);
+    t.write(&format!("{dir}included_file.asm"), "  .db 2\n");
+    t.write(&format!("{dir}binary_data.bin"), [3]);
+    t.write(
+        &format!("{dir}source_file.asm"),
+        "  .db 1\n  .include \"included_file.asm\"\n  .incbin \"binary_data.bin\"\n",
+    );
+    let mut request = t.request(AssembleOptions::default());
+    request.input = format!("{dir}source_file.asm").into();
+    request.include_paths = vec![t.0.join(&dir)];
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[..3], [1, 2, 3]);
+    // So are in-memory files.
+    request.files.insert(
+        format!("{dir}included_file.asm").into(),
+        b"  .db 4\n".to_vec(),
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[..3], [1, 4, 3]);
+}
+
 #[test]
 fn expanded_source_limit() {
     let t = Temp::new();
