@@ -623,6 +623,34 @@ fn source_files_outside_the_root_and_absolute_paths() {
     assert!(common::messages(&r)[0].starts_with("Cannot open file"));
 }
 
+#[cfg(windows)]
+#[test]
+fn verbatim_paths_do_not_leave_the_root_through_slashes() {
+    // In a `\\?\` path, `/` is not a separator: `a/../../secret.bin` is one
+    // missing name, which must not become `..` once the prefix is removed.
+    let t = Temp::new();
+    t.write("secret.bin", [9]);
+    t.write("project/a/keep.txt", "");
+    let root = nesasm_core::resolve_path(&t.0.join("project"), &t.0, None).unwrap();
+    let escape = format!(r"\\?\{}\a/../../secret.bin", root.display());
+    assert_eq!(
+        nesasm_core::resolve_path(std::path::Path::new(&escape), &root, Some(&root)),
+        Err("Invalid path".into())
+    );
+    // As an INCBIN file.
+    t.write("project/test.asm", format!("  .incbin \"{escape}\"\n"));
+    let mut request = t.request(AssembleOptions::default());
+    request.working_directory = root.clone();
+    request.allowed_root = Some(root);
+    let r = nesasm_core::assemble(&request);
+    assert_eq!(
+        common::messages(&r),
+        ["Invalid path"],
+        "{:?}",
+        r.diagnostics
+    );
+}
+
 #[test]
 fn long_source_paths_within_the_root() {
     // Files whose canonical paths are long, in a directory whose path is not:

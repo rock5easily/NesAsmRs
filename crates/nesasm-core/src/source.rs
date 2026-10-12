@@ -52,7 +52,14 @@ pub fn resolve_path(path: &Path, base: &Path, root: Option<&Path>) -> Result<Pat
     let mut ancestor = full.as_path();
     let mut tail = Vec::new();
     while !ancestor.exists() {
-        tail.push(ancestor.file_name().ok_or("Invalid path")?.to_owned());
+        let name = ancestor.file_name().ok_or("Invalid path")?;
+        // In a Windows verbatim path (`\\?\`), `/` is not a separator, so a
+        // name like `a/../..` would become `..` components once the canonical
+        // path drops the prefix.
+        if !Path::new(name).components().eq([Component::Normal(name)]) {
+            return Err("Invalid path".into());
+        }
+        tail.push(name.to_owned());
         ancestor = ancestor.parent().ok_or("Invalid path")?;
     }
     let mut resolved = canonicalize(ancestor)?;
