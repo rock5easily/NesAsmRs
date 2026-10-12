@@ -111,7 +111,7 @@ pub struct SourceLine {
     /// ROM bytes the line produces.
     pub size: usize,
     /// The first bytes as hex pairs (`..` when there are more).
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bytes: String,
     pub text: String,
 }
@@ -184,7 +184,7 @@ pub struct Diff {
     pub referenced_from: Vec<Xref>,
     /// The first bytes of the ROM and of the base ROM in the range.
     pub bytes: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_bytes: String,
 }
 
@@ -206,7 +206,7 @@ pub struct Routine {
     pub reads: Vec<String>,
     pub writes: Vec<String>,
     /// The routine has more instructions than are followed (16384).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 

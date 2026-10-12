@@ -106,7 +106,10 @@ pub(crate) fn render(
         .chain(a.comments.keys())
         .chain(a.operands.keys());
     for loc in keys {
-        stops[loc.bank].insert(loc.offset);
+        // A word is never split: names inside it are defined relative to it.
+        if !a.in_word(*loc) {
+            stops[loc.bank].insert(loc.offset);
+        }
     }
     for region in a.regions.iter().flatten() {
         stops[region.bank].extend([region.start, region.end]);
@@ -644,6 +647,39 @@ impl Writer<'_> {
             self.line_comment(loc, size)
         );
         self.push(loc.bank, Some(self.a.memory.address(loc)), size, text);
+        for offset in loc.offset + 1..loc.offset + size {
+            let inner = loc.at(offset);
+            if !self.a.in_word(inner) {
+                continue;
+            }
+            let address = self.a.memory.address(inner);
+            for line in self
+                .a
+                .comments
+                .get(&inner)
+                .map_or(&[][..], |(above, _)| above.as_slice())
+            {
+                let text = format!("; {line}").trim_end().to_owned();
+                self.push(loc.bank, Some(address), 0, text);
+            }
+            let Some(base) = self
+                .a
+                .labels
+                .get(&loc.at(offset - 1))
+                .and_then(|l| l.first())
+            else {
+                continue;
+            };
+            let base = base.name.clone();
+            for label in self.a.labels.get(&inner).into_iter().flatten() {
+                self.push(
+                    loc.bank,
+                    Some(address),
+                    0,
+                    format!("{} = {base}+1", label.name),
+                );
+            }
+        }
         size
     }
 

@@ -65,7 +65,8 @@ fragments (`load_address`) cannot have a base.
 - `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes"}]`.
   Code is traced from the interrupt vectors and these addresses. `no_return`:
   a JSR to the routine does not return. `inline_bytes`: bytes of inline
-  arguments after each JSR to it, emitted as data.
+  arguments after each JSR to it, emitted as data (or as the regions that
+  describe them).
 - `labels`: `[{"address", "bank", "name", "comment"}]`, names of ROM
   addresses. The comment is placed above the label.
 - `symbols`: `[{"name", "value", "size", "comment"}]`, names of RAM, I/O and
@@ -102,8 +103,10 @@ are reserved.
 - Automatic labels: `sub_C123` (JSR targets), `L_C123` (jumps and branches),
   `D_C123` (data read by code or named by tables), and `NMI`, `RESET`, `IRQ`
   for the vectors. When several banks hold the address, the bank is included
-  (`L_03_8123`). A target inside an instruction is written `label+n`; a named
-  one is defined as `name = label+n`.
+  (`L_03_8123`). A target inside an instruction, or in the second byte of a
+  word of a `words`/`pointers` region, is written `label+n`; a named one is
+  defined as `name = label+n`, so instructions and words are never split.
+  `operands` cannot replace the second byte of a word.
 - Zero page operands use `<`, absolute ones keep four digits (`lda $0012`),
   so no AUTOZP is needed. Branches that wrap around $FFFF use `*+n`.
 - Bytes no code reaches and no region describes are `.db`; runs of 16 or more

@@ -597,6 +597,21 @@ impl Analysis {
         }
         self.apply_regions(config, &mut errors);
         if errors.is_empty() {
+            let mut inside: Vec<Loc> = self
+                .operands
+                .keys()
+                .filter(|l| self.in_word(**l))
+                .copied()
+                .collect();
+            inside.sort();
+            for loc in inside {
+                errors.push(format!(
+                    "operands ${:04X}: the second byte of a word; give the expression at the word",
+                    self.memory.address(loc)
+                ));
+            }
+        }
+        if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
@@ -1069,7 +1084,7 @@ impl Analysis {
         if end > bank.end
             || self.class[call.bank][start..end]
                 .iter()
-                .any(|c| *c != Class::Unknown)
+                .any(|c| matches!(c, Class::Insn | Class::Operand))
         {
             let address = self.memory.address(call);
             self.issue(
@@ -1080,20 +1095,31 @@ impl Analysis {
             );
             return false;
         }
-        self.class[call.bank][start..end].fill(Class::Data);
-        let regions = &mut self.regions[call.bank];
-        regions.push(Region {
-            bank: call.bank,
-            start,
-            end,
-            kind: RegionType::Bytes,
-            pair: None,
-            code_targets: false,
-            adjust: 0,
-            columns: None,
-            comment: None,
-        });
-        regions.sort_by_key(|r| r.start);
+        // Bytes a region already describes keep it; the others become bytes.
+        let mut offset = start;
+        while offset < end {
+            if self.class[call.bank][offset] != Class::Unknown {
+                offset += 1;
+                continue;
+            }
+            let piece = offset;
+            while offset < end && self.class[call.bank][offset] == Class::Unknown {
+                offset += 1;
+            }
+            self.class[call.bank][piece..offset].fill(Class::Data);
+            self.regions[call.bank].push(Region {
+                bank: call.bank,
+                start: piece,
+                end: offset,
+                kind: RegionType::Bytes,
+                pair: None,
+                code_targets: false,
+                adjust: 0,
+                columns: None,
+                comment: None,
+            });
+        }
+        self.regions[call.bank].sort_by_key(|r| r.start);
         true
     }
 
@@ -1127,6 +1153,9 @@ impl Analysis {
                 address,
                 format!("The instruction at ${address:04X}{source} would overlap other code, data or the end of the bank"),
             );
+            if let Some(issue) = self.issues.last_mut() {
+                issue.span = Some((loc.offset, len.min(end - loc.offset)));
+            }
             return None;
         }
         let byte = |i: usize| u32::from(self.memory.byte(loc.at(loc.offset + i)));
@@ -1149,7 +1178,13 @@ impl Analysis {
         self.class[loc.bank][loc.offset] = Class::Insn;
         self.class[loc.bank][loc.offset + 1..loc.offset + len].fill(Class::Operand);
         self.insns.insert(loc, insn);
+        let before = self.issues.len();
         self.reference(loc, insn);
+        for issue in &mut self.issues[before..] {
+            if issue.span == Some((loc.offset, 1)) {
+                issue.span = Some((loc.offset, len));
+            }
+        }
         Some(insn)
     }
 
@@ -1249,12 +1284,17 @@ impl Analysis {
             .wanted
             .keys()
             .chain(self.labels.keys())
-            .filter(|l| self.class[l.bank][l.offset] == Class::Operand)
+            .filter(|l| self.class[l.bank][l.offset] == Class::Operand || self.in_word(**l))
             .copied()
             .collect();
         for loc in inside {
             if let Some(start) = self.containing(loc) {
-                self.want(start, Want::Jump);
+                let want = if self.in_word(loc) {
+                    Want::Data
+                } else {
+                    Want::Jump
+                };
+                self.want(start, want);
             }
         }
         let user: HashSet<String> = self
@@ -1279,7 +1319,9 @@ impl Analysis {
         }
         let wanted: Vec<(Loc, Want)> = self.wanted.iter().map(|(l, w)| (*l, *w)).collect();
         for (loc, want) in wanted {
-            if self.labels.contains_key(&loc) || self.class[loc.bank][loc.offset] == Class::Operand
+            if self.labels.contains_key(&loc)
+                || self.class[loc.bank][loc.offset] == Class::Operand
+                || self.in_word(loc)
             {
                 continue;
             }
@@ -1348,6 +1390,9 @@ impl Analysis {
 
     /// The instruction whose operand holds `loc`.
     pub fn containing(&self, loc: Loc) -> Option<Loc> {
+        if self.in_word(loc) {
+            return Some(loc.at(loc.offset - 1));
+        }
         (loc.offset.saturating_sub(2)..loc.offset)
             .rev()
             .map(|o| loc.at(o))
@@ -1356,6 +1401,15 @@ impl Analysis {
                     .get(l)
                     .is_some_and(|i| l.offset + i.len > loc.offset)
             })
+    }
+
+    /// Whether `loc` is the second byte of a word in a words or pointers region.
+    pub fn in_word(&self, loc: Loc) -> bool {
+        self.region_at(loc).is_some_and(|r| {
+            matches!(r.kind, RegionType::Words | RegionType::Pointers)
+                && (loc.offset - r.start) % 2 == 1
+                && loc.offset < r.end - (r.end - r.start) % 2
+        })
     }
 
     /// The primary name of a ROM location, or `label+n` inside an instruction.

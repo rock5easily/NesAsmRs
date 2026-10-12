@@ -430,7 +430,7 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
         &never,
     )
     .unwrap();
-    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"));
+    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"), &never);
     let artifacts = write().unwrap();
     let kinds: Vec<ArtifactKind> = artifacts.iter().map(|a| a.kind).collect();
     assert_eq!(kinds, [ArtifactKind::Source, ArtifactKind::Chr]);
@@ -475,7 +475,8 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
         &never,
     )
     .unwrap();
-    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.chr")).unwrap_err();
+    let e =
+        nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.chr"), &never).unwrap_err();
     assert_eq!(e, "Output would overwrite the ROM");
     let d = nesasm_core::disasm::disassemble(
         &rom,
@@ -485,7 +486,8 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
         &never,
     )
     .unwrap();
-    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes")).unwrap_err();
+    let e =
+        nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"), &never).unwrap_err();
     assert_eq!(e, "Source output must have a .asm extension");
 }
 
@@ -516,7 +518,8 @@ fn write_disassembly_does_not_follow_links_to_other_files() {
     .unwrap();
     t.write("backup.nes", b"keep");
     std::os::unix::fs::symlink(t.0.join("backup.nes"), t.0.join("game.chr")).unwrap();
-    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes")).unwrap_err();
+    let e =
+        nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"), &never).unwrap_err();
     assert!(e.contains("backup.nes is not a .chr file"), "{e}");
     assert_eq!(fs::read(t.0.join("backup.nes")).unwrap(), b"keep");
 }
@@ -534,7 +537,7 @@ fn write_disassembly_protects_split_sources_and_chr() {
         nesasm_core::disasm::parse_config(r#"{"options": {"split_banks": true}}"#).unwrap();
     let d = nesasm_core::disasm::disassemble(&rom, None, &config, Path::new("game.asm"), &never)
         .unwrap();
-    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"));
+    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"), &never);
     let kinds: Vec<ArtifactKind> = write().unwrap().iter().map(|a| a.kind).collect();
     assert_eq!(
         kinds,
@@ -584,7 +587,7 @@ fn write_disassembly_keeps_sources_that_are_not_utf8() {
     .unwrap();
     let d = nesasm_core::disasm::disassemble(&rom, None, &config, Path::new("game.asm"), &never)
         .unwrap();
-    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"));
+    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"), &never);
     write().unwrap();
     let path = t.0.join("game.asm");
     let bytes = fs::read(&path).unwrap();
@@ -602,4 +605,29 @@ fn write_disassembly_keeps_sources_that_are_not_utf8() {
         "{e}"
     );
     assert_eq!(fs::read(&path).unwrap(), edited);
+}
+
+#[test]
+fn write_disassembly_writes_nothing_when_cancelled() {
+    let t = Temp::new();
+    let r =
+        t.run("  .inesprg 1\n  .ineschr 1\n  .bank 1\n  .org $FFFA\n  .dw 0, 0, 0\n  .bank 2\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    let never = AtomicBool::new(false);
+    let d = nesasm_core::disasm::disassemble(
+        &rom,
+        None,
+        &nesasm_core::disasm::DisasmConfig::default(),
+        Path::new("out/game.asm"),
+        &never,
+    )
+    .unwrap();
+    let cancelled = AtomicBool::new(true);
+    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"), &cancelled)
+        .unwrap_err();
+    assert_eq!(e, "Cancelled before writing; nothing was written");
+    // Neither the files nor their staging copies remain.
+    assert_eq!(fs::read_dir(t.0.join("out")).unwrap().count(), 0);
 }

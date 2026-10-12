@@ -147,12 +147,14 @@ fn check_not_hidden(path: &Path, root: &Path) -> Result<(), String> {
 /// `base` and within `root` when set. The main source must end in `.asm`
 /// (bank files and the CHR file derive from its name). Existing files are
 /// replaced only if they are generated sources not edited since (or the CHR
-/// file of one), so hand-written or edited files are never lost.
+/// file of one), so hand-written or edited files are never lost. When
+/// `cancel` is set before the files are renamed into place, nothing is written.
 pub fn write_disassembly(
     disassembly: &crate::disasm::Disassembly,
     base: &Path,
     root: Option<&Path>,
     rom: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<Artifact>, String> {
     let main = disassembly.source_path();
     if !main
@@ -249,6 +251,10 @@ pub fn write_disassembly(
     let mut staged = Vec::with_capacity(files.len());
     for (kind, path, data) in files {
         staged.push(StagedArtifact::write(kind, path, &data).map_err(|e| e.to_string())?);
+    }
+    // Staged files are removed when dropped.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Cancelled before writing; nothing was written".into());
     }
     staged
         .into_iter()

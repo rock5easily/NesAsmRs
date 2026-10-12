@@ -916,7 +916,7 @@ impl Server {
                 "The time limit passed before writing; nothing was written",
             ));
         } else {
-            match nesasm_core::write_disassembly(d, root, Some(root), &loaded.rom) {
+            match nesasm_core::write_disassembly(d, root, Some(root), &loaded.rom, cancel) {
                 Ok(artifacts) => {
                     report.artifacts = artifacts;
                     report.success = true;

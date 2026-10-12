@@ -200,6 +200,84 @@ fn concurrent_calls_all_complete() {
     }
 }
 
+/// Where `value` departs from `schema` (a JSON Schema whose `$ref`s point
+/// into the `$defs` of `root`): missing required properties, unknown
+/// properties, wrong types, nested objects and arrays included.
+fn violations(value: &Value, schema: &Value, root: &Value, path: &str, out: &mut Vec<String>) {
+    if let Some(name) = schema.get("$ref").and_then(Value::as_str) {
+        let name = name.trim_start_matches("#/$defs/");
+        return violations(value, &root["$defs"][name], root, path, out);
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(options) = schema.get(key).and_then(Value::as_array) {
+            let fits = |option: &Value| {
+                let mut errors = Vec::new();
+                violations(value, option, root, path, &mut errors);
+                errors.is_empty()
+            };
+            if !options.iter().any(fits) {
+                out.push(format!("{path}: matches no {key} option"));
+            }
+            return;
+        }
+    }
+    let actual = match value {
+        Value::Bool(_) => "boolean",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Number(n) if n.is_f64() => "number",
+        Value::Number(_) => "integer",
+        Value::Null => "null",
+    };
+    let types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    if !types.is_empty()
+        && !types.contains(&actual)
+        && !(actual == "integer" && types.contains(&"number"))
+    {
+        out.push(format!("{path}: {actual} is not {types:?}"));
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for required in schema["required"].as_array().into_iter().flatten() {
+                let required = required.as_str().unwrap();
+                if !map.contains_key(required) {
+                    out.push(format!("{path}: missing required {required}"));
+                }
+            }
+            for (key, item) in map {
+                let path = format!("{path}.{key}");
+                match schema["properties"].get(key) {
+                    Some(property) => violations(item, property, root, &path, out),
+                    None => match schema.get("additionalProperties") {
+                        Some(Value::Bool(false)) => out.push(format!("{path}: not in the schema")),
+                        Some(extra) if extra.is_object() => {
+                            violations(item, extra, root, &path, out)
+                        }
+                        _ if schema.get("properties").is_some() => {
+                            out.push(format!("{path}: not in the schema"))
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
+        Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for (i, item) in items.iter().enumerate() {
+                    violations(item, item_schema, root, &format!("{path}[{i}]"), out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn structured_content_matches_output_schema() {
     let mut c = Client::start();
@@ -209,6 +287,10 @@ fn structured_content_matches_output_schema() {
     )
     .unwrap();
     fs::write(c.root.join("game.bin"), vec![0xea; 0x2000]).unwrap();
+    // A hack of game.bin with a second bank, which the base lacks.
+    let mut hack = vec![0xea; 0x2000];
+    hack.extend(vec![0x60; 0x2000]);
+    fs::write(c.root.join("hack.bin"), hack).unwrap();
     let listed = c.request("tools/list", json!({}));
     let schemas: Vec<(String, Value)> = listed["result"]["tools"]
         .as_array()
@@ -231,12 +313,29 @@ fn structured_content_matches_output_schema() {
             json!({"inline":{"rom":"game.bin"},"view":{"from":"$E000"},
                                "xrefs":["$E000"],"routines":{},"ram":{}}),
         ),
+        (
+            "disassemble",
+            json!({"inline":{"rom":"game.bin"},"view":{"from":"$EAEA","to":"$EAEB"}}),
+        ),
+        (
+            "disassemble",
+            json!({"inline":{"rom":"hack.bin","base":"game.bin"},"routines":{},"ram":{}}),
+        ),
         ("export_disassembly", json!({"inline":{"rom":"game.bin"}})),
         ("disassemble", json!({"inline":{"rom":"missing.bin"}})),
     ] {
-        let result = c.call(name, arguments);
+        let result = c.call(name, arguments.clone());
         let content = result["structuredContent"].as_object().unwrap();
         let schema = &schemas.iter().find(|(n, _)| n == name).unwrap().1;
+        let mut errors = Vec::new();
+        violations(
+            &result["structuredContent"],
+            schema,
+            schema,
+            "$",
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{name} {arguments}: {errors:#?}");
         let properties = schema["properties"].as_object().unwrap();
         for key in content.keys() {
             assert!(properties.contains_key(key), "{name}: {key} not in schema");

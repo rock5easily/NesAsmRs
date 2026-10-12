@@ -1214,3 +1214,90 @@ fn backslashes_are_not_separators_outside_windows() {
         "{e:?}"
     );
 }
+
+#[test]
+fn words_are_not_split_by_names_inside_them() {
+    let c = config(
+        r#"{"load_address": "$7000", "regions": [{"start": "$7000", "length": 4, "type": "words"}],
+            "labels": [{"address": "$7001", "name": "Mid"}],
+            "comments": [{"address": "$7001", "text": "high byte"}],
+            "operands": [{"address": "$7000", "expr": "$7777"}]}"#,
+    );
+    let d = round_trip(&[0x77; 4], &c);
+    assert_lines(
+        &d,
+        &[
+            "D_7000:",
+            "  .dw $7777, $7777 ; high byte",
+            "Mid = D_7000+1",
+        ],
+    );
+    // Reads of the second byte of a word name the word.
+    let rom = nrom("Reset:\n  lda Table+1\nNmi:\n  rti\nTable:\n  .dw $1234, $5678");
+    let d = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E004", "length": 4, "type": "words"}]}"#),
+    );
+    assert_lines(&d, &["  lda D_E004+1", "D_E004:", "  .dw $1234, $5678"]);
+    // An expression cannot replace half a word.
+    let e = disasm::disassemble(
+        &[0x77; 4],
+        None,
+        &config(
+            r#"{"load_address": "$7000", "regions": [{"start": "$7000", "length": 4, "type": "words"}],
+                "operands": [{"address": "$7001", "expr": "$77"}]}"#,
+        ),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        e[0].message,
+        "operands $7001: the second byte of a word; give the expression at the word"
+    );
+}
+
+#[test]
+fn inline_arguments_may_be_described_by_regions() {
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Sub\n  .db $41\n  lda <$20\n  rts\n",
+        "Sub:\n  nop\n  rts\nNmi:\n  rti",
+    ));
+    let d = round_trip(
+        &rom,
+        &config(
+            r#"{"entry_points": [{"address": "$E007", "inline_bytes": 1}],
+                "regions": [{"start": "$E003", "length": 1, "type": "text"}]}"#,
+        ),
+    );
+    assert_lines(
+        &d,
+        &["  jsr sub_E007", "  .db \"A\"", "  lda <$20", "  rts"],
+    );
+    assert!(issues(&d, IssueKind::CodeDataConflict).is_empty());
+    let reset = d
+        .routines()
+        .into_iter()
+        .find(|r| r.name == "RESET")
+        .unwrap();
+    assert_eq!(reset.reads, ["$0020"]);
+}
+
+#[test]
+fn rom_hack_issues_cover_whole_instructions() {
+    // JSR at $E000 would overlap the data region at $E002.
+    let rom = nrom("Reset:\n  jsr Sub\nNmi:\n  rti\nSub:\n  rts");
+    let d = patch_round_trip(
+        &rom,
+        &rom,
+        r#"{"regions": [{"start": "$E002", "length": 1}],
+            "patches": [{"start": "$E001", "length": 1}]}"#,
+    );
+    assert_eq!(
+        issues(&d, IssueKind::Overlap),
+        [
+            "$E000 The instruction at $E000 (from $FFFC) would overlap other code, data or the end of the bank"
+        ]
+    );
+}
