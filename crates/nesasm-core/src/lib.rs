@@ -1,3 +1,4 @@
+pub mod disasm;
 mod engine;
 mod error;
 mod expr;
@@ -242,6 +243,9 @@ pub enum DiagnosticCode {
     Timeout,
     #[serde(rename = "E_INTERNAL")]
     Internal,
+    /// Invalid disassembly annotations or ROM.
+    #[serde(rename = "E_DISASM")]
+    Disasm,
     #[serde(rename = "W_BANK_OVERFLOW")]
     BankOverflow,
     #[serde(rename = "W_UNDEFINED_IF")]
@@ -263,6 +267,7 @@ impl DiagnosticCode {
             Self::Output => "E_OUTPUT",
             Self::Timeout => "E_TIMEOUT",
             Self::Internal => "E_INTERNAL",
+            Self::Disasm => "E_DISASM",
             Self::BankOverflow => "W_BANK_OVERFLOW",
             Self::UndefinedIf => "W_UNDEFINED_IF",
         }

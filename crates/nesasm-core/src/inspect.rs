@@ -10,12 +10,12 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 4] = b"NES\x1a";
-const HEADER_SIZE: usize = 16;
+pub(crate) const HEADER_SIZE: usize = 16;
 const TRAINER_SIZE: usize = 512;
-const PRG_UNIT: usize = 16 * 1024;
+pub(crate) const PRG_UNIT: usize = 16 * 1024;
 const CHR_UNIT: usize = 8 * 1024;
 /// CPU address of the NMI, RESET and IRQ vectors.
-const VECTORS: u32 = 0xfffa;
+pub(crate) const VECTORS: u32 = 0xfffa;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -109,6 +109,8 @@ pub struct Rom {
     pub payload: Vec<u8>,
     /// Banks known to hold $FFFA-$FFFF (from assembly).
     vector_banks: Vec<usize>,
+    /// The 16 header bytes as read, empty without a header.
+    header_bytes: Vec<u8>,
 }
 
 impl Rom {
@@ -127,6 +129,7 @@ impl Rom {
             header: Some(header),
             payload: payload.to_vec(),
             vector_banks: Vec::new(),
+            header_bytes: bytes[..HEADER_SIZE].to_vec(),
         })
     }
 
@@ -147,14 +150,20 @@ impl Rom {
             header: InesHeader::parse(&result.header).ok(),
             payload: result.binary.clone(),
             vector_banks,
+            header_bytes: result.header.clone(),
         }
+    }
+
+    /// The 16 header bytes, empty for a raw payload.
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.header_bytes
     }
 
     pub fn bank_count(&self) -> usize {
         self.payload.len().div_ceil(BANK_SIZE)
     }
 
-    fn bank(&self, bank: usize) -> Result<&[u8], String> {
+    pub(crate) fn bank(&self, bank: usize) -> Result<&[u8], String> {
         let start = bank * BANK_SIZE;
         if bank >= self.bank_count() {
             return Err(format!(
@@ -310,7 +319,7 @@ impl Rom {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|b| format!("{b:02X}"))
@@ -319,7 +328,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Opcode to instruction, from the assembler's own table.
-fn decode_table() -> [Option<(Mnemonic, Mode)>; 256] {
+pub(crate) fn decode_table() -> [Option<(Mnemonic, Mode)>; 256] {
     const MODES: [Mode; 15] = [
         Mode::Acc,
         Mode::Imm,
@@ -348,7 +357,7 @@ fn decode_table() -> [Option<(Mnemonic, Mode)>; 256] {
     table
 }
 
-const fn operand_size(mode: Mode) -> usize {
+pub(crate) const fn operand_size(mode: Mode) -> usize {
     match mode {
         Mode::Imp | Mode::Acc => 0,
         Mode::Abs | Mode::Ax | Mode::Ay | Mode::Ind | Mode::Ix => 2,
@@ -358,7 +367,7 @@ const fn operand_size(mode: Mode) -> usize {
 
 /// 65C02 encodings the legacy assembler accepts but the NES CPU (NMOS 6502)
 /// does not execute as such.
-fn is_cmos_only(code: u8) -> bool {
+pub(crate) fn is_cmos_only(code: u8) -> bool {
     matches!(code, 0x12 | 0x32 | 0x52 | 0x72 | 0x92 | 0xb2 | 0xd2 | 0xf2)
         || matches!(code, 0x89 | 0x34 | 0x3c | 0x1a | 0x3a | 0x7c)
 }
