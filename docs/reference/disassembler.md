@@ -140,7 +140,9 @@ are reserved.
   also records the checksum of the `.chr` file, which is replaced only together
   with an unedited main file and only if it was not changed either. It writes
   only `.asm` files and the `.chr` file (also after following links), outside
-  hidden directories and never over the ROM.
+  hidden directories and never over the ROM. If one of the files cannot be
+  replaced (for example, another program has it open), none of them is
+  changed and no file is removed.
 - Paths written into `.include` and `.incbin` (the output and `base`) cannot
   contain quotes or control characters, nor (outside Windows) backslashes.
   Source files that are not valid UTF-8 are never replaced.
