@@ -692,6 +692,23 @@ fn verbatim_paths_do_not_leave_the_root_through_trailing_dots() {
     assert_eq!(resolve(&path), Ok(Path::new(&path).to_owned()));
 }
 
+#[cfg(windows)]
+#[test]
+fn canonical_paths_keep_names_that_are_not_unicode() {
+    // An unpaired surrogate must not become U+FFFD, which would name another file.
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    let t = Temp::new();
+    let root = nesasm_core::resolve_path(&t.0, &t.0, None).unwrap();
+    let name = OsString::from_wide(&[u16::from(b'r'), 0xD800]);
+    std::fs::create_dir(root.join(&name)).unwrap();
+    std::fs::write(root.join(&name).join("data.bin"), [7]).unwrap();
+    std::fs::create_dir(root.join("r\u{FFFD}")).unwrap();
+    let path = root.join(&name).join("data.bin");
+    let resolved = nesasm_core::resolve_path(&path, &root, Some(&root)).unwrap();
+    assert_eq!(resolved, path);
+    assert_eq!(std::fs::read(&resolved).unwrap(), [7]);
+}
+
 #[test]
 fn long_source_paths_within_the_root() {
     // Files whose canonical paths are long, in a directory whose path is not:

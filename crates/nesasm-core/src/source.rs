@@ -117,20 +117,31 @@ pub(crate) fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
     #[cfg(windows)]
     {
+        use std::{ffi::OsString, os::windows::ffi::OsStrExt};
         const MAX_PATH: usize = 260;
-        let plain = path.components().all(|c| match c {
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return Ok(path);
+        };
+        let mut plain = match prefix.kind() {
+            Prefix::VerbatimDisk(disk) => OsString::from(format!("{}:", char::from(disk))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut plain = OsString::from(r"\\");
+                plain.push(server);
+                plain.push(r"\");
+                plain.push(share);
+                plain
+            }
+            _ => return Ok(path),
+        };
+        // Joined as `OsStr`, so that names that are not valid Unicode stay intact.
+        plain.push(components.as_path());
+        let same = components.all(|c| match c {
             Component::Normal(name) => is_plain_name(name),
             _ => true,
         });
-        let text = path.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(r"\\?\").filter(|_| plain) {
-            if let Some(share) = rest.strip_prefix(r"UNC\") {
-                if share.len() + 2 < MAX_PATH {
-                    return Ok(PathBuf::from(format!(r"\\{share}")));
-                }
-            } else if rest.len() < MAX_PATH && rest.as_bytes().get(1) == Some(&b':') {
-                return Ok(PathBuf::from(rest));
-            }
+        if same && plain.encode_wide().count() < MAX_PATH {
+            return Ok(plain.into());
         }
     }
     Ok(path)
