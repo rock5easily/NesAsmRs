@@ -99,6 +99,11 @@ table or entry points), `unresolved_bank` (add `references`), `outside_rom`
 `unknown_range` (bytes not described; padding runs are not reported).
 65C02-only encodings are treated as data.
 
+## Limits
+
+ROMs of up to 128 banks of 8 KiB; over MCP, ROM and annotation files of up
+to 8 MiB each. A disassembly is subject to the server's time limit.
+
 ## Queries
 
 `disassemble` returns the first 20 issues; `issues` selects a `kind`,

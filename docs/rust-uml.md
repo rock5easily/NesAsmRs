@@ -42,6 +42,13 @@ flowchart TB
         state["state.rs：メモリ配置の定数・Pass・Section"]
         error["error.rs：AsmError"]
         output["output.rs：成果物・S-record"]
+        inspect["inspect.rs：ROM検査・逆アセンブル表示"]
+        subgraph disasm["disasm/"]
+            disasm_mod["mod.rs：Disassembly・検証・問い合わせ"]
+            disasm_config["config.rs：注釈（DisasmConfig）"]
+            disasm_analysis["analysis.rs：バンク配置・コード追跡・命名"]
+            disasm_render["render.rs：ソース生成"]
+        end
     end
     cli_main --> api
     mcp_main --> api
@@ -56,14 +63,19 @@ flowchart TB
     source --> api
     output --> api
     output --> source
+    output --> disasm_mod
+    disasm_mod --> disasm_config & disasm_analysis & disasm_render
+    disasm_mod --> engine_mod
+    disasm_analysis --> inspect & opcode
+    inspect --> opcode
     mcp_main --> rmcp["rmcp：MCP"]
     mcp_main --> tokio["tokio：非同期処理"]
     source --> encoding["encoding_rs：SJIS変換"]
     output --> encoding
 ```
 
-`lib.rs` は `assemble`、`assemble_with_cancel`、`build`、`write_artifacts`、`reference`
-と公開データ型を提供します。CLIとMCPはこの公開APIだけを利用します。
+`lib.rs` は `assemble`、`assemble_with_cancel`、`build`、`write_artifacts`、
+`write_disassembly`、`reference` と公開データ型を提供し、`inspect` と `disasm` を公開モジュールとします。CLIとMCPはこの公開APIだけを利用します。
 `assemble` は入力を読み込み、結果をメモリ上に作ります。`build` はアセンブルに続けて
 成果物を書き込み、書き込みの失敗を `E_OUTPUT` 診断として結果に加えます。
 JSONスキーマの導出（`schemars`）は `schema` featureで有効になり、MCPだけが使います。
@@ -512,6 +524,8 @@ classDiagram
         -assemble(input)
         -check(input)
         -inspect_rom(input)
+        -disassemble(input)
+        -export_disassembly(input)
         -get_reference(input)
         list_resources()
         read_resource(uri)
@@ -538,6 +552,7 @@ classDiagram
     class OutputModule {
         <<module>>
         write_artifacts(result, input, output, base, root, options)
+        write_disassembly(disassembly, base, root, rom)
         srec(binary, map)
     }
     class StagedArtifact {
@@ -558,7 +573,8 @@ classDiagram
 ```
 
 `ServerHandler` はrmcpのtraitです。MCPツールはRust上では非公開メソッドですが、
-マクロによってMCPの `assemble`・`check`・`get_reference` として公開されます。
+マクロによってMCPの `assemble`・`check`・`inspect_rom`・`disassemble`・`export_disassembly`・
+`get_reference` として公開されます。
 `gate` の型は `Arc<tokio::sync::Mutex<()>>` で、checkとassembleの実行を直列化します。
 時間制限を超えると `assemble_with_cancel` に渡したフラグを立て、エンジンは次の行で停止します。
 `stdio_relay` はstdinとrmcpの間で行を中継し、JSONとして解析できない行に `-32700` を返します。
@@ -612,3 +628,81 @@ EmitパスはそのROMとmapを生成します。Layoutパスでは `INCBIN` の
 サイズだけで位置を進めます。失敗結果では `binary` と `map` を空にします。
 一時ファイルは `Drop` で後片付けします。複数成果物のrenameは順に実行されるため、
 途中の失敗で既に確定した成果物を元に戻すトランザクションにはなっていません。
+
+## 7. 逆アセンブラ
+
+出典：[disasm/](../crates/nesasm-core/src/disasm/)。
+
+```mermaid
+classDiagram
+    class DisasmConfig {
+        +PathBuf rom
+        +Option~Address~ load_address
+        +Vec~BankLayout~ banks
+        +Vec~EntryPoint~ entry_points
+        +Vec~LabelDef~ labels
+        +Vec~SymbolDef~ symbols
+        +Vec~RegionDef~ regions
+        +Vec~CommentDef~ comments
+        +Vec~OperandDef~ operands
+        +Vec~ReferenceDef~ references
+        +DisasmOptions options
+    }
+    class Disassembly {
+        -Analysis analysis
+        -Rendered rendered
+        -PathBuf source
+        +text() str
+        +files() Vec
+        +chr_file() Option
+        +summary() Summary
+        +issues() Vec~Issue~
+        +view(bank, from, to)
+        +xrefs(query)
+        +routines() Vec~Routine~
+        +ram() Vec~RamUse~
+        +verify(working_directory, root, cancel) Verification
+    }
+    class Analysis {
+        -Memory memory
+        -Vec class
+        -BTreeMap insns
+        -Vec regions
+        -BTreeMap labels
+        -Vec~Ref~ refs
+        -Vec~Issue~ issues
+        -run(file, config, cancel)
+        -trace(loc, from)
+        -name_labels()
+        -find_routines()
+    }
+    class Memory {
+        -RomFormat format
+        -Vec header
+        -Vec~BankImage~ banks
+        -resolve(from, address) Resolved
+        -locate(bank, address) Loc
+    }
+    class Rendered {
+        -Vec files
+        -Vec~SourceLine~ lines
+        -Option chr
+    }
+    class DisasmModule {
+        <<module>>
+        parse_config(json)
+        disassemble(rom_file, config, source, cancel)
+        is_unedited_source(text)
+    }
+    DisasmModule ..> Disassembly : 生成
+    DisasmModule ..> DisasmConfig : 解析
+    Disassembly *-- Analysis
+    Disassembly *-- Rendered
+    Analysis *-- Memory
+    Disassembly ..> CoreApi : verifyでassemble_with_cancel
+```
+
+`Analysis::run` は注釈を検証・適用し（誤りは `E_DISASM` としてまとめて返す）、ベクタ・
+エントリポイント・コード領域・ジャンプ表から幅優先でコードを追跡し、参照とラベル名を決めます。
+`render` は全バンクの全バイトを順に書き、各ファイルの先頭行に本文のチェックサムを付けます。
+`verify` は生成したファイルを `AssembleRequest.files` に渡してメモリ上でアセンブルし、元のROMと比較します。
