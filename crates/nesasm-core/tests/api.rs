@@ -520,3 +520,51 @@ fn write_disassembly_does_not_follow_links_to_other_files() {
     assert!(e.contains("backup.nes is not a .chr file"), "{e}");
     assert_eq!(fs::read(t.0.join("backup.nes")).unwrap(), b"keep");
 }
+
+#[test]
+fn write_disassembly_protects_split_sources_and_chr() {
+    let t = Temp::new();
+    let r =
+        t.run("  .inesprg 1\n  .ineschr 1\n  .bank 1\n  .org $FFFA\n  .dw 0, 0, 0\n  .bank 2\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    let never = AtomicBool::new(false);
+    let config =
+        nesasm_core::disasm::parse_config(r#"{"options": {"split_banks": true}}"#).unwrap();
+    let d = nesasm_core::disasm::disassemble(&rom, None, &config, Path::new("game.asm"), &never)
+        .unwrap();
+    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"));
+    let kinds: Vec<ArtifactKind> = write().unwrap().iter().map(|a| a.kind).collect();
+    assert_eq!(
+        kinds,
+        // The main file, a file per bank (including the CHR bank) and the CHR file.
+        [
+            ArtifactKind::Source,
+            ArtifactKind::Source,
+            ArtifactKind::Source,
+            ArtifactKind::Source,
+            ArtifactKind::Chr
+        ]
+    );
+    write().unwrap();
+    // A changed CHR file or bank file is kept.
+    fs::write(t.0.join("game.chr"), vec![1; 8192]).unwrap();
+    let e = write().unwrap_err();
+    assert!(
+        e.contains("game.chr exists and is not an unedited generated file"),
+        "{e}"
+    );
+    fs::write(t.0.join("game.chr"), vec![0; 8192]).unwrap();
+    let bank = fs::read_to_string(t.0.join("game_bank01.asm")).unwrap();
+    fs::write(
+        t.0.join("game_bank01.asm"),
+        bank.replace(".bank 1", ".bank 1 ; mine"),
+    )
+    .unwrap();
+    let e = write().unwrap_err();
+    assert!(
+        e.contains("game_bank01.asm exists and is not an unedited generated file"),
+        "{e}"
+    );
+}

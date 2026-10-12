@@ -1033,3 +1033,68 @@ fn rom_hack_banks_may_name_new_banks() {
     let d = patch_round_trip(&hack, &base, r#"{"banks": [{"bank": 3, "org": "$A000"}]}"#);
     assert_eq!(d.summary().diff.unwrap().new_banks, [2, 3]);
 }
+
+#[test]
+fn edits_inside_lines_change_the_checksum() {
+    let rom = nrom("Reset:\nNmi:\n  rti\n  .db \"ww\"");
+    let d = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E001", "length": 2, "type": "text"}]}"#),
+    );
+    let text = d.text();
+    assert!(disasm::is_unedited_source(text));
+    assert!(disasm::is_unedited_source(&text.replace('\n', "\r\n")));
+    // A carriage return inside a line changes the bytes.
+    let edited = text.replacen("\"ww\"", "\"w\rw\"", 1);
+    assert_ne!(edited, text);
+    assert!(!disasm::is_unedited_source(&edited));
+}
+
+#[test]
+fn every_name_in_an_override_is_defined() {
+    let (base, hack) = hack_roms();
+    // Two names for one address of an unchanged range; the override uses the second.
+    let d = patch_round_trip(
+        &hack,
+        &base,
+        r#"{"labels": [{"address": "$E00B", "name": "First"}, {"address": "$E00B", "name": "Second"}],
+            "operands": [{"address": "$E105", "expr": "Second"}]}"#,
+    );
+    // Only the name the source uses needs a definition.
+    assert_lines(&d, &["Second          = $E00B", "  jmp Second"]);
+    assert!(!d.text().contains("First"), "{}", d.text());
+}
+
+#[test]
+fn overrides_apply_in_text_regions() {
+    let rom = nrom("Reset:\nNmi:\n  rti\nMsg:\n  .db \"HI\"");
+    let regions = r#""regions": [{"start": "$E001", "length": 2, "type": "text"}]"#;
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{{regions}, "operands": [{{"address": "$E001", "expr": "'H'"}}]}}"#
+        )),
+    );
+    assert_lines(&d, &["  .db 'H'", "  .db \"I\""]);
+    // A value that changes the byte fails verification.
+    let d = disasm::disassemble(
+        &rom,
+        None,
+        &config(&format!(
+            r#"{{{regions}, "operands": [{{"address": "$E001", "expr": "$00"}}]}}"#
+        )),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .unwrap();
+    let t = Temp::new();
+    let v = d.verify(&t.0, Some(&t.0), &NEVER);
+    assert_eq!(v.mismatch_count, 1);
+    assert_eq!(
+        (
+            v.mismatches[0].expected.as_str(),
+            v.mismatches[0].actual.as_str()
+        ),
+        ("48", "00")
+    );
+}

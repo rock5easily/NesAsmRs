@@ -6,7 +6,7 @@ use super::config::{ChrMode, RegionType};
 use super::patch::Patches;
 use super::{Address, RomFormat, SourceLine};
 use crate::opcode::Mode;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// First line of every generated source.
@@ -30,7 +30,7 @@ pub(crate) struct Rendered {
 
 /// FNV-1a over the text after the marker line, with LF line endings.
 pub(crate) fn checksum(body: &str) -> u64 {
-    fnv(body.bytes().filter(|b| *b != b'\r'))
+    fnv(body.replace("\r\n", "\n").bytes())
 }
 
 fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -73,8 +73,8 @@ struct Writer<'a> {
     stops: Vec<Vec<usize>>,
     /// For a ROM hack, the ranges written as source.
     patches: Option<&'a Patches>,
-    /// ROM locations whose labels the source refers to.
-    used_labels: BTreeSet<Loc>,
+    /// Labels the source refers to, with their locations.
+    used_labels: BTreeMap<String, Loc>,
 }
 
 /// A path as written in `.include`/`.incbin` (forward slashes).
@@ -125,7 +125,7 @@ pub(crate) fn render(
         used: BTreeSet::new(),
         stops: stops.into_iter().map(|s| s.into_iter().collect()).collect(),
         patches,
-        used_labels: BTreeSet::new(),
+        used_labels: BTreeMap::new(),
     };
     // Names in operand overrides must be defined too.
     let names: HashMap<&str, Loc> = a
@@ -139,7 +139,7 @@ pub(crate) fn render(
         }
         for word in expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
             if let Some(label) = names.get(word) {
-                w.used_labels.insert(*label);
+                w.used_labels.insert(word.to_owned(), *label);
             } else if a.symbols.iter().any(|s| s.name == word) {
                 w.used.insert(word.to_owned());
             }
@@ -208,11 +208,8 @@ pub(crate) fn render(
     let outside: Vec<(String, u32)> = w
         .used_labels
         .iter()
-        .filter(|loc| patches.is_some_and(|p| p.range_at(**loc).is_none()))
-        .filter_map(|loc| {
-            let label = a.labels.get(loc)?.first()?;
-            Some((label.name.clone(), a.memory.address(*loc)))
-        })
+        .filter(|(_, loc)| patches.is_some_and(|p| p.range_at(**loc).is_none()))
+        .map(|(name, loc)| (name.clone(), a.memory.address(*loc)))
         .collect();
     if !outside.is_empty() {
         push(String::new());
@@ -400,7 +397,11 @@ impl Writer<'_> {
         } else {
             self.a.containing(loc)
         };
-        self.used_labels.extend(labelled);
+        if let Some(labelled) = labelled
+            && let Some(label) = self.a.labels.get(&labelled).and_then(|l| l.first())
+        {
+            self.used_labels.insert(label.name.clone(), labelled);
+        }
         Some(name)
     }
 
@@ -597,10 +598,13 @@ impl Writer<'_> {
                     .collect();
                 (".db", items, count)
             }
-            RegionType::Text => {
-                let (items, size) = self.text(loc, limit);
-                (".db", items, size)
-            }
+            RegionType::Text => match self.a.operands.get(&loc) {
+                Some(expr) => (".db", vec![expr.clone()], 1),
+                None => {
+                    let (items, size) = self.text(loc, limit);
+                    (".db", items, size)
+                }
+            },
             _ => {
                 let run = (start..limit)
                     .take_while(|o| byte(*o) == byte(start))
