@@ -1395,6 +1395,9 @@ fn vector_references_are_reported_once() {
         r#"[{"start": "$FFFA", "length": 2, "type": "bytes"}]"#,
         r#"[{"start": "$FFFA", "length": 6, "type": "pointers"}]"#,
         r#"[{"start": "$FFFA", "length": 6, "type": "pointers", "code_targets": true}]"#,
+        // Tables that read other values than the vector: misaligned or adjusted.
+        r#"[{"start": "$FFF9", "length": 2, "type": "pointers"}]"#,
+        r#"[{"start": "$FFFA", "length": 6, "type": "pointers", "adjust": 1}]"#,
     ] {
         let d = round_trip(
             &bin,
@@ -1403,17 +1406,29 @@ fn vector_references_are_reported_once() {
         assert_eq!(issues(&d, IssueKind::UnresolvedBank), expected, "{regions}");
         assert_eq!(d.xrefs("$8000").unwrap().len(), 1, "{regions}");
     }
-    // Either byte of the vector in a ROM hack range keeps the issue.
+    // Either byte of the vector in a ROM hack range keeps the issue, whether
+    // the automatic table, a pointers region or a bytes region holds it.
     let t = Temp::new();
     t.write("base.bin", &bin);
-    for patch in ["$FFFA", "$FFFB"] {
-        let mut c = config(&format!(
-            r#"{{{banks}, "regions": [{{"start": "$FFFA", "length": 2, "type": "bytes"}}],
-                "patches": [{{"bank": 3, "start": "{patch}", "length": 1}}]}}"#
-        ));
-        c.base = Some(PathBuf::from("base.bin"));
-        let d = disasm::disassemble(&bin, Some(&bin), &c, Path::new("out.asm"), &NEVER).unwrap();
-        assert!(d.verify(&t.0, Some(&t.0), &NEVER).matched);
-        assert_eq!(issues(&d, IssueKind::UnresolvedBank), expected, "{patch}");
+    for regions in [
+        "[]",
+        r#"[{"start": "$FFFA", "length": 6, "type": "pointers"}]"#,
+        r#"[{"start": "$FFFA", "length": 2, "type": "bytes"}]"#,
+    ] {
+        for patch in ["$FFFA", "$FFFB"] {
+            let mut c = config(&format!(
+                r#"{{{banks}, "regions": {regions},
+                    "patches": [{{"bank": 3, "start": "{patch}", "length": 1}}]}}"#
+            ));
+            c.base = Some(PathBuf::from("base.bin"));
+            let d =
+                disasm::disassemble(&bin, Some(&bin), &c, Path::new("out.asm"), &NEVER).unwrap();
+            assert!(d.verify(&t.0, Some(&t.0), &NEVER).matched);
+            assert_eq!(
+                issues(&d, IssueKind::UnresolvedBank),
+                expected,
+                "{regions} {patch}"
+            );
+        }
     }
 }

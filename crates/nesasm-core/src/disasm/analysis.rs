@@ -935,10 +935,14 @@ impl Analysis {
                 ]));
                 // A pointer table (the automatic one or the annotations')
                 // records the reference and its issues in seed_tables.
+                // Only when the table reads the same entry: aligned, whole and unadjusted.
                 let table = !covered[i]
-                    || self
-                        .region_at(from)
-                        .is_some_and(|r| r.kind == RegionType::Pointers);
+                    || self.region_at(from).is_some_and(|r| {
+                        r.kind == RegionType::Pointers
+                            && (from.offset - r.start).is_multiple_of(2)
+                            && from.offset + 2 <= r.end
+                            && r.adjust == 0
+                    });
                 let target = if table {
                     self.target_of(from, address)
                 } else {
