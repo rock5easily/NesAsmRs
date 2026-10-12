@@ -222,7 +222,8 @@ struct ExportInput {
     inline: Option<DisasmConfig>,
     /// Main source file to write (.asm) within the root and outside hidden
     /// directories; defaults to the ROM path with .asm. Bank files
-    /// (<stem>_bankNN.asm) and the CHR file (<stem>.chr) use its stem.
+    /// (<stem>_bankXX.asm, XX the bank in uppercase hexadecimal) and the CHR
+    /// file (<stem>.chr) use its stem.
     output: Option<PathBuf>,
 }
 
@@ -263,6 +264,12 @@ struct DisasmReport {
     files: Vec<PathBuf>,
     /// Files written by export_disassembly.
     artifacts: Vec<Artifact>,
+    /// Unedited bank files of the replaced source that the new source no
+    /// longer includes (older decimal names such as <stem>_bank10.asm for
+    /// bank 10, or banks a ROM hack no longer changes), removed by
+    /// export_disassembly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issues: Option<Page<Issue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -916,9 +923,20 @@ impl Server {
                 "The time limit passed before writing; nothing was written",
             ));
         } else {
-            match nesasm_core::write_disassembly(d, root, Some(root), &loaded.rom, cancel) {
-                Ok(artifacts) => {
-                    report.artifacts = artifacts;
+            match nesasm_core::export_disassembly(d, root, Some(root), &loaded.rom, cancel) {
+                Ok(export) => {
+                    report.artifacts = export.artifacts;
+                    report.removed = export
+                        .removed
+                        .iter()
+                        .map(|path| Self::relative(root, path))
+                        .collect();
+                    for warning in export.warnings {
+                        report.diagnostics.push(Diagnostic {
+                            severity: Severity::Warning,
+                            ..error(DiagnosticCode::Output, warning)
+                        });
+                    }
                     report.success = true;
                 }
                 Err(e) => report.diagnostics.push(Diagnostic::error(
@@ -1003,6 +1021,9 @@ impl Server {
         for artifact in &report.artifacts {
             text.push(format!("Wrote {}", artifact.path.display()));
         }
+        for path in &report.removed {
+            text.push(format!("Removed {}", path.display()));
+        }
         if !report.diagnostics.is_empty() {
             text.push(diagnostics_summary(&report.diagnostics));
         }
@@ -1075,7 +1096,12 @@ impl Server {
             text.push(heading("Lines", page.total, page.offset, page.items.len()));
             for line in &page.items {
                 let address = line.address.map_or(String::new(), |a| a.to_string());
-                text.push(format!("{address:<6} {:<27} {}", line.bytes, line.text));
+                // The tab of instructions would break the columns of this table.
+                let source = match line.text.strip_prefix('\t') {
+                    Some(rest) => format!("  {rest}"),
+                    None => line.text.clone(),
+                };
+                text.push(format!("{address:<6} {:<27} {source}", line.bytes));
             }
         }
         for (query, found) in report.xrefs.iter().flatten() {
@@ -1182,7 +1208,7 @@ impl Server {
         let summary = Self::disasm_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Write the source that disassemble generates (.asm, plus <stem>_bankNN.asm files for large ROMs and <stem>.chr for CHR ROM), only if it reassembles to the same ROM. Existing files are replaced only if they are generated sources not edited since.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    #[tool(description="Write the source that disassemble generates (.asm, plus <stem>_bankXX.asm files with XX the bank in uppercase hexadecimal for large ROMs, and <stem>.chr for CHR ROM), only if it reassembles to the same ROM. Existing files are replaced only if they are generated sources not edited since (a bank file only by the file of the same bank, unless the replaced main source included it); unedited bank files the replaced main source included and the new one does not are removed.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=false,destructive_hint=true))]
     async fn export_disassembly(
         &self,
         Parameters(input): Parameters<ExportInput>,

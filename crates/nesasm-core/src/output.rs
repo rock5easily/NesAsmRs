@@ -143,12 +143,23 @@ fn check_not_hidden(path: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes the source files and CHR file of a disassembly, relative to
-/// `base` and within `root` when set. The main source must end in `.asm`
-/// (bank files and the CHR file derive from its name). Existing files are
-/// replaced only if they are generated sources not edited since (or the CHR
-/// file of one), so hand-written or edited files are never lost. When
-/// `cancel` is set before the files are renamed into place, nothing is written.
+/// What [`export_disassembly`] wrote and removed.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct DisassemblyExport {
+    /// Files written, the main source first.
+    pub artifacts: Vec<Artifact>,
+    /// Unedited bank files of the replaced main source that the new source
+    /// no longer includes, such as the decimal names of older versions
+    /// (`_bank10.asm` for bank 10, now `_bank0A.asm`) or banks a ROM hack no
+    /// longer changes.
+    pub removed: Vec<PathBuf>,
+    /// Such files that could not be removed.
+    pub warnings: Vec<String>,
+}
+
+/// Writes the source files and CHR file of a disassembly; see
+/// [`export_disassembly`], which also reports the files it removed.
 pub fn write_disassembly(
     disassembly: &crate::disasm::Disassembly,
     base: &Path,
@@ -156,6 +167,28 @@ pub fn write_disassembly(
     rom: &Path,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<Artifact>, String> {
+    export_disassembly(disassembly, base, root, rom, cancel).map(|export| export.artifacts)
+}
+
+/// Writes the source files and CHR file of a disassembly, relative to
+/// `base` and within `root` when set. The main source must end in `.asm`
+/// (bank files and the CHR file derive from its name). Existing files are
+/// replaced only if they are generated sources not edited since (or the CHR
+/// file of one), so hand-written or edited files are never lost: the main
+/// file only by a main file, and a bank file by the file of the same bank,
+/// or by any bank file when the replaced main file included it (the whole
+/// set is generated again). Bank files the replaced main file included that
+/// are not written again are removed, if they were not edited either. When
+/// `cancel` is set before the files are renamed into place, nothing is
+/// written.
+pub fn export_disassembly(
+    disassembly: &crate::disasm::Disassembly,
+    base: &Path,
+    root: Option<&Path>,
+    rom: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<DisassemblyExport, String> {
+    use crate::disasm::{SourceRole, source_includes, source_role};
     let main = disassembly.source_path();
     if !main
         .extension()
@@ -164,8 +197,9 @@ pub fn write_disassembly(
         return Err("Source output must have a .asm extension".into());
     }
     let rom = resolve_path(rom, base, root)?;
-    let mut files: Vec<(ArtifactKind, PathBuf, Vec<u8>)> = Vec::new();
+    let mut files: Vec<(ArtifactKind, PathBuf, Vec<u8>, Option<SourceRole>)> = Vec::new();
     for (path, text) in disassembly.files() {
+        let role = source_role(text);
         // Like the listing, sources use the platform line ending.
         let text = if cfg!(windows) {
             text.replace('\n', "\r\n")
@@ -176,6 +210,7 @@ pub fn write_disassembly(
             ArtifactKind::Source,
             resolve_path(path, base, root)?,
             text.into_bytes(),
+            role,
         ));
     }
     if let Some((path, data)) = disassembly.chr_file() {
@@ -183,6 +218,7 @@ pub fn write_disassembly(
             ArtifactKind::Chr,
             resolve_path(path, base, root)?,
             data.to_vec(),
+            None,
         ));
     }
     let main = files[0].1.clone();
@@ -192,10 +228,17 @@ pub fn write_disassembly(
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.to_string()),
     };
-    let main_replaceable = main_text
+    let main_replaceable = main_text.as_deref().and_then(source_role) == Some(SourceRole::Main);
+    // The bank files generated with the main file that is replaced.
+    let previous: Vec<PathBuf> = main_text
         .as_deref()
-        .is_some_and(crate::disasm::is_unedited_source);
-    for (kind, path, _) in &files {
+        .filter(|_| main_replaceable)
+        .map(source_includes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| resolve_path(Path::new(&path), base, root).ok())
+        .collect();
+    for (kind, path, _, role) in &files {
         if let Some(root) = root {
             check_not_hidden(path, root)?;
         }
@@ -226,7 +269,24 @@ pub fn write_disassembly(
         let replaceable = match kind {
             ArtifactKind::Source => {
                 let text = fs::read(path).map_err(|e| e.to_string())?;
-                std::str::from_utf8(&text).is_ok_and(crate::disasm::is_unedited_source)
+                let existing = std::str::from_utf8(&text).ok().and_then(source_role);
+                match (existing, role) {
+                    (Some(existing), Some(role)) if existing == *role => true,
+                    (Some(SourceRole::Bank(_)), Some(SourceRole::Bank(_)))
+                        if previous.contains(path) =>
+                    {
+                        true
+                    }
+                    (Some(SourceRole::Bank(other)), Some(SourceRole::Bank(bank))) => {
+                        return Err(format!(
+                            "{} exists and is the generated file of bank {other}, not of bank {bank} \
+                             (bank files are named in hexadecimal; older versions used decimal); \
+                             remove it or choose another output path",
+                            path.display()
+                        ));
+                    }
+                    _ => false,
+                }
             }
             _ => {
                 let data = fs::read(path).map_err(|e| e.to_string())?;
@@ -243,23 +303,61 @@ pub fn write_disassembly(
             ));
         }
     }
-    for (_, path, _) in &files {
+    // Bank files of the replaced main file that are not written again.
+    let prefix = format!(
+        "{}_bank",
+        main.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let stale: Vec<PathBuf> = previous
+        .into_iter()
+        .filter(|path| files.iter().all(|(_, p, _, _)| p != path))
+        .filter(|path| {
+            path.parent() == main.parent()
+                && path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("asm"))
+                && root.is_none_or(|root| check_not_hidden(path, root).is_ok())
+                && fs::read(path).is_ok_and(|text| {
+                    std::str::from_utf8(&text)
+                        .ok()
+                        .and_then(source_role)
+                        .is_some_and(|role| matches!(role, SourceRole::Bank(_)))
+                })
+        })
+        .collect();
+    for (_, path, _, _) in &files {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
     let mut staged = Vec::with_capacity(files.len());
-    for (kind, path, data) in files {
+    for (kind, path, data, _) in files {
         staged.push(StagedArtifact::write(kind, path, &data).map_err(|e| e.to_string())?);
     }
     // Staged files are removed when dropped.
     if cancel.load(Ordering::Relaxed) {
         return Err("Cancelled before writing; nothing was written".into());
     }
-    staged
+    let artifacts = staged
         .into_iter()
         .map(|artifact| artifact.commit().map_err(|e| e.to_string()))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut export = DisassemblyExport {
+        artifacts,
+        ..DisassemblyExport::default()
+    };
+    for path in stale {
+        match fs::remove_file(&path) {
+            Ok(()) => export.removed.push(path),
+            Err(e) => export
+                .warnings
+                .push(format!("Could not remove {}: {e}", path.display())),
+        }
+    }
+    Ok(export)
 }
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
