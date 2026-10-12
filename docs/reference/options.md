@@ -13,7 +13,9 @@ The working directory is searched before NES_INCLUDE directories (semicolon
 separated; colons are also accepted outside Windows; at most 10).
 Exit status: 0 on success, the error count (up to 255) on assembly errors,
 2 on invalid arguments. Output names use the input stem:
-.nes, .lst when LIST is enabled, and .s28 when requested.
+.nes, .lst when LIST is enabled, and .s28 when requested. If one of these
+files cannot be replaced (for example, another program has it open), none of
+them is changed.
 
 Additional Rust options: `--output path`, `--include directory` (repeatable),
 `--json` (complete assembly result), `--check` (no file writes).

@@ -109,10 +109,8 @@ pub fn write_artifacts(
     for (kind, path, data) in files {
         staged.push(StagedArtifact::write(kind, path, &data).map_err(|e| e.to_string())?);
     }
-    staged
-        .into_iter()
-        .map(|artifact| artifact.commit().map_err(|e| e.to_string()))
-        .collect()
+    // A backup left behind is hidden and harmless, and there is no place to report it.
+    commit_all(staged, &mut |from, to| fs::rename(from, to)).map(|(artifacts, _)| artifacts)
 }
 
 /// Restricts root-confined (MCP) output to ROM artifact names outside hidden
@@ -356,13 +354,11 @@ pub fn export_disassembly(
     if cancel.load(Ordering::Relaxed) {
         return Err("Cancelled before writing; nothing was written".into());
     }
-    let artifacts = staged
-        .into_iter()
-        .map(|artifact| artifact.commit().map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (artifacts, warnings) = commit_all(staged, &mut |from, to| fs::rename(from, to))?;
     let mut export = DisassemblyExport {
         artifacts,
-        ..DisassemblyExport::default()
+        removed: Vec::new(),
+        warnings,
     };
     for path in stale {
         match fs::remove_file(&path) {
@@ -400,25 +396,186 @@ struct StagedArtifact {
     file: Option<fs::File>,
 }
 
-impl StagedArtifact {
-    fn write(kind: ArtifactKind, path: PathBuf, data: &[u8]) -> io::Result<Self> {
-        let name = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid output name"))?
-            .to_string_lossy();
-        let (temp, file) = loop {
-            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let temp = path.with_file_name(format!(".{name}.{}.{id}.tmp", std::process::id()));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-            {
-                Ok(file) => break (temp, file),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
+/// Creates a new file next to `path`, named `.<name>.<process>.<id>.<extension>`.
+fn create_beside(path: &Path, extension: &str) -> io::Result<(PathBuf, fs::File)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid output name"))?
+        .to_string_lossy();
+    loop {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_file_name(format!(".{name}.{}.{id}.{extension}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((temp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A destination that [`commit_all`] changed.
+struct Change {
+    path: PathBuf,
+    /// The previous file, renamed beside it.
+    backup: Option<PathBuf>,
+    /// Whether the new file was renamed into place.
+    placed: bool,
+    /// The size and time of the new file once in place, to notice if
+    /// another program replaces it before it is undone.
+    stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+/// Renames the staged files into place as one change. Each existing file is
+/// first renamed to a backup beside it; if a rename fails, the files changed
+/// so far are restored, and those that cannot be are named in the error. A
+/// file another program replaced in the meantime is left as it is. On
+/// success, the backups are removed, and those that cannot be are returned
+/// as warnings. `rename` is `fs::rename` except in tests.
+fn commit_all(
+    staged: Vec<StagedArtifact>,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<(Vec<Artifact>, Vec<String>), String> {
+    let mut changed: Vec<Change> = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut failure = None;
+    for mut staged in staged {
+        // Windows requires the file to be closed before renaming it.
+        drop(staged.file.take());
+        let path = staged.path.clone();
+        // A directory is not moved away; renaming onto it fails below.
+        let existing = match fs::symlink_metadata(&path) {
+            Ok(metadata) => !metadata.is_dir(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                failure = Some((path, e));
+                break;
             }
         };
+        let backup = if existing {
+            match back_up(&path, rename) {
+                Ok(backup) => Some(backup),
+                Err(e) => {
+                    failure = Some((path, e));
+                    break;
+                }
+            }
+        } else {
+            None
+        };
+        let placed = rename(&staged.temp, &path);
+        changed.push(Change {
+            path: path.clone(),
+            backup,
+            placed: placed.is_ok(),
+            stamp: placed.as_ref().ok().and_then(|_| stamp(&path)),
+        });
+        if let Err(e) = placed {
+            failure = Some((path, e));
+            break;
+        }
+        artifacts.push(Artifact {
+            kind: staged.kind,
+            path,
+            size: staged.size,
+        });
+    }
+    let Some((path, error)) = failure else {
+        let warnings = changed
+            .into_iter()
+            .filter_map(|change| change.backup)
+            .filter_map(|backup| {
+                let e = fs::remove_file(&backup).err()?;
+                Some(format!("Could not remove {}: {e}", backup.display()))
+            })
+            .collect();
+        return Ok((artifacts, warnings));
+    };
+    let mut kept = Vec::new();
+    for change in changed.into_iter().rev() {
+        let Change {
+            path,
+            backup,
+            placed,
+            stamp: placed_stamp,
+        } = change;
+        let previous = backup.as_ref().map_or_else(String::new, |backup| {
+            format!(" (its previous content is in {})", backup.display())
+        });
+        // Whatever is at the destination now, if it is not the new file.
+        let other = if placed {
+            match (placed_stamp, stamp(&path)) {
+                (Some(placed), Some(current)) if placed == current => None,
+                (Some(_), Some(_)) => Some("replaced by another program since"),
+                _ => Some("could not be checked for changes by another program"),
+            }
+        } else if backup.is_some() {
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Ok(_) => Some("created by another program since"),
+                Err(_) => Some("could not be checked for changes by another program"),
+            }
+        } else {
+            None
+        };
+        if let Some(other) = other {
+            kept.push(format!(
+                "{}: {other}, so left as it is{previous}",
+                path.display()
+            ));
+            continue;
+        }
+        let undone = match backup {
+            Some(backup) => rename(&backup, &path),
+            None if placed => fs::remove_file(&path),
+            None => Ok(()),
+        };
+        if let Err(e) = undone {
+            let remains = if previous.is_empty() {
+                " (the new file remains)".into()
+            } else {
+                previous
+            };
+            kept.push(format!("{}: {e}{remains}", path.display()));
+        }
+    }
+    let message = format!("Could not write {}: {error}", path.display());
+    Err(if kept.is_empty() {
+        format!("{message}; nothing was changed")
+    } else {
+        format!(
+            "{message}; these changes could not be undone: {}",
+            kept.join("; ")
+        )
+    })
+}
+
+/// Renames `path` to a new backup name beside it.
+fn back_up(
+    path: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    // The empty file reserves the name; the rename replaces it.
+    let (backup, file) = create_beside(path, "bak")?;
+    drop(file);
+    if let Err(e) = rename(path, &backup) {
+        let _ = fs::remove_file(&backup);
+        return Err(e);
+    }
+    Ok(backup)
+}
+
+impl StagedArtifact {
+    fn write(kind: ArtifactKind, path: PathBuf, data: &[u8]) -> io::Result<Self> {
+        let (temp, file) = create_beside(&path, "tmp")?;
         let mut staged = Self {
             kind,
             path,
@@ -430,17 +587,6 @@ impl StagedArtifact {
         file.write_all(data)?;
         file.sync_all()?;
         Ok(staged)
-    }
-
-    fn commit(mut self) -> io::Result<Artifact> {
-        // Windows requires the file to be closed before renaming it.
-        drop(self.file.take());
-        fs::rename(&self.temp, &self.path)?;
-        Ok(Artifact {
-            kind: self.kind,
-            path: std::mem::take(&mut self.path),
-            size: self.size,
-        })
     }
 }
 
@@ -526,8 +672,9 @@ mod tests {
         }
         let staged = StagedArtifact::write(ArtifactKind::Rom, path.clone(), &[1]).unwrap();
         assert!(NEXT_TEMP_ID.load(Ordering::Relaxed) >= next + 16);
-        let artifact = staged.commit().unwrap();
-        assert_eq!((artifact.path, artifact.size), (path.clone(), 1));
+        let (artifacts, _) =
+            commit_all(vec![staged], &mut |from, to| fs::rename(from, to)).unwrap();
+        assert_eq!((&artifacts[0].path, artifacts[0].size), (&path, 1));
         assert_eq!(fs::read(path).unwrap(), [1]);
     }
 
@@ -543,7 +690,214 @@ mod tests {
         let path = dir.path().join("result.nes");
         let staged = StagedArtifact::write(ArtifactKind::Rom, path.clone(), &[1]).unwrap();
         fs::create_dir(&path).unwrap();
-        assert!(staged.commit().is_err());
+        assert!(commit_all(vec![staged], &mut |from, to| fs::rename(from, to)).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(path.is_dir());
+    }
+
+    /// Stages each `(name, data)` in `dir`.
+    fn stage(dir: &Path, files: &[(&str, &[u8])]) -> Vec<StagedArtifact> {
+        files
+            .iter()
+            .map(|(name, data)| {
+                StagedArtifact::write(ArtifactKind::Source, dir.join(name), data).unwrap()
+            })
+            .collect()
+    }
+
+    /// The files in `dir`, sorted, with their contents.
+    fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (name, fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A `rename` that fails on the calls numbered in `failing`, from 1.
+    fn failing_rename(failing: &[usize]) -> impl FnMut(&Path, &Path) -> io::Result<()> {
+        let mut call = 0;
+        move |from, to| {
+            call += 1;
+            if failing.contains(&call) {
+                Err(io::Error::other(format!("rename {call} failed")))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+    }
+
+    #[test]
+    fn commit_all_replaces_files_and_removes_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.asm"), "old a").unwrap();
+        let staged = stage(dir.path(), &[("a.asm", b"new a"), ("b.asm", b"new b")]);
+        let (artifacts, warnings) =
+            commit_all(staged, &mut |from, to| fs::rename(from, to)).unwrap();
+        let paths: Vec<_> = artifacts.iter().map(|a| a.path.clone()).collect();
+        assert_eq!(paths, [dir.path().join("a.asm"), dir.path().join("b.asm")]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            contents(dir.path()),
+            [
+                ("a.asm".into(), b"new a".to_vec()),
+                ("b.asm".into(), b"new b".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_commits_restore_the_previous_files() {
+        // The renames: 1 backs up a, 2 places a, 3 places b (new), 4 backs up
+        // c and 5 places c. Whichever fails, the files are as before.
+        let failing = [(1, "a"), (2, "a"), (3, "b"), (4, "c"), (5, "c")];
+        for (call, name) in failing {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("a.asm"), "old a").unwrap();
+            fs::write(dir.path().join("c.asm"), "old c").unwrap();
+            let before = contents(dir.path());
+            let staged = stage(
+                dir.path(),
+                &[
+                    ("a.asm", b"new a"),
+                    ("b.asm", b"new b"),
+                    ("c.asm", b"new c"),
+                ],
+            );
+            let e = commit_all(staged, &mut failing_rename(&[call])).unwrap_err();
+            let path = dir.path().join(format!("{name}.asm"));
+            assert_eq!(
+                e,
+                format!(
+                    "Could not write {}: rename {call} failed; nothing was changed",
+                    path.display()
+                )
+            );
+            // No temporary file or backup remains.
+            assert_eq!(contents(dir.path()), before, "rename {call}");
+        }
+    }
+
+    #[test]
+    fn files_replaced_by_another_program_are_not_undone() {
+        // The renames: 1 backs up a, 2 places a, 3 backs up b, and before
+        // 4 fails to place b, another program replaces a.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.asm"), "old a").unwrap();
+        fs::write(dir.path().join("b.asm"), "old b").unwrap();
+        let staged = stage(dir.path(), &[("a.asm", b"new a"), ("b.asm", b"new b")]);
+        let a = dir.path().join("a.asm");
+        let mut fail = failing_rename(&[4]);
+        let mut call = 0;
+        let e = commit_all(staged, &mut |from, to| {
+            call += 1;
+            if call == 4 {
+                fs::write(&a, "another a").unwrap();
+            }
+            fail(from, to)
+        })
+        .unwrap_err();
+        let files = contents(dir.path());
+        assert_eq!(files.len(), 3, "{files:?}");
+        let (backup, old) = &files[0];
+        assert!(
+            backup.starts_with(".a.asm.") && backup.ends_with(".bak"),
+            "{backup}"
+        );
+        assert_eq!(old, b"old a");
+        assert_eq!(files[1], ("a.asm".into(), b"another a".to_vec()));
+        assert_eq!(files[2], ("b.asm".into(), b"old b".to_vec()));
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "Could not write {}: rename 4 failed; these changes could not be undone: \
+                 {}: replaced by another program since, so left as it is \
+                 (its previous content is in {})",
+                path("b.asm"),
+                path("a.asm"),
+                path(backup)
+            )
+        );
+    }
+
+    #[test]
+    fn files_created_by_another_program_are_not_overwritten() {
+        // The renames: 1 backs up a, 2 places a, 3 backs up b, and before
+        // 4 fails to place b, another program creates b.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.asm"), "old a").unwrap();
+        fs::write(dir.path().join("b.asm"), "old b").unwrap();
+        let staged = stage(dir.path(), &[("a.asm", b"new a"), ("b.asm", b"new b")]);
+        let b = dir.path().join("b.asm");
+        let mut fail = failing_rename(&[4]);
+        let mut call = 0;
+        let e = commit_all(staged, &mut |from, to| {
+            call += 1;
+            if call == 4 {
+                fs::write(&b, "another b").unwrap();
+            }
+            fail(from, to)
+        })
+        .unwrap_err();
+        let files = contents(dir.path());
+        assert_eq!(files.len(), 3, "{files:?}");
+        let (backup, old) = &files[0];
+        assert!(
+            backup.starts_with(".b.asm.") && backup.ends_with(".bak"),
+            "{backup}"
+        );
+        assert_eq!(old, b"old b");
+        assert_eq!(files[1], ("a.asm".into(), b"old a".to_vec()));
+        assert_eq!(files[2], ("b.asm".into(), b"another b".to_vec()));
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "Could not write {}: rename 4 failed; these changes could not be undone: \
+                 {}: created by another program since, so left as it is \
+                 (its previous content is in {})",
+                path("b.asm"),
+                path("b.asm"),
+                path(backup)
+            )
+        );
+    }
+
+    #[test]
+    fn failed_restores_are_reported() {
+        // The renames: 1 backs up a, 2 places a, 3 backs up b and 4 fails to
+        // place b; restoring b (5) works, and restoring a (6) fails.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.asm"), "old a").unwrap();
+        fs::write(dir.path().join("b.asm"), "old b").unwrap();
+        let staged = stage(dir.path(), &[("a.asm", b"new a"), ("b.asm", b"new b")]);
+        let e = commit_all(staged, &mut failing_rename(&[4, 6])).unwrap_err();
+        let files = contents(dir.path());
+        assert_eq!(files.len(), 3, "{files:?}");
+        let (backup, old) = &files[0];
+        assert!(
+            backup.starts_with(".a.asm.") && backup.ends_with(".bak"),
+            "{backup}"
+        );
+        assert_eq!(old, b"old a");
+        assert_eq!(files[1], ("a.asm".into(), b"new a".to_vec()));
+        assert_eq!(files[2], ("b.asm".into(), b"old b".to_vec()));
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "Could not write {}: rename 4 failed; these changes could not be undone: \
+                 {}: rename 6 failed (its previous content is in {})",
+                path("b.asm"),
+                path("a.asm"),
+                path(backup)
+            )
+        );
     }
 }

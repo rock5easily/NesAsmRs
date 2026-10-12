@@ -189,6 +189,106 @@ fn build_overwrites_long_paths_within_the_root() {
     );
 }
 
+/// Opens `path` sharing it only for reading, as some editors and virus
+/// scanners do, so that it cannot be renamed or replaced.
+#[cfg(windows)]
+fn lock(path: &Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ
+        .open(path)
+        .unwrap()
+}
+
+/// The files in `dir`, sorted, with their contents.
+#[cfg(windows)]
+fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, fs::read(entry.path()).unwrap_or_default())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[cfg(windows)]
+#[test]
+fn build_keeps_all_artifacts_when_one_cannot_be_replaced() {
+    let t = Temp::new();
+    t.write("test.asm", "  .list\n  .db 1\n");
+    let request = t.request(AssembleOptions::default());
+    let cancel = AtomicBool::new(false);
+    let (r, _) = nesasm_core::build(&request, None, &cancel);
+    assert!(r.success, "{:?}", r.diagnostics);
+    let before = contents(&t.0);
+    // The ROM is replaced first, then the listing fails: the ROM is restored.
+    let listing = lock(&t.0.join("test.lst"));
+    t.write("test.asm", "  .list\n  .db 2\n");
+    let (r, artifacts) = nesasm_core::build(&request, None, &cancel);
+    assert!(artifacts.is_empty());
+    let message = &r.diagnostics.last().unwrap().message;
+    assert!(
+        message.starts_with("Could not write ")
+            && message.contains("test.lst: ")
+            && message.ends_with("; nothing was changed"),
+        "{message}"
+    );
+    let mut expected = before;
+    expected[0].1 = fs::read(t.0.join("test.asm")).unwrap();
+    assert_eq!(contents(&t.0), expected);
+    drop(listing);
+    let (r, artifacts) = nesasm_core::build(&request, None, &cancel);
+    assert!(r.success && artifacts.len() == 2, "{:?}", r.diagnostics);
+    assert_eq!(fs::read(t.0.join("test.nes")).unwrap()[16], 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn export_disassembly_keeps_all_files_when_one_cannot_be_replaced() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .inesprg 1\n  .ineschr 1\n  .bank 1\n  .org $FFFA\n  .dw 0, 0, 0\n  .bank 2\n  .db 1\n",
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    let never = AtomicBool::new(false);
+    let disassemble = |rom: &[u8]| {
+        let config = nesasm_core::disasm::DisasmConfig::default();
+        nesasm_core::disasm::disassemble(rom, None, &config, Path::new("out/game.asm"), &never)
+            .unwrap()
+    };
+    let export = |d: &nesasm_core::disasm::Disassembly| {
+        nesasm_core::export_disassembly(d, &t.0, Some(&t.0), Path::new("game.nes"), &never)
+    };
+    export(&disassemble(&rom)).unwrap();
+    let out = t.0.join("out");
+    let before = contents(&out);
+    assert_eq!(before.len(), 2, "{before:?}");
+    // Other CHR data changes both files; the source is written first.
+    *rom.last_mut().unwrap() = 0x55;
+    let d = disassemble(&rom);
+    let chr = lock(&out.join("game.chr"));
+    let e = export(&d).unwrap_err();
+    assert!(
+        e.contains("game.chr: ") && e.ends_with("; nothing was changed"),
+        "{e}"
+    );
+    assert_eq!(contents(&out), before);
+    drop(chr);
+    let e = export(&d).unwrap();
+    assert_eq!(e.artifacts.len(), 2);
+    assert_eq!(
+        *fs::read(out.join("game.chr")).unwrap().last().unwrap(),
+        0x55
+    );
+}
+
 #[test]
 fn relative_to_root_compares_components() {
     let relative =

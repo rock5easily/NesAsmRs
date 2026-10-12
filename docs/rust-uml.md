@@ -556,12 +556,12 @@ classDiagram
         write_disassembly(disassembly, base, root, rom)
         export_disassembly(disassembly, base, root, rom)
         srec(binary, map)
+        -commit_all(staged, rename)
     }
     class StagedArtifact {
         -PathBuf path
         -PathBuf temp
         -write(kind, path, data)
-        -commit()
         drop()
     }
     CliModule ..> Arguments : parse・run
@@ -571,7 +571,7 @@ classDiagram
     Server ..> CoreApi : spawn_blocking・タイムアウトで中断
     Server ..> Report : 構造化応答
     CoreApi ..> OutputModule : build内で書き込み
-    OutputModule ..> StagedArtifact : 一時ファイル作成
+    OutputModule ..> StagedArtifact : 一時ファイル作成・commit_allでrename
 ```
 
 `ServerHandler` はrmcpのtraitです。MCPツールはRust上では非公開メソッドですが、
@@ -618,7 +618,7 @@ sequenceDiagram
     alt 成功
         API->>O: write_artifacts(result, paths, options)
         O->>O: 出力先を検証（root内・拡張子・入力の上書き禁止）
-        O->>FS: 一時ファイルへ書き込み後rename
+        O->>FS: 一時ファイルへ書き込み、既存ファイルをバックアップしてrename（失敗時は元に戻す）
         O-->>API: Vec of Artifact / エラー
         Note over API,O: 書き込み失敗はE_OUTPUT診断として結果に追加
     end
@@ -628,8 +628,8 @@ sequenceDiagram
 Layoutパスは配置とシンボルを計算し、その後 `relocate` がプロシージャの配置を確定します。
 EmitパスはそのROMとmapを生成します。Layoutパスでは `INCBIN` のファイル本体を読まず、
 サイズだけで位置を進めます。失敗結果では `binary` と `map` を空にします。
-一時ファイルは `Drop` で後片付けします。複数成果物のrenameは順に実行されるため、
-途中の失敗で既に確定した成果物を元に戻すトランザクションにはなっていません。
+一時ファイルは `Drop` で後片付けします。複数成果物のrenameは順に実行し、途中で失敗したら
+それまでに置いた成果物を削除またはバックアップから戻します（`commit_all`）。
 
 ## 7. 逆アセンブラ
 
