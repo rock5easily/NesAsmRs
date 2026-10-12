@@ -1,6 +1,6 @@
 # NESASM reference
 
-Topics: instructions, directives, expressions, options.
+Topics: instructions, directives, expressions, options, disassembler.
 
 NESASM uses 8 KiB assembler banks. iNES PRG counts are in 16 KiB units;
 CHR counts are in 8 KiB units. Indent instructions and directives; labels

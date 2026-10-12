@@ -10,7 +10,7 @@ mod source;
 mod state;
 
 pub use engine::{assemble, assemble_with_cancel};
-pub use output::{Artifact, ArtifactKind, write_artifacts};
+pub use output::{Artifact, ArtifactKind, write_artifacts, write_disassembly};
 pub use source::resolve_path;
 
 #[cfg(feature = "schema")]
@@ -532,15 +532,17 @@ pub enum ReferenceTopic {
     Directives,
     Expressions,
     Options,
+    Disassembler,
 }
 
 impl ReferenceTopic {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Index,
         Self::Instructions,
         Self::Directives,
         Self::Expressions,
         Self::Options,
+        Self::Disassembler,
     ];
     /// A one-line summary of the topic.
     pub const fn summary(self) -> &'static str {
@@ -550,6 +552,9 @@ impl ReferenceTopic {
             Self::Directives => "Assembler directives and assembler limits",
             Self::Expressions => "Numbers, operators, functions and labels in expressions",
             Self::Options => "Command-line options, include paths and exit status",
+            Self::Disassembler => {
+                "Disassembling ROMs into NESASM source: annotations, issues and output"
+            }
         }
     }
     pub const fn name(self) -> &'static str {
@@ -559,6 +564,7 @@ impl ReferenceTopic {
             Self::Directives => "directives",
             Self::Expressions => "expressions",
             Self::Options => "options",
+            Self::Disassembler => "disassembler",
         }
     }
     pub const fn text(self) -> &'static str {
@@ -568,6 +574,7 @@ impl ReferenceTopic {
             Self::Directives => include_str!("../../../docs/reference/directives.md"),
             Self::Expressions => include_str!("../../../docs/reference/expressions.md"),
             Self::Options => include_str!("../../../docs/reference/options.md"),
+            Self::Disassembler => include_str!("../../../docs/reference/disassembler.md"),
         }
     }
 }
@@ -581,8 +588,9 @@ impl std::str::FromStr for ReferenceTopic {
             "directives" => Ok(Self::Directives),
             "expressions" => Ok(Self::Expressions),
             "options" => Ok(Self::Options),
+            "disassembler" => Ok(Self::Disassembler),
             _ => Err(
-                "Unknown topic; use index, instructions, directives, expressions, or options"
+                "Unknown topic; use index, instructions, directives, expressions, options, or disassembler"
                     .into(),
             ),
         }

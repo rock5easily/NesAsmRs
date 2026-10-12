@@ -412,3 +412,68 @@ fn small_payloads_and_unrelocated_symbols() {
     let code = rom.disassemble(0, 0x8000, 1, &symbols).unwrap();
     assert!(code[0].labels.is_empty());
 }
+
+#[test]
+fn write_disassembly_replaces_only_unedited_generated_files() {
+    let t = Temp::new();
+    let r =
+        t.run("  .inesprg 1\n  .ineschr 1\n  .bank 1\n  .org $FFFA\n  .dw 0, 0, 0\n  .bank 2\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    let never = AtomicBool::new(false);
+    let d = nesasm_core::disasm::disassemble(
+        &rom,
+        &nesasm_core::disasm::DisasmConfig::default(),
+        Path::new("gen/game.asm"),
+        &never,
+    )
+    .unwrap();
+    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"));
+    let artifacts = write().unwrap();
+    let kinds: Vec<ArtifactKind> = artifacts.iter().map(|a| a.kind).collect();
+    assert_eq!(kinds, [ArtifactKind::Source, ArtifactKind::Chr]);
+    assert_eq!(fs::read(t.0.join("gen/game.chr")).unwrap(), vec![0; 8192]);
+    assert_eq!(serde_json::to_value(ArtifactKind::Chr).unwrap(), "chr");
+    // Unedited output is replaced.
+    write().unwrap();
+    // The CHR file is replaced only with its generated source.
+    fs::remove_file(t.0.join("gen/game.asm")).unwrap();
+    let e = write().unwrap_err();
+    assert!(
+        e.contains("game.chr exists and is not an unedited generated file"),
+        "{e}"
+    );
+    fs::remove_file(t.0.join("gen/game.chr")).unwrap();
+    write().unwrap();
+    let source = fs::read_to_string(t.0.join("gen/game.asm")).unwrap();
+    fs::write(
+        t.0.join("gen/game.asm"),
+        source.replace(".inesprg 1", ".inesprg 1 ; edited"),
+    )
+    .unwrap();
+    let e = write().unwrap_err();
+    assert!(
+        e.contains("game.asm exists and is not an unedited generated file"),
+        "{e}"
+    );
+    // The ROM is never overwritten, and only .asm sources are written.
+    let d = nesasm_core::disasm::disassemble(
+        &rom,
+        &nesasm_core::disasm::DisasmConfig::default(),
+        Path::new("game.ASM"),
+        &never,
+    )
+    .unwrap();
+    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.chr")).unwrap_err();
+    assert_eq!(e, "Output would overwrite the ROM");
+    let d = nesasm_core::disasm::disassemble(
+        &rom,
+        &nesasm_core::disasm::DisasmConfig::default(),
+        Path::new("game.txt"),
+        &never,
+    )
+    .unwrap();
+    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes")).unwrap_err();
+    assert_eq!(e, "Source output must have a .asm extension");
+}

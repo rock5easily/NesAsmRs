@@ -275,3 +275,230 @@ fn forward_if_compatibility_is_an_assembly_option() {
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(r["structuredContent"]["hexdump"][0]["bytes"], "01");
 }
+
+/// Builds `old/game.nes` (16 KiB PRG, 8 KiB CHR) and returns its bytes.
+fn game_rom(c: &mut Client) -> Vec<u8> {
+    let source = concat!(
+        "  .inesprg 1\n  .ineschr 1\n  .inesmir 1\n  .bank 0\n  .org $C000\n",
+        "Reset:\n  lda #0\n  sta $2000\n  jsr Wait\nLoop:\n  jmp Loop\n",
+        "Wait:\n  lda $2002\n  bpl Wait\n  rts\nNmi:\n  inc <$10\n  rti\n",
+        "  .bank 1\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+        "  .bank 2\n  .db 1, 2, 3\n",
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"src/game.asm","sources":{"src/game.asm":source},"output":"old/game.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    std::fs::read(c.root.join("old/game.nes")).unwrap()
+}
+
+#[test]
+fn disassemble_reports_and_queries_without_writing() {
+    let mut c = Client::start();
+    game_rom(&mut c);
+    c.write(
+        "game.disasm.json",
+        r#"{"rom": "old/game.nes", "labels": [{"address": "$C00B", "name": "WaitVBlank"}],
+            "symbols": [{"name": "frames", "value": "$10", "comment": "frame counter"}]}"#,
+    );
+    let r = c.call(
+        "disassemble",
+        json!({"annotations":"game.disasm.json","view":{"from":"$C000","to":"0xC00F"},
+               "xrefs":["WaitVBlank","PPUSTATUS","nothing"],"routines":{},"ram":{"limit":1}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["verification"]["matched"], true, "{r}");
+    let files = report["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        std::path::Path::new(files[0].as_str().unwrap()),
+        std::path::Path::new("old/game.asm")
+    );
+    assert_eq!(report["summary"]["format"], "nes");
+    assert_eq!(report["summary"]["banks"][0]["org"], "$C000");
+    assert_eq!(report["summary"]["banks"][2]["chr"], true);
+    let view = report["view"]["items"].as_array().unwrap();
+    assert_eq!(view[0]["text"], "RESET:");
+    assert_eq!(view[1]["bytes"], "A9 00");
+    assert_eq!(view[1]["text"], "  lda #$00");
+    let xrefs = &report["xrefs"];
+    assert_eq!(xrefs["WaitVBlank"].as_array().unwrap().len(), 2);
+    assert_eq!(xrefs["PPUSTATUS"][0]["line"], "lda PPUSTATUS");
+    // An unknown name is a warning; the rest of the report stands.
+    let warning = &report["diagnostics"][0];
+    assert_eq!(
+        (&warning["severity"], &warning["code"]),
+        (&json!("warning"), &json!("E_DISASM"))
+    );
+    let ram = &report["ram"];
+    assert_eq!(
+        (
+            ram["total"].as_u64(),
+            ram["items"].as_array().unwrap().len()
+        ),
+        (Some(3), 1)
+    );
+    let text = Client::text(&r);
+    let lda = format!("$C000  {:<27}   lda #$00", "A9 00");
+    for line in [
+        "nes ROM: 2 PRG and 1 CHR banks; 9 instructions, 4 labels, 3 routines",
+        "Bank 0 $C000: code 20, data 0, unknown 8172 bytes",
+        "Round trip: the source reassembles to the same ROM",
+        &lda,
+        "warning: 'nothing' is neither a label, a symbol nor an address",
+        "References to WaitVBlank: 2",
+        "  bank 0 $C005 in RESET: jsr WaitVBlank",
+        "  WaitVBlank bank 0 $C00B: 6 bytes, 1 callers; calls []; reads [PPUSTATUS]; writes []",
+        "RAM: 1 of 3 from 0",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    assert!(!c.root.join("old/game.asm").exists());
+    assert!(!c.root.join("old/game.chr").exists());
+}
+
+#[test]
+fn disassemble_rejects_bad_requests() {
+    let mut c = Client::start();
+    game_rom(&mut c);
+    c.write("broken.json", "{\"rom\": ");
+    c.write("norom.json", "{}");
+    for (arguments, code, message) in [
+        (
+            json!({"annotations":"broken.json"}),
+            "E_DISASM",
+            "Invalid annotations",
+        ),
+        (
+            json!({"annotations":"norom.json"}),
+            "E_DISASM",
+            "must name the ROM file",
+        ),
+        (
+            json!({"annotations":"norom.json","inline":{"rom":"old/game.nes"}}),
+            "E_DISASM",
+            "Give either annotations",
+        ),
+        (
+            json!({"inline":{"rom":"missing.nes"}}),
+            "E_IO",
+            "missing.nes",
+        ),
+        (
+            json!({"inline":{"rom":"../outside.nes"}}),
+            "E_IO",
+            "outside.nes",
+        ),
+        (
+            json!({"inline":{"rom":"old/game.nes"},"output":"game.txt"}),
+            "E_OUTPUT",
+            "Source output must have a .asm extension",
+        ),
+        (
+            json!({"inline":{"rom":"old/game.nes","labels":[{"address":"$C000","name":"9"}]}}),
+            "E_DISASM",
+            "Invalid name '9'",
+        ),
+    ] {
+        let r = c.call("disassemble", arguments.clone());
+        assert_eq!(r["isError"], true, "{arguments}: {r}");
+        let d = &r["structuredContent"]["diagnostics"][0];
+        assert_eq!(d["code"], code, "{arguments}: {r}");
+        assert!(
+            d["message"].as_str().unwrap().contains(message),
+            "{arguments}: {r}"
+        );
+    }
+    // Errors in an annotation file name it.
+    let r = c.call("disassemble", json!({"annotations":"broken.json"}));
+    let location = &r["structuredContent"]["diagnostics"][0]["location"];
+    assert_eq!(location["file"], "broken.json");
+}
+
+#[test]
+fn export_writes_verified_sources_and_keeps_edits() {
+    let mut c = Client::start();
+    let original = game_rom(&mut c);
+    let export = |c: &mut Client, output: Option<&str>| {
+        let mut arguments = json!({"inline":{"rom":"old/game.nes"}});
+        if let Some(output) = output {
+            arguments["output"] = json!(output);
+        }
+        c.call("export_disassembly", arguments)
+    };
+    let r = export(&mut c, None);
+    assert_eq!(r["isError"], false, "{r}");
+    let kinds: Vec<&Value> = r["structuredContent"]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| &a["kind"])
+        .collect();
+    assert_eq!(kinds, [&json!("source"), &json!("chr")]);
+    assert!(Client::text(&r).contains("Wrote "), "{r}");
+    let source = std::fs::read_to_string(c.root.join("old/game.asm")).unwrap();
+    assert!(source.starts_with("; Generated by nesasm disassembler; checksum "));
+    assert!(
+        source.contains("  .incbin \"old/game.chr\", 0, 8192"),
+        "{source}"
+    );
+    // The written source assembles to the original ROM.
+    let r = c.call(
+        "assemble",
+        json!({"input":"old/game.asm","output":"rebuilt/game.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        std::fs::read(c.root.join("rebuilt/game.nes")).unwrap(),
+        original
+    );
+    // An unedited generated source is replaced; an edited one is kept.
+    let r = export(&mut c, None);
+    assert_eq!(r["isError"], false, "{r}");
+    c.write("old/game.asm", source.replace("lda #$00", "lda #0"));
+    c.write("hand.asm", "  nop\n");
+    for (output, message) in [
+        (None, "exists and is not an unedited generated file"),
+        (
+            Some("hand.asm"),
+            "exists and is not an unedited generated file",
+        ),
+        (
+            Some(".git/game.asm"),
+            "must not contain hidden files or directories",
+        ),
+        (Some("../game.asm"), "outside the project root"),
+    ] {
+        let r = export(&mut c, output);
+        assert_eq!(r["isError"], true, "{output:?}: {r}");
+        assert!(Client::messages(&r).contains(message), "{output:?}: {r}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(c.root.join("hand.asm")).unwrap(),
+        "  nop\n"
+    );
+    assert!(!c.root.join(".git").exists());
+    // A source that does not reassemble to the ROM is not written.
+    let mut nes2 = original.clone();
+    nes2[7] = 0x08;
+    c.write("nes2.nes", &nes2);
+    let r = c.call("export_disassembly", json!({"inline":{"rom":"nes2.nes"}}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains("does not reassemble to the ROM; nothing was written"),
+        "{r}"
+    );
+    assert!(
+        Client::text(&r).contains(
+            "Round trip FAILED: 1 bytes differ; first header $0007 expected 08 actual 00"
+        ),
+        "{}",
+        Client::text(&r)
+    );
+    assert!(!c.root.join("nes2.asm").exists());
+}

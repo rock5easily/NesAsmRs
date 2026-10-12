@@ -21,7 +21,7 @@ use analysis::{Analysis, Class, Loc, Target};
 use render::Rendered;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -44,7 +44,7 @@ pub enum RomFormat {
 }
 
 /// Something the annotations should settle, or a limit of the round trip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum IssueKind {
@@ -104,6 +104,9 @@ pub struct SourceLine {
     pub address: Option<Address>,
     /// ROM bytes the line produces.
     pub size: usize,
+    /// The first bytes as hex pairs (`..` when there are more).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bytes: String,
     pub text: String,
 }
 

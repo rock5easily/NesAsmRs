@@ -9,7 +9,18 @@ fn stdio_lifecycle_validation_build_and_recovery() {
     let mut c = Client::start();
     let listed = c.request("tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for name in [
+        "assemble",
+        "check",
+        "inspect_rom",
+        "get_reference",
+        "disassemble",
+        "export_disassembly",
+    ] {
+        assert!(names.contains(&name), "{names:?}");
+    }
+    assert_eq!(tools.len(), 6);
     for tool in tools {
         assert!(tool["inputSchema"].is_object());
         assert!(tool["outputSchema"].is_object());
@@ -197,6 +208,7 @@ fn structured_content_matches_output_schema() {
         "  .bank 0\n  .org $8000\nStart:\n  nop\n",
     )
     .unwrap();
+    fs::write(c.root.join("game.bin"), vec![0xea; 0x2000]).unwrap();
     let listed = c.request("tools/list", json!({}));
     let schemas: Vec<(String, Value)> = listed["result"]["tools"]
         .as_array()
@@ -214,6 +226,13 @@ fn structured_content_matches_output_schema() {
         ("assemble", json!({"input":"main.asm"})),
         ("check", json!({"input":"missing.asm"})),
         ("get_reference", json!({})),
+        (
+            "disassemble",
+            json!({"inline":{"rom":"game.bin"},"view":{"from":"$E000"},
+                               "xrefs":["$E000"],"routines":{},"ram":{}}),
+        ),
+        ("export_disassembly", json!({"inline":{"rom":"game.bin"}})),
+        ("disassemble", json!({"inline":{"rom":"missing.bin"}})),
     ] {
         let result = c.call(name, arguments);
         let content = result["structuredContent"].as_object().unwrap();
@@ -263,6 +282,7 @@ fn reference_documents_are_resources() {
             "nesasm://reference/directives",
             "nesasm://reference/expressions",
             "nesasm://reference/options",
+            "nesasm://reference/disassembler",
         ]
     );
     for resource in resources {
