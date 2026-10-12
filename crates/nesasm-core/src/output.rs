@@ -417,17 +417,34 @@ fn create_beside(path: &Path, extension: &str) -> io::Result<(PathBuf, fs::File)
     }
 }
 
+/// A destination that [`commit_all`] changed.
+struct Change {
+    path: PathBuf,
+    /// The previous file, renamed beside it.
+    backup: Option<PathBuf>,
+    /// Whether the new file was renamed into place.
+    placed: bool,
+    /// The size and time of the new file once in place, to notice if
+    /// another program replaces it before it is undone.
+    stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
 /// Renames the staged files into place as one change. Each existing file is
 /// first renamed to a backup beside it; if a rename fails, the files changed
-/// so far are restored, and those that cannot be are named in the error.
-/// On success, the backups are removed, and those that cannot be are
-/// returned as warnings. `rename` is `fs::rename` except in tests.
+/// so far are restored, and those that cannot be are named in the error. A
+/// file another program replaced in the meantime is left as it is. On
+/// success, the backups are removed, and those that cannot be are returned
+/// as warnings. `rename` is `fs::rename` except in tests.
 fn commit_all(
     staged: Vec<StagedArtifact>,
     rename: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
 ) -> Result<(Vec<Artifact>, Vec<String>), String> {
-    // Each destination changed, its backup, and whether the new file is in place.
-    let mut changed: Vec<(PathBuf, Option<PathBuf>, bool)> = Vec::new();
+    let mut changed: Vec<Change> = Vec::new();
     let mut artifacts = Vec::new();
     let mut failure = None;
     for mut staged in staged {
@@ -435,7 +452,15 @@ fn commit_all(
         drop(staged.file.take());
         let path = staged.path.clone();
         // A directory is not moved away; renaming onto it fails below.
-        let backup = if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
+        let existing = match fs::symlink_metadata(&path) {
+            Ok(metadata) => !metadata.is_dir(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                failure = Some((path, e));
+                break;
+            }
+        };
+        let backup = if existing {
             match back_up(&path, rename) {
                 Ok(backup) => Some(backup),
                 Err(e) => {
@@ -447,7 +472,12 @@ fn commit_all(
             None
         };
         let placed = rename(&staged.temp, &path);
-        changed.push((path.clone(), backup, placed.is_ok()));
+        changed.push(Change {
+            path: path.clone(),
+            backup,
+            placed: placed.is_ok(),
+            stamp: placed.as_ref().ok().and_then(|_| stamp(&path)),
+        });
         if let Err(e) = placed {
             failure = Some((path, e));
             break;
@@ -461,7 +491,7 @@ fn commit_all(
     let Some((path, error)) = failure else {
         let warnings = changed
             .into_iter()
-            .filter_map(|(_, backup, _)| backup)
+            .filter_map(|change| change.backup)
             .filter_map(|backup| {
                 let e = fs::remove_file(&backup).err()?;
                 Some(format!("Could not remove {}: {e}", backup.display()))
@@ -470,20 +500,36 @@ fn commit_all(
         return Ok((artifacts, warnings));
     };
     let mut kept = Vec::new();
-    for (path, backup, placed) in changed.into_iter().rev() {
-        let undone = match (backup, placed) {
-            (Some(backup), _) => rename(&backup, &path).map_err(|e| {
-                format!(
-                    "{}: {e} (its previous content is in {})",
-                    path.display(),
-                    backup.display()
-                )
-            }),
-            (None, true) => fs::remove_file(&path)
-                .map_err(|e| format!("{}: {e} (the new file remains)", path.display())),
-            (None, false) => Ok(()),
+    for change in changed.into_iter().rev() {
+        let Change {
+            path,
+            backup,
+            placed,
+            stamp: placed_stamp,
+        } = change;
+        let previous = backup.as_ref().map_or_else(String::new, |backup| {
+            format!(" (its previous content is in {})", backup.display())
+        });
+        if placed && (placed_stamp.is_none() || stamp(&path) != placed_stamp) {
+            kept.push(format!(
+                "{}: replaced by another program since, so left as it is{previous}",
+                path.display()
+            ));
+            continue;
+        }
+        let undone = match backup {
+            Some(backup) => rename(&backup, &path),
+            None if placed => fs::remove_file(&path),
+            None => Ok(()),
         };
-        kept.extend(undone.err());
+        if let Err(e) = undone {
+            let remains = if previous.is_empty() {
+                " (the new file remains)".into()
+            } else {
+                previous
+            };
+            kept.push(format!("{}: {e}{remains}", path.display()));
+        }
     }
     let message = format!("Could not write {}: {error}", path.display());
     Err(if kept.is_empty() {
@@ -719,6 +765,49 @@ mod tests {
             // No temporary file or backup remains.
             assert_eq!(contents(dir.path()), before, "rename {call}");
         }
+    }
+
+    #[test]
+    fn files_replaced_by_another_program_are_not_undone() {
+        // The renames: 1 backs up a, 2 places a, 3 backs up b, and before
+        // 4 fails to place b, another program replaces a.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.asm"), "old a").unwrap();
+        fs::write(dir.path().join("b.asm"), "old b").unwrap();
+        let staged = stage(dir.path(), &[("a.asm", b"new a"), ("b.asm", b"new b")]);
+        let a = dir.path().join("a.asm");
+        let mut fail = failing_rename(&[4]);
+        let mut call = 0;
+        let e = commit_all(staged, &mut |from, to| {
+            call += 1;
+            if call == 4 {
+                fs::write(&a, "another a").unwrap();
+            }
+            fail(from, to)
+        })
+        .unwrap_err();
+        let files = contents(dir.path());
+        assert_eq!(files.len(), 3, "{files:?}");
+        let (backup, old) = &files[0];
+        assert!(
+            backup.starts_with(".a.asm.") && backup.ends_with(".bak"),
+            "{backup}"
+        );
+        assert_eq!(old, b"old a");
+        assert_eq!(files[1], ("a.asm".into(), b"another a".to_vec()));
+        assert_eq!(files[2], ("b.asm".into(), b"old b".to_vec()));
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "Could not write {}: rename 4 failed; these changes could not be undone: \
+                 {}: replaced by another program since, so left as it is \
+                 (its previous content is in {})",
+                path("b.asm"),
+                path("a.asm"),
+                path(backup)
+            )
+        );
     }
 
     #[test]
