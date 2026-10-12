@@ -281,6 +281,7 @@ fn reference_topics() {
         "directives",
         "expressions",
         "options",
+        "disassembler",
     ] {
         assert!(!nesasm_core::reference(Some(topic)).unwrap().is_empty());
     }

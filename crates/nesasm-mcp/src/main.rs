@@ -1,6 +1,10 @@
 use nesasm_core::{
     Artifact, AssembleOptions, AssembleRequest, AssembleResult, BankUsage, Diagnostic,
-    DiagnosticCode, LineRecord, ReferenceTopic, Region, SourceLocation, Symbol,
+    DiagnosticCode, LineRecord, ReferenceTopic, Region, Severity, SourceLocation, Symbol,
+    disasm::{
+        self, Address, Diff, DisasmConfig, Disassembly, Issue, IssueKind, RamUse, Routine,
+        SourceLine, Summary, Verification, Xref,
+    },
     inspect::{Disassembled, HexRow, InesHeader, Rom, Vectors},
 };
 use rmcp::{
@@ -35,8 +39,16 @@ const DEFAULT_DUMP_LENGTH: usize = 256;
 const MAX_DUMP_LENGTH: usize = 4096;
 const DEFAULT_DISASSEMBLY_COUNT: usize = 32;
 const MAX_DISASSEMBLY_COUNT: usize = 512;
-/// Largest ROM file inspect_rom reads.
+/// Largest ROM file inspect_rom and the disassembler read.
 const MAX_ROM_FILE: u64 = 8 * 1024 * 1024;
+/// Largest annotation file the disassembler reads.
+const MAX_ANNOTATIONS_FILE: u64 = 8 * 1024 * 1024;
+const DEFAULT_ISSUE_LIMIT: usize = 20;
+const DEFAULT_DIFF_LIMIT: usize = 20;
+const DEFAULT_ITEM_LIMIT: usize = 100;
+const MAX_ITEM_LIMIT: usize = 1000;
+/// Bytes a view without `to` covers.
+const DEFAULT_VIEW_SPAN: u32 = 0x100;
 
 /// The project to assemble: an entry file plus optional in-memory sources.
 #[derive(Clone, Default, Deserialize, JsonSchema)]
@@ -134,6 +146,135 @@ struct InspectInput {
     hexdump: Option<RomRange>,
     /// Disassembly starting at an address.
     disassemble: Option<RomRange>,
+}
+
+/// Which issues to return.
+#[derive(Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct IssueQuery {
+    /// Only issues of this kind.
+    kind: Option<IssueKind>,
+    #[serde(default)]
+    offset: usize,
+    /// Maximum issues returned (default 20, at most 1000).
+    limit: Option<usize>,
+}
+
+/// Generated source lines of an address range.
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ViewQuery {
+    /// Only this bank (needed when several banks hold the range).
+    bank: Option<usize>,
+    /// First CPU address: a number or "$C000".
+    from: Address,
+    /// Last CPU address (default from + $FF).
+    to: Option<Address>,
+    #[serde(default)]
+    offset: usize,
+    /// Maximum lines returned (default 200, at most 2000).
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PageQuery {
+    #[serde(default)]
+    offset: usize,
+    /// Maximum items returned (default 100, at most 1000).
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DisasmInput {
+    /// Annotation file (JSON) within the root. Its `rom` field names the ROM;
+    /// the other fields record what is known (labels, symbols, regions,
+    /// comments). Edit it and call again to refine the source.
+    annotations: Option<PathBuf>,
+    /// Or the annotations inline, with the same fields.
+    inline: Option<DisasmConfig>,
+    /// Main source file (.asm) within the root, used for the names of bank
+    /// files and the CHR file; defaults to the ROM path with .asm.
+    output: Option<PathBuf>,
+    /// Issues to return (default: the first 20).
+    issues: Option<IssueQuery>,
+    /// For a ROM hack (annotations with `base`): the changed ranges written
+    /// as source, with their code/data bytes, labels, routines and references
+    /// from outside (default: the first 20).
+    diffs: Option<PageQuery>,
+    /// Generated source lines (with their bytes) in an address range.
+    view: Option<ViewQuery>,
+    /// References to each label, symbol name or address ("$C000").
+    xrefs: Option<Vec<String>>,
+    /// Routines with their callers, calls and RAM accesses.
+    routines: Option<PageQuery>,
+    /// Addresses outside the ROM (RAM, I/O) and the routines accessing them.
+    ram: Option<PageQuery>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExportInput {
+    /// Annotation file (JSON) within the root, as for disassemble.
+    annotations: Option<PathBuf>,
+    /// Or the annotations inline.
+    inline: Option<DisasmConfig>,
+    /// Main source file to write (.asm) within the root and outside hidden
+    /// directories; defaults to the ROM path with .asm. Bank files
+    /// (<stem>_bankNN.asm) and the CHR file (<stem>.chr) use its stem.
+    output: Option<PathBuf>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Page<T> {
+    /// Items matching the query.
+    total: usize,
+    offset: usize,
+    items: Vec<T>,
+}
+
+impl<T: Clone> Page<T> {
+    fn of(items: &[T], offset: usize, limit: Option<usize>, default: usize, max: usize) -> Self {
+        Self {
+            total: items.len(),
+            offset,
+            items: items
+                .iter()
+                .skip(offset)
+                .take(limit.unwrap_or(default).min(max))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+struct DisasmReport {
+    success: bool,
+    /// Errors in the annotations or ROM, or why the request failed.
+    diagnostics: Vec<Diagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<Summary>,
+    /// Whether the generated source reassembles to the same ROM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<Verification>,
+    /// Generated source files relative to the root (main file first).
+    files: Vec<PathBuf>,
+    /// Files written by export_disassembly.
+    artifacts: Vec<Artifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issues: Option<Page<Issue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diffs: Option<Page<Diff>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view: Option<Page<SourceLine>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xrefs: Option<BTreeMap<String, Vec<Xref>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routines: Option<Page<Routine>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram: Option<Page<RamUse>>,
 }
 
 #[derive(Default, Serialize, JsonSchema)]
@@ -234,6 +375,20 @@ fn error(code: DiagnosticCode, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(code, message, SourceLocation::default())
 }
 
+/// Reads a file within `root`, up to `limit` bytes.
+fn read_limited(root: &Path, path: &Path, limit: u64) -> Result<(PathBuf, Vec<u8>), Diagnostic> {
+    let io = |e: String| error(DiagnosticCode::Io, format!("{}: {e}", path.display()));
+    let path = nesasm_core::resolve_path(path, root, Some(root)).map_err(io)?;
+    let size = std::fs::metadata(&path)
+        .map_err(|e| io(e.to_string()))?
+        .len();
+    if size > limit {
+        return Err(io(format!("File exceeds {} MiB", limit >> 20)));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| io(e.to_string()))?;
+    Ok((path, bytes))
+}
+
 /// A structured tool result with a text summary.
 fn tool_result<T: Serialize>(report: &T, success: bool, summary: String) -> CallToolResult {
     let mut result = CallToolResult::structured(serde_json::to_value(report).unwrap());
@@ -246,12 +401,16 @@ fn diagnostics_summary(diagnostics: &[Diagnostic]) -> String {
     diagnostics
         .iter()
         .map(|d| {
-            format!(
-                "{}:{}: {}",
-                d.location.file.display(),
-                d.location.line,
-                d.message
-            )
+            if d.location.file.as_os_str().is_empty() {
+                format!("{}: {}", d.severity, d.message)
+            } else {
+                format!(
+                    "{}:{}: {}",
+                    d.location.file.display(),
+                    d.location.line,
+                    d.message
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -540,6 +699,446 @@ impl Server {
     }
 }
 
+/// A disassembly and the resolved path of its ROM.
+struct Loaded {
+    disassembly: Disassembly,
+    rom: PathBuf,
+}
+
+impl Server {
+    /// Reads the annotations and ROM and disassembles them.
+    fn load_disassembly(
+        root: &Path,
+        annotations: Option<&Path>,
+        inline: Option<&DisasmConfig>,
+        output: Option<&Path>,
+        cancel: &AtomicBool,
+    ) -> Result<Loaded, Vec<Diagnostic>> {
+        let (config, location) = match (annotations, inline) {
+            (Some(path), None) => {
+                let (_, bytes) =
+                    read_limited(root, path, MAX_ANNOTATIONS_FILE).map_err(|d| vec![d])?;
+                let location = SourceLocation::file(path);
+                let config =
+                    disasm::parse_config(&String::from_utf8_lossy(&bytes)).map_err(|e| {
+                        vec![Diagnostic::error(
+                            DiagnosticCode::Disasm,
+                            e,
+                            location.clone(),
+                        )]
+                    })?;
+                (config, location)
+            }
+            (None, Some(config)) => (config.clone(), SourceLocation::default()),
+            _ => {
+                return Err(vec![error(
+                    DiagnosticCode::Disasm,
+                    "Give either annotations (a JSON file) or inline annotations",
+                )]);
+            }
+        };
+        if config.rom.as_os_str().is_empty() {
+            return Err(vec![Diagnostic::error(
+                DiagnosticCode::Disasm,
+                "The annotations must name the ROM file (rom)",
+                location,
+            )]);
+        }
+        let (rom, bytes) = read_limited(root, &config.rom, MAX_ROM_FILE).map_err(|d| vec![d])?;
+        let base = match &config.base {
+            Some(path) => Some(
+                read_limited(root, path, MAX_ROM_FILE)
+                    .map_err(|d| vec![d])?
+                    .1,
+            ),
+            None => None,
+        };
+        let output = output.map_or_else(|| disasm::default_output(&config.rom), Path::to_owned);
+        if !output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("asm"))
+        {
+            return Err(vec![error(
+                DiagnosticCode::Output,
+                "Source output must have a .asm extension",
+            )]);
+        }
+        // Sources name their bank and CHR files relative to the root.
+        let source = nesasm_core::resolve_path(&output, root, Some(root))
+            .map_err(|e| vec![error(DiagnosticCode::Output, e)])?;
+        let source = Self::relative(root, &source);
+        let disassembly = disasm::disassemble(&bytes, base.as_deref(), &config, &source, cancel)
+            .map_err(|errors| {
+                errors
+                    .into_iter()
+                    .map(|d| Diagnostic {
+                        location: location.clone(),
+                        ..d
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+        Ok(Loaded { disassembly, rom })
+    }
+
+    fn disasm_report(root: &Path, input: &DisasmInput, cancel: &AtomicBool) -> DisasmReport {
+        let loaded = match Self::load_disassembly(
+            root,
+            input.annotations.as_deref(),
+            input.inline.as_ref(),
+            input.output.as_deref(),
+            cancel,
+        ) {
+            Ok(loaded) => loaded,
+            Err(diagnostics) => {
+                return DisasmReport {
+                    diagnostics,
+                    ..DisasmReport::default()
+                };
+            }
+        };
+        let d = &loaded.disassembly;
+        let mut report = DisasmReport {
+            success: true,
+            summary: Some(d.summary()),
+            verification: Some(d.verify(root, Some(root), cancel)),
+            files: d.files().iter().map(|(p, _)| p.clone()).collect(),
+            ..DisasmReport::default()
+        };
+        let query = input.issues.clone().unwrap_or_default();
+        let issues: Vec<Issue> = d
+            .issues()
+            .iter()
+            .filter(|i| query.kind.is_none_or(|k| i.kind == k))
+            .cloned()
+            .collect();
+        report.issues = Some(Page::of(
+            &issues,
+            query.offset,
+            query.limit,
+            DEFAULT_ISSUE_LIMIT,
+            MAX_ITEM_LIMIT,
+        ));
+        if report.summary.as_ref().is_some_and(|s| s.diff.is_some()) {
+            let page = input.diffs.clone().unwrap_or_default();
+            report.diffs = Some(Page::of(
+                &d.diffs(),
+                page.offset,
+                page.limit,
+                DEFAULT_DIFF_LIMIT,
+                MAX_ITEM_LIMIT,
+            ));
+        }
+        if let Some(view) = &input.view {
+            let to = view
+                .to
+                .map_or(view.from.0.saturating_add(DEFAULT_VIEW_SPAN - 1), |a| a.0);
+            let lines: Vec<SourceLine> = d
+                .view(view.bank, view.from.0, to)
+                .into_iter()
+                .cloned()
+                .collect();
+            report.view = Some(Page::of(
+                &lines,
+                view.offset,
+                view.limit,
+                DEFAULT_LINE_LIMIT,
+                MAX_LINE_LIMIT,
+            ));
+        }
+        if let Some(queries) = &input.xrefs {
+            let mut xrefs = BTreeMap::new();
+            for query in queries {
+                match d.xrefs(query) {
+                    Ok(found) => {
+                        xrefs.insert(query.clone(), found);
+                    }
+                    Err(e) => report.diagnostics.push(Diagnostic {
+                        severity: Severity::Warning,
+                        ..error(DiagnosticCode::Disasm, e)
+                    }),
+                }
+            }
+            report.xrefs = Some(xrefs);
+        }
+        if let Some(page) = &input.routines {
+            report.routines = Some(Page::of(
+                &d.routines(),
+                page.offset,
+                page.limit,
+                DEFAULT_ITEM_LIMIT,
+                MAX_ITEM_LIMIT,
+            ));
+        }
+        if let Some(page) = &input.ram {
+            report.ram = Some(Page::of(
+                &d.ram(),
+                page.offset,
+                page.limit,
+                DEFAULT_ITEM_LIMIT,
+                MAX_ITEM_LIMIT,
+            ));
+        }
+        report
+    }
+
+    fn export_report(root: &Path, input: &ExportInput, cancel: &AtomicBool) -> DisasmReport {
+        let loaded = match Self::load_disassembly(
+            root,
+            input.annotations.as_deref(),
+            input.inline.as_ref(),
+            input.output.as_deref(),
+            cancel,
+        ) {
+            Ok(loaded) => loaded,
+            Err(diagnostics) => {
+                return DisasmReport {
+                    diagnostics,
+                    ..DisasmReport::default()
+                };
+            }
+        };
+        let d = &loaded.disassembly;
+        let verification = d.verify(root, Some(root), cancel);
+        let mut report = DisasmReport {
+            summary: Some(d.summary()),
+            files: d.files().iter().map(|(p, _)| p.clone()).collect(),
+            ..DisasmReport::default()
+        };
+        if !verification.matched {
+            report.diagnostics.push(error(
+                DiagnosticCode::Disasm,
+                "The generated source does not reassemble to the ROM; nothing was written (see verification)",
+            ));
+        } else if cancel.load(Ordering::Relaxed) {
+            // The time limit passed; nothing is written after the reply.
+            report.diagnostics.push(error(
+                DiagnosticCode::Cancelled,
+                "The time limit passed before writing; nothing was written",
+            ));
+        } else {
+            match nesasm_core::write_disassembly(d, root, Some(root), &loaded.rom, cancel) {
+                Ok(artifacts) => {
+                    report.artifacts = artifacts;
+                    report.success = true;
+                }
+                Err(e) => report.diagnostics.push(Diagnostic::error(
+                    DiagnosticCode::Output,
+                    e,
+                    SourceLocation::file(d.source_path()),
+                )),
+            }
+        }
+        report.verification = Some(verification);
+        report
+    }
+
+    fn disasm_summary(report: &DisasmReport) -> String {
+        let mut text = Vec::new();
+        if let Some(summary) = &report.summary {
+            let prg = summary.banks.iter().filter(|b| !b.chr).count();
+            text.push(format!(
+                "{} ROM: {prg} PRG and {} CHR banks; {} instructions, {} labels, {} routines",
+                json_name(&summary.format),
+                summary.banks.len() - prg,
+                summary.instructions,
+                summary.labels,
+                summary.routines
+            ));
+            for bank in summary.banks.iter().filter(|b| !b.chr) {
+                text.push(format!(
+                    "Bank {} {}: code {}, data {}, unknown {} bytes",
+                    bank.bank,
+                    bank.org.unwrap_or_default(),
+                    bank.code_bytes,
+                    bank.data_bytes,
+                    bank.unknown_bytes
+                ));
+            }
+            if let Some(diff) = &summary.diff {
+                let new_banks = if diff.new_banks.is_empty() {
+                    String::new()
+                } else {
+                    let banks: Vec<String> = diff.new_banks.iter().map(usize::to_string).collect();
+                    format!("; banks not in the base ROM: {}", banks.join(", "))
+                };
+                text.push(format!(
+                    "ROM hack: {} bytes differ from the base ROM; {} ranges ({} bytes) are source, the rest is included from the base{new_banks}",
+                    diff.changed_bytes, diff.ranges, diff.source_bytes
+                ));
+            }
+            if !summary.issues.is_empty() {
+                let counts: Vec<String> = summary
+                    .issues
+                    .iter()
+                    .map(|(kind, n)| format!("{} {n}", json_name(kind)))
+                    .collect();
+                text.push(format!("Issues: {}", counts.join(", ")));
+            }
+        }
+        if let Some(v) = &report.verification {
+            text.push(if v.matched {
+                "Round trip: the source reassembles to the same ROM".into()
+            } else if let Some(first) = v.mismatches.first() {
+                format!(
+                    "Round trip FAILED: {} bytes differ; first {}{} expected {} actual {}{}",
+                    v.mismatch_count,
+                    first
+                        .bank
+                        .map_or("header ".into(), |b| format!("bank {b} ")),
+                    first.address,
+                    first.expected,
+                    first.actual,
+                    first
+                        .line
+                        .as_ref()
+                        .map_or(String::new(), |l| format!(" ({l})"))
+                )
+            } else {
+                format!(
+                    "Round trip FAILED: the source does not assemble\n{}",
+                    diagnostics_summary(&v.diagnostics)
+                )
+            });
+        }
+        for artifact in &report.artifacts {
+            text.push(format!("Wrote {}", artifact.path.display()));
+        }
+        if !report.diagnostics.is_empty() {
+            text.push(diagnostics_summary(&report.diagnostics));
+        }
+        let heading = |name: &str, total: usize, offset: usize, shown: usize| {
+            if offset > 0 || offset + shown < total {
+                format!("{name}: {shown} of {total} from {offset}")
+            } else {
+                format!("{name}: {total}")
+            }
+        };
+        if let Some(page) = report.issues.as_ref().filter(|p| p.total > 0) {
+            text.push(heading("Issues", page.total, page.offset, page.items.len()));
+            for issue in &page.items {
+                let bank = issue.bank.map_or(String::new(), |b| format!("bank {b} "));
+                text.push(format!(
+                    "  {} {bank}{}: {}",
+                    json_name(&issue.kind),
+                    issue.address,
+                    issue.message
+                ));
+            }
+        }
+        if let Some(page) = report.diffs.as_ref().filter(|p| p.total > 0) {
+            text.push(heading(
+                "Changed ranges",
+                page.total,
+                page.offset,
+                page.items.len(),
+            ));
+            for d in &page.items {
+                let mut entry = format!(
+                    "  {}bank {} {}-{}: {} changed; code {}, data {}, unknown {}",
+                    if d.chr { "CHR " } else { "" },
+                    d.bank,
+                    d.start,
+                    d.end,
+                    d.changed_bytes,
+                    d.code_bytes,
+                    d.data_bytes,
+                    d.unknown_bytes
+                );
+                if let Some(fill) = &d.base_fill {
+                    entry.push_str(&format!("; base was free space ({fill})"));
+                }
+                if !d.labels.is_empty() {
+                    entry.push_str(&format!("; labels [{}]", d.labels.join(", ")));
+                }
+                if !d.routines.is_empty() {
+                    entry.push_str(&format!("; in [{}]", d.routines.join(", ")));
+                }
+                if !d.referenced_from.is_empty() {
+                    let from: Vec<String> = d
+                        .referenced_from
+                        .iter()
+                        .map(|x| {
+                            let what = if x.line.is_empty() {
+                                json_name(&x.kind)
+                            } else {
+                                x.line.clone()
+                            };
+                            format!("bank {} {} {what}", x.bank, x.address)
+                        })
+                        .collect();
+                    entry.push_str(&format!("; from [{}]", from.join(", ")));
+                }
+                text.push(entry);
+            }
+        }
+        if let Some(page) = &report.view {
+            text.push(heading("Lines", page.total, page.offset, page.items.len()));
+            for line in &page.items {
+                let address = line.address.map_or(String::new(), |a| a.to_string());
+                text.push(format!("{address:<6} {:<27} {}", line.bytes, line.text));
+            }
+        }
+        for (query, found) in report.xrefs.iter().flatten() {
+            text.push(format!("References to {query}: {}", found.len()));
+            for x in found {
+                let routine = x
+                    .routine
+                    .as_ref()
+                    .map_or(String::new(), |r| format!(" in {r}"));
+                let what = if x.line.is_empty() {
+                    json_name(&x.kind)
+                } else {
+                    x.line.clone()
+                };
+                text.push(format!("  bank {} {}{routine}: {what}", x.bank, x.address));
+            }
+        }
+        if let Some(page) = &report.routines {
+            text.push(heading(
+                "Routines",
+                page.total,
+                page.offset,
+                page.items.len(),
+            ));
+            for r in &page.items {
+                text.push(format!(
+                    "  {} bank {} {}: {} bytes, {} callers; calls [{}]; reads [{}]; writes [{}]",
+                    r.name,
+                    r.bank,
+                    r.address,
+                    r.size,
+                    r.callers,
+                    r.calls.join(", "),
+                    r.reads.join(", "),
+                    r.writes.join(", ")
+                ));
+            }
+        }
+        if let Some(page) = &report.ram {
+            text.push(heading("RAM", page.total, page.offset, page.items.len()));
+            for r in &page.items {
+                let name = r.name.as_ref().map_or(String::new(), |n| format!(" {n}"));
+                text.push(format!(
+                    "  {}{name}: {} reads, {} writes; [{}]",
+                    r.address,
+                    r.reads,
+                    r.writes,
+                    r.routines.join(", ")
+                ));
+            }
+        }
+        text.join("\n")
+    }
+}
+
+/// The JSON name of a unit enum value (`"nes"`, `"invalid_opcode"`).
+fn json_name<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 #[tool_router]
 impl Server {
     fn new(root: PathBuf, timeout: Duration) -> Self {
@@ -571,7 +1170,34 @@ impl Server {
         let summary = Self::inspect_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Read assembler syntax documentation. Topics: index, instructions, directives, expressions, options.",output_schema=schema::<ReferenceReport>(),annotations(read_only_hint=true))]
+    #[tool(description="Disassemble a ROM (.nes, or raw .bin) into NESASM source, guided by annotations: a JSON file in the root (or inline) that names the ROM and records labels, symbols, code/data regions and comments taken from the author's notes. Code is traced from the interrupt vectors and entry points. For a ROM hack, give the original ROM as base: only the changed ranges become source (widen them with patches) and the rest is included from the base. Returns a summary, issues to settle in the annotations and whether the source reassembles to the same ROM; optionally source lines of a range, references, routines and RAM use. Writes nothing. See get_reference topic disassembler.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=true))]
+    async fn disassemble(&self, Parameters(input): Parameters<DisasmInput>) -> CallToolResult {
+        let report = self
+            .guarded(move |root, cancel| Self::disasm_report(root, &input, cancel))
+            .await
+            .unwrap_or_else(|diagnostic| DisasmReport {
+                diagnostics: vec![diagnostic],
+                ..DisasmReport::default()
+            });
+        let summary = Self::disasm_summary(&report);
+        tool_result(&report, report.success, summary)
+    }
+    #[tool(description="Write the source that disassemble generates (.asm, plus <stem>_bankNN.asm files for large ROMs and <stem>.chr for CHR ROM), only if it reassembles to the same ROM. Existing files are replaced only if they are generated sources not edited since.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    async fn export_disassembly(
+        &self,
+        Parameters(input): Parameters<ExportInput>,
+    ) -> CallToolResult {
+        let report = self
+            .guarded(move |root, cancel| Self::export_report(root, &input, cancel))
+            .await
+            .unwrap_or_else(|diagnostic| DisasmReport {
+                diagnostics: vec![diagnostic],
+                ..DisasmReport::default()
+            });
+        let summary = Self::disasm_summary(&report);
+        tool_result(&report, report.success, summary)
+    }
+    #[tool(description="Read assembler syntax documentation. Topics: index, instructions, directives, expressions, options, disassembler.",output_schema=schema::<ReferenceReport>(),annotations(read_only_hint=true))]
     fn get_reference(&self, Parameters(input): Parameters<ReferenceInput>) -> CallToolResult {
         // Unknown topics are rejected when the arguments are parsed.
         let topic = input.topic.unwrap_or_default();
@@ -601,7 +1227,9 @@ impl ServerHandler for Server {
             concat!(
                 "NESASM assembler. Read the syntax reference first (get_reference, or the ",
                 "nesasm://reference/* resources); use check to inspect diagnostics before ",
-                "assemble. All paths are relative to the configured project root."
+                "assemble. To turn a ROM into source, read the disassembler reference and use ",
+                "disassemble, then export_disassembly. All paths are relative to the configured ",
+                "project root."
             )
             .into(),
         );

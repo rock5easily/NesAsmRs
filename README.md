@@ -41,7 +41,16 @@ MCPクライアントの設定例（実行ファイルとプロジェクトの�
 - `inspect_rom`: ROMのiNESヘッダ・割り込みベクタ・起動しない原因の警告を返し、指定範囲の
   16進ダンプと逆アセンブル（NESASM構文、シンボル名付き）も返します。対象はルート内のROMファイル、
   またはメモリ上でアセンブルしたプロジェクトです。
-- `get_reference`: 命令・ディレクティブ・式・オプションの説明を取得します。
+- `disassemble`: ROM（`.nes`、または生の `.bin`）をNESASMソースに逆アセンブルします。
+  ルート内の注釈ファイル（JSON）にラベル・シンボル・コード／データ範囲・コメントを記録し、
+  割り込みベクタとエントリポイントからコードを追跡します。要約、注釈で解決すべき課題、
+  再アセンブルして元のROMと一致するかの検証結果、指定範囲のソース行・相互参照・ルーチン・
+  RAM使用を返します。ファイルは書き込みません。ROM Hackでは注釈の `base` にベースROMを指定すると、
+  差分の範囲（とその判断材料）を返し、差分だけを逆アセンブルし残りをベースROMから `.incbin` で
+  取り込むソースを生成します。
+- `export_disassembly`: 元のROMと一致することを確かめたうえで、生成したソース（`.asm`、
+  大きなROMではバンクごとの `.asm`、CHR ROMの `.chr`）を書き込みます。
+- `get_reference`: 命令・ディレクティブ・式・オプション・逆アセンブラの説明を取得します。
 
 `check`／`assemble`／`inspect_rom` は、ファイルの代わりにソースの文字列を `sources` で受け取れます
 （`{"input":"main.asm","sources":{"main.asm":"...","lib.asm":"..."}}`）。ディスク上のファイルより優先し、
@@ -49,19 +58,22 @@ MCPクライアントの設定例（実行ファイルとプロジェクトの�
 CPUアドレス・出力バイトを、ファイル・行範囲・バンク・アドレス範囲で絞り込み、ページ単位で返します。
 
 同じリファレンス文書をMCPのresourcesとしても公開します（`nesasm://reference/index`、
-`instructions`、`directives`、`expressions`、`options`、いずれも `text/markdown`）。
+`instructions`、`directives`、`expressions`、`options`、`disassembler`、いずれも `text/markdown`）。
 
 `check` / `assemble` の引数例: `{"input":"main.asm","options":{"encoding":"sjis","auto_zp":true}}`。
 `assemble` には `output`、両ツールには `include_paths` も指定できます。
 MCPの入力・依存ファイル・出力先は起動時の `--root` 内に制限されます。
-出力先は `.nes`／`.bin` のROMとその付随ファイルに限られ、`.git` などの隠しディレクトリには書き込みません。
+出力先は `.nes`／`.bin` のROMとその付随ファイル、および逆アセンブルの `.asm`／`.chr` に限られ、
+`.git` などの隠しディレクトリには書き込みません。逆アセンブルの出力は、生成後に編集されていない
+生成ファイルだけを上書きします。
 1回のアセンブルは既定30秒で打ち切られます（`--timeout <秒>` で変更）。
 
 ## ドキュメント
 
 - [Rust版の詳細](docs/rust.md): 構成、C#版との互換性と意図した差分、比較検証の手順
 - [UML図](docs/rust-uml.md)
-- [リファレンス](docs/reference/index.md): 命令・ディレクティブ・式・CLIオプション・上限
+- [リファレンス](docs/reference/index.md): 命令・ディレクティブ・式・CLIオプション・上限、
+  [逆アセンブラ](docs/reference/disassembler.md)
 
 ## C#版との互換性検証
 

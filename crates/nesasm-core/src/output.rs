@@ -16,6 +16,10 @@ pub enum ArtifactKind {
     Rom,
     Listing,
     Srec,
+    /// Generated source (disassembly).
+    Source,
+    /// CHR data included by a generated source.
+    Chr,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,8 +126,12 @@ fn check_rooted_output(rom: &Path, root: &Path) -> Result<(), String> {
     if !matches!(extension.as_deref(), Some("nes" | "bin")) {
         return Err("Output file must have a .nes or .bin extension".into());
     }
+    check_not_hidden(rom, root)
+}
+
+fn check_not_hidden(path: &Path, root: &Path) -> Result<(), String> {
     let root = crate::source::canonicalize(root)?;
-    let relative = rom
+    let relative = path
         .strip_prefix(&root)
         .map_err(|_| "Path is outside the project root")?;
     if relative
@@ -133,6 +141,125 @@ fn check_rooted_output(rom: &Path, root: &Path) -> Result<(), String> {
         return Err("Output path must not contain hidden files or directories".into());
     }
     Ok(())
+}
+
+/// Writes the source files and CHR file of a disassembly, relative to
+/// `base` and within `root` when set. The main source must end in `.asm`
+/// (bank files and the CHR file derive from its name). Existing files are
+/// replaced only if they are generated sources not edited since (or the CHR
+/// file of one), so hand-written or edited files are never lost. When
+/// `cancel` is set before the files are renamed into place, nothing is written.
+pub fn write_disassembly(
+    disassembly: &crate::disasm::Disassembly,
+    base: &Path,
+    root: Option<&Path>,
+    rom: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<Artifact>, String> {
+    let main = disassembly.source_path();
+    if !main
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("asm"))
+    {
+        return Err("Source output must have a .asm extension".into());
+    }
+    let rom = resolve_path(rom, base, root)?;
+    let mut files: Vec<(ArtifactKind, PathBuf, Vec<u8>)> = Vec::new();
+    for (path, text) in disassembly.files() {
+        // Like the listing, sources use the platform line ending.
+        let text = if cfg!(windows) {
+            text.replace('\n', "\r\n")
+        } else {
+            text.clone()
+        };
+        files.push((
+            ArtifactKind::Source,
+            resolve_path(path, base, root)?,
+            text.into_bytes(),
+        ));
+    }
+    if let Some((path, data)) = disassembly.chr_file() {
+        files.push((
+            ArtifactKind::Chr,
+            resolve_path(path, base, root)?,
+            data.to_vec(),
+        ));
+    }
+    let main = files[0].1.clone();
+    let main_text = match fs::read(&main) {
+        // Text that is not UTF-8 was not generated (or was edited).
+        Ok(text) => Some(String::from_utf8(text).unwrap_or_default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let main_replaceable = main_text
+        .as_deref()
+        .is_some_and(crate::disasm::is_unedited_source);
+    for (kind, path, _) in &files {
+        if let Some(root) = root {
+            check_not_hidden(path, root)?;
+        }
+        if *path == rom {
+            return Err("Output would overwrite the ROM".into());
+        }
+        // A link must not lead to another kind of file, such as a ROM.
+        let expected = if *kind == ArtifactKind::Chr {
+            "chr"
+        } else {
+            "asm"
+        };
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(expected))
+        {
+            return Err(format!(
+                "Output path {} is not a .{expected} file",
+                path.display()
+            ));
+        }
+        if path.is_dir() {
+            return Err(format!("Output path is a directory: {}", path.display()));
+        }
+        if !path.exists() {
+            continue;
+        }
+        let replaceable = match kind {
+            ArtifactKind::Source => {
+                let text = fs::read(path).map_err(|e| e.to_string())?;
+                std::str::from_utf8(&text).is_ok_and(crate::disasm::is_unedited_source)
+            }
+            _ => {
+                let data = fs::read(path).map_err(|e| e.to_string())?;
+                main_replaceable
+                    && main_text
+                        .as_deref()
+                        .is_some_and(|text| crate::disasm::is_unedited_chr(text, &data))
+            }
+        };
+        if !replaceable {
+            return Err(format!(
+                "{} exists and is not an unedited generated file; choose another output path",
+                path.display()
+            ));
+        }
+    }
+    for (_, path, _) in &files {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut staged = Vec::with_capacity(files.len());
+    for (kind, path, data) in files {
+        staged.push(StagedArtifact::write(kind, path, &data).map_err(|e| e.to_string())?);
+    }
+    // Staged files are removed when dropped.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Cancelled before writing; nothing was written".into());
+    }
+    staged
+        .into_iter()
+        .map(|artifact| artifact.commit().map_err(|e| e.to_string()))
+        .collect()
 }
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);

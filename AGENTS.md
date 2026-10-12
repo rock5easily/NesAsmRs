@@ -15,7 +15,8 @@ PCE専用機能は対象外です。
   - `engine/`: 2パスのアセンブラ。`mod.rs`（行処理・シンボル、`assemble`／`assemble_with_cancel`）、
     `directive.rs`、`instruction.rs`、`macros.rs`、`conditional.rs`、`procedure.rs`、`listing.rs`、`rom.rs`
   - `expr.rs`（式）、`opcode.rs`（命令表）、`state.rs`（メモリ配置の定数）、`source.rs`（入力解決）、
-    `image.rs`（PCX/CHR）、`output.rs`（`write_artifacts`）、`inspect.rs`（ROM検査・逆アセンブル）、
+    `image.rs`（PCX/CHR）、`output.rs`（`write_artifacts`／`write_disassembly`）、`inspect.rs`（ROM検査・逆アセンブル表示）、
+    `disasm/`（注釈に基づく逆アセンブル、ソース生成、往復検証）、
     `lib.rs`（公開API、`build`、リファレンス文書）
 - `crates/nesasm-cli`: `nesasm` コマンド（従来のオプション、watch）
 - `crates/nesasm-mcp`: `nesasm-mcp`（rmcpによるstdio接続のMCPサーバ）
@@ -83,7 +84,8 @@ cargo test --workspace --locked
 | | `instructions.rs` | 命令のエンコード、アドレッシング形式と拡張、全オペコードの逆アセンブル往復 |
 | | `macros_procedures.rs` | マクロ、プロシージャの配置と CALL |
 | | `images.rs` | PCX（INCCHR）の読み込みと検証 |
-| | `api.rs` | 公開API（serde表現、`build`、`write_artifacts`、`inspect`） |
+| | `api.rs` | 公開API（serde表現、`build`、`write_artifacts`、`write_disassembly`、`inspect`） |
+| | `disasm.rs` | 逆アセンブル（コード追跡、注釈の適用と誤り、ソース生成、往復検証、問い合わせ） |
 | | `assembly.rs` | 既存の総合テスト（新規は上の各ファイルへ） |
 | | `golden.rs` | C#版との互換（`tools/compat/golden.json`） |
 | nesasm-cli | `options.rs`／`reports.rs`／`watch.rs` | 引数・環境変数と出力ファイル／診断・JSON・使用量表／watch モード |
@@ -131,6 +133,8 @@ cargo llvm-cov -p nesasm-core --locked --summary-only
 - 入力・依存ファイル・出力先は `--root` の中に限ります（シンボリックリンク・ジャンクション経由の脱出も拒否）。
 - `assemble` が書き込めるのは `.nes`／`.bin` のROMと、その名前から派生する `.lst`／`.s28` だけです。
   `.` で始まるファイル・ディレクトリを含むパスには書き込みません。
+- `export_disassembly` が書き込めるのは `.asm`（とバンクファイル）と同じ名前の `.chr` だけで、
+  往復検証が一致した場合に限ります。既存ファイルは、生成後に編集されていない生成ファイルだけを上書きします。
 - stdoutはMCP通信専用です。ログなどを出力しないでください。
 - 1回のアセンブルには時間制限（既定30秒、`E_TIMEOUT`）があります。
 
