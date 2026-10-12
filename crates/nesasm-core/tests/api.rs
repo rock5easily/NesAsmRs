@@ -633,8 +633,8 @@ fn write_disassembly_writes_nothing_when_cancelled() {
 }
 
 /// An 18-bank NROM-style ROM (banks 0 to 17) and its disassembly into
-/// `game.asm` and a file per bank.
-fn eighteen_banks(t: &Temp) -> (Vec<u8>, nesasm_core::disasm::Disassembly) {
+/// `<dir>game.asm` and a file per bank.
+fn eighteen_banks(t: &Temp, dir: &str) -> (Vec<u8>, nesasm_core::disasm::Disassembly) {
     let r = t.run("  .inesprg 9\n  .bank 17\n  .org $FFFA\n  .dw 0, 0, 0\n");
     assert!(r.success, "{:?}", r.diagnostics);
     let mut rom = r.header.clone();
@@ -642,29 +642,32 @@ fn eighteen_banks(t: &Temp) -> (Vec<u8>, nesasm_core::disasm::Disassembly) {
     let config =
         nesasm_core::disasm::parse_config(r#"{"options": {"split_banks": true}}"#).unwrap();
     let never = AtomicBool::new(false);
-    let d = nesasm_core::disasm::disassemble(&rom, None, &config, Path::new("game.asm"), &never)
-        .unwrap();
+    let source = format!("{dir}game.asm");
+    let d =
+        nesasm_core::disasm::disassemble(&rom, None, &config, Path::new(&source), &never).unwrap();
     (rom, d)
 }
 
 /// Writes `d` as versions before hexadecimal bank names did: two spaces of
 /// indentation and decimal names (`game_bank10.asm` for bank 10), with the
-/// checksums of that text.
-fn write_old_format(t: &Temp, d: &nesasm_core::disasm::Disassembly) {
+/// checksums of that text. `dir` is the directory of the source, as given to
+/// [`eighteen_banks`].
+fn write_old_format(t: &Temp, d: &nesasm_core::disasm::Disassembly, dir: &str) {
     let fnv = |text: &str| {
         text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, b| {
             (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         })
     };
     let decimal = |hex: &str| usize::from_str_radix(hex, 16).unwrap();
+    let include = format!("\t.include \"{dir}game_bank");
     for (path, text) in d.files() {
         let (_, body) = text.split_once('\n').unwrap();
         let body: String = body
             .lines()
-            .map(|line| match line.strip_prefix("\t.include \"game_bank") {
+            .map(|line| match line.strip_prefix(&include) {
                 Some(rest) => {
                     let bank = decimal(rest.trim_end_matches(".asm\""));
-                    format!("  .include \"game_bank{bank:02}.asm\"\n")
+                    format!("  .include \"{dir}game_bank{bank:02}.asm\"\n")
                 }
                 None => match line.strip_prefix('\t') {
                     Some(rest) => format!("  {rest}\n"),
@@ -673,7 +676,7 @@ fn write_old_format(t: &Temp, d: &nesasm_core::disasm::Disassembly) {
             })
             .collect();
         let name = match body.lines().next().unwrap().strip_prefix("  .bank ") {
-            Some(bank) => format!("game_bank{:02}.asm", bank.parse::<usize>().unwrap()),
+            Some(bank) => format!("{dir}game_bank{:02}.asm", bank.parse::<usize>().unwrap()),
             None => path.to_string_lossy().into_owned(),
         };
         let marker = format!(
@@ -692,8 +695,8 @@ fn first_body_line(t: &Temp, name: &str) -> String {
 #[test]
 fn export_disassembly_migrates_decimal_bank_file_names() {
     let t = Temp::new();
-    let (rom, d) = eighteen_banks(&t);
-    write_old_format(&t, &d);
+    let (rom, d) = eighteen_banks(&t, "");
+    write_old_format(&t, &d, "");
     assert_eq!(first_body_line(&t, "game_bank10.asm"), "  .bank 10");
     let never = AtomicBool::new(false);
     let export =
@@ -756,8 +759,8 @@ fn export_disassembly_migrates_decimal_bank_file_names() {
 #[test]
 fn export_disassembly_does_not_mix_up_banks_of_old_names() {
     let t = Temp::new();
-    let (rom, d) = eighteen_banks(&t);
-    write_old_format(&t, &d);
+    let (rom, d) = eighteen_banks(&t, "");
+    write_old_format(&t, &d, "");
     let never = AtomicBool::new(false);
     let export =
         || nesasm_core::export_disassembly(&d, &t.0, Some(&t.0), Path::new("game.nes"), &never);
@@ -821,4 +824,62 @@ fn export_disassembly_does_not_mix_up_banks_of_old_names() {
         "{e}"
     );
     assert_eq!(fs::read(t.0.join("other.asm")).unwrap(), bank0);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_disassembly_does_not_remove_through_links() {
+    let t = Temp::new();
+    let (_, d) = eighteen_banks(&t, "");
+    write_old_format(&t, &d, "");
+    // The old main file includes game_bank13.asm, a link to an unedited bank
+    // file of another source whose name has the same prefix.
+    let other = t.0.join("game_bank_backup_bank0D.asm");
+    fs::rename(t.0.join("game_bank13.asm"), &other).unwrap();
+    let backup = fs::read(&other).unwrap();
+    std::os::unix::fs::symlink(&other, t.0.join("game_bank13.asm")).unwrap();
+    let never = AtomicBool::new(false);
+    let e = nesasm_core::export_disassembly(&d, &t.0, Some(&t.0), Path::new("game.nes"), &never)
+        .unwrap();
+    assert_eq!(e.removed.len(), 5, "{:?}", e.removed);
+    assert!(
+        !e.removed
+            .iter()
+            .any(|p| p.ends_with("game_bank13.asm") || p.ends_with("game_bank_backup_bank0D.asm")),
+        "{:?}",
+        e.removed
+    );
+    assert_eq!(fs::read(&other).unwrap(), backup);
+    assert!(
+        fs::symlink_metadata(t.0.join("game_bank13.asm"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn export_disassembly_migrates_files_with_long_paths() {
+    // A directory below 260 characters whose files are longer: on Windows,
+    // their canonical paths keep the `\\?\` prefix and the directory's does not.
+    let t = Temp::new();
+    let root = fs::canonicalize(&t.0).unwrap();
+    let root = root.to_string_lossy();
+    let length = root.strip_prefix(r"\\?\").unwrap_or(&root).len();
+    let mut dir = String::new();
+    while length + 1 + dir.len() < 250 {
+        dir.push(if dir.len() % 50 == 49 { '/' } else { 'd' });
+    }
+    if dir.ends_with('/') {
+        dir.push('d');
+    }
+    dir.push('/');
+    let (_, d) = eighteen_banks(&t, &dir);
+    write_old_format(&t, &d, &dir);
+    let never = AtomicBool::new(false);
+    // Without a root: with one, such paths fail its check (a separate limit).
+    let e = nesasm_core::export_disassembly(&d, &t.0, None, Path::new("game.nes"), &never).unwrap();
+    assert_eq!(e.removed.len(), 6, "{:?}", e.removed);
+    let text = fs::read_to_string(t.0.join(&dir).join("game_bank10.asm")).unwrap();
+    assert_eq!(text.lines().nth(1), Some("\t.bank 16"));
 }

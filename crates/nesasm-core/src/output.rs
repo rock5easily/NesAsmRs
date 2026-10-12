@@ -229,14 +229,23 @@ pub fn export_disassembly(
         Err(e) => return Err(e.to_string()),
     };
     let main_replaceable = main_text.as_deref().and_then(source_role) == Some(SourceRole::Main);
-    // The bank files generated with the main file that is replaced.
-    let previous: Vec<PathBuf> = main_text
+    // The bank files generated with the main file that is replaced, as
+    // resolved (to compare with the files written) and as named in their
+    // directory. A link is left out: resolving it names its target, which may
+    // belong to another source and must not be replaced or removed with this one.
+    let previous: Vec<(PathBuf, PathBuf)> = main_text
         .as_deref()
         .filter(|_| main_replaceable)
         .map(source_includes)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|path| resolve_path(Path::new(&path), base, root).ok())
+        .filter_map(|path| {
+            let path = Path::new(&path);
+            let resolved = resolve_path(path, base, root).ok()?;
+            let named = in_directory(path, base, root)?;
+            let file = fs::symlink_metadata(&named).is_ok_and(|m| m.file_type().is_file());
+            file.then_some((resolved, named))
+        })
         .collect();
     for (kind, path, _, role) in &files {
         if let Some(root) = root {
@@ -273,7 +282,7 @@ pub fn export_disassembly(
                 match (existing, role) {
                     (Some(existing), Some(role)) if existing == *role => true,
                     (Some(SourceRole::Bank(_)), Some(SourceRole::Bank(_)))
-                        if previous.contains(path) =>
+                        if previous.iter().any(|(resolved, _)| resolved == path) =>
                     {
                         true
                     }
@@ -303,16 +312,23 @@ pub fn export_disassembly(
             ));
         }
     }
-    // Bank files of the replaced main file that are not written again.
+    // Bank files of the replaced main file that are not written again, in
+    // the directory of the main file. Directories are compared as resolved
+    // themselves: on Windows, a resolved file path keeps the `\\?\` prefix
+    // when it is too long without it, which its directory may not need.
     let prefix = format!(
         "{}_bank",
         main.file_stem().unwrap_or_default().to_string_lossy()
     );
+    let main_directory = in_directory(disassembly.source_path(), base, root)
+        .and_then(|path| path.parent().map(Path::to_owned));
     let stale: Vec<PathBuf> = previous
         .into_iter()
-        .filter(|path| files.iter().all(|(_, p, _, _)| p != path))
+        .filter(|(resolved, _)| files.iter().all(|(_, p, _, _)| p != resolved))
+        .map(|(_, named)| named)
         .filter(|path| {
-            path.parent() == main.parent()
+            main_directory.is_some()
+                && path.parent() == main_directory.as_deref()
                 && path
                     .file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
@@ -358,6 +374,20 @@ pub fn export_disassembly(
         }
     }
     Ok(export)
+}
+
+/// `path` relative to `base`, with its directory resolved but not its last
+/// component, which may be a link.
+fn in_directory(path: &Path, base: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Some(
+        resolve_path(directory, base, root)
+            .ok()?
+            .join(path.file_name()?),
+    )
 }
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
