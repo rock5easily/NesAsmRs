@@ -51,6 +51,8 @@ pub(crate) struct Memory {
     /// The 16 iNES header bytes, empty for raw files.
     pub header: Vec<u8>,
     pub trainer: bool,
+    /// The trainer's bytes, which the source cannot reproduce.
+    pub trainer_bytes: Vec<u8>,
     pub banks: Vec<BankImage>,
     /// Bytes of ROM data (without header and trainer).
     pub payload_len: usize,
@@ -176,6 +178,13 @@ impl Memory {
             format,
             header,
             trainer: rom.header.as_ref().is_some_and(|h| h.trainer),
+            trainer_bytes: if rom.header.as_ref().is_some_and(|h| h.trainer) {
+                file.get(HEADER_SIZE..HEADER_SIZE + 512)
+                    .unwrap_or_default()
+                    .to_vec()
+            } else {
+                Vec::new()
+            },
             banks,
             payload_len: payload.len(),
         })
@@ -256,21 +265,20 @@ impl Memory {
     ) -> Result<(Loc, usize), String> {
         let loc = self.locate(bank, start)?;
         let length = match (end, length) {
-            (Some(end), None) if end.0 >= start.0 => end.0 - start.0 + 1,
-            (None, Some(length)) if length > 0 => length,
+            (Some(end), None) if end.0 >= start.0 => u64::from(end.0 - start.0) + 1,
+            (None, Some(length)) if length > 0 => u64::from(length),
             (Some(_), None) => return Err("end is before start".into()),
             _ => return Err("give either end or a nonzero length".into()),
         };
         let bank = &self.banks[loc.bank];
-        let end = loc.offset + length as usize;
-        if end > bank.end {
+        if loc.offset as u64 + length > bank.end as u64 {
             return Err(format!(
                 "the range runs past the end of bank {} (${:04X})",
                 loc.bank,
                 bank.org + bank.end as u32 - 1
             ));
         }
-        Ok((loc, end))
+        Ok((loc, loc.offset + length as usize))
     }
 
     pub fn prg_banks(&self) -> impl Iterator<Item = &BankImage> {
@@ -462,6 +470,13 @@ impl Analysis {
             }
         };
         for entry in &config.entry_points {
+            if entry.inline_bytes > BANK_SIZE {
+                errors.push(format!(
+                    "entry_points {}: inline_bytes must be at most {BANK_SIZE}",
+                    entry.address
+                ));
+                continue;
+            }
             match self.memory.locate(entry.bank, entry.address) {
                 Ok(loc) => {
                     if let Some(name) = &entry.name {
@@ -506,6 +521,13 @@ impl Analysis {
             }
             if symbol.size == Some(0) {
                 errors.push(format!("Symbol {} size must be at least 1", symbol.name));
+            }
+            if u64::from(symbol.value.0) + u64::from(symbol.size.unwrap_or(1)) > 0x10000 {
+                errors.push(format!(
+                    "Symbol {} covers addresses past $FFFF",
+                    symbol.name
+                ));
+                continue;
             }
             self.symbols.push(SymbolEntry {
                 name: symbol.name.clone(),

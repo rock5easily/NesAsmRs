@@ -40,11 +40,14 @@ impl Patches {
             .base
             .as_ref()
             .map_or(String::new(), |p| p.to_string_lossy().replace('\\', "/"));
-        let base = Memory::new(base_file, config).map_err(|e| vec![format!("base: {e}")])?;
         let memory = &a.memory;
         if memory.format == RomFormat::Fragment {
             return Err(vec!["base cannot be combined with load_address".into()]);
         }
+        // Only the bytes are compared, so the base keeps the default layout
+        // (`banks` may name banks only an expanded hack has).
+        let base = Memory::new(base_file, &DisasmConfig::default())
+            .map_err(|e| vec![format!("base: {e}")])?;
         if base.format != memory.format {
             return Err(vec![
                 "base must have the same format as rom (both .nes or both raw .bin)".into(),

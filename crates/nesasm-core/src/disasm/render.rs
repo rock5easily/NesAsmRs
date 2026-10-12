@@ -6,7 +6,7 @@ use super::config::{ChrMode, RegionType};
 use super::patch::Patches;
 use super::{Address, RomFormat, SourceLine};
 use crate::opcode::Mode;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// First line of every generated source.
@@ -30,11 +30,24 @@ pub(crate) struct Rendered {
 
 /// FNV-1a over the text after the marker line, with LF line endings.
 pub(crate) fn checksum(body: &str) -> u64 {
-    body.bytes()
-        .filter(|b| *b != b'\r')
-        .fold(0xcbf2_9ce4_8422_2325, |hash, b| {
-            (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        })
+    fnv(body.bytes().filter(|b| *b != b'\r'))
+}
+
+fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+    bytes.fold(0xcbf2_9ce4_8422_2325, |hash, b| {
+        (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Line of the main source recording the CHR file's checksum.
+const CHR_LINE: &str = "; CHR file checksum ";
+
+/// Whether `chr` is the CHR file the generated source `text` records.
+pub(crate) fn is_unedited_chr(text: &str, chr: &[u8]) -> bool {
+    text.lines()
+        .find_map(|line| line.trim_end().strip_prefix(CHR_LINE))
+        .and_then(|sum| u64::from_str_radix(sum, 16).ok())
+        .is_some_and(|sum| sum == fnv(chr.iter().copied()))
 }
 
 /// Whether `text` is a generated source that has not been edited since.
@@ -114,6 +127,24 @@ pub(crate) fn render(
         patches,
         used_labels: BTreeSet::new(),
     };
+    // Names in operand overrides must be defined too.
+    let names: HashMap<&str, Loc> = a
+        .labels
+        .iter()
+        .flat_map(|(loc, labels)| labels.iter().map(move |l| (l.name.as_str(), *loc)))
+        .collect();
+    for (loc, expr) in &a.operands {
+        if patches.is_some_and(|p| p.range_at(*loc).is_none()) {
+            continue;
+        }
+        for word in expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if let Some(label) = names.get(word) {
+                w.used_labels.insert(*label);
+            } else if a.symbols.iter().any(|s| s.name == word) {
+                w.used.insert(word.to_owned());
+            }
+        }
+    }
     for bank in a.memory.prg_banks() {
         w.prg_bank(bank.index);
     }
@@ -130,7 +161,10 @@ pub(crate) fn render(
             text,
         })
     };
-    push(format!("; Source: {rom_name}"));
+    push(format!("; Source: {}", one_line(rom_name)));
+    if let Some(data) = &chr {
+        push(format!("{CHR_LINE}{:016x}", fnv(data.iter().copied())));
+    }
     if let Some(p) = patches {
         push(format!(
             "; Changed ranges are disassembled; the rest is included from {}.",
@@ -617,13 +651,23 @@ impl Writer<'_> {
     }
 
     fn pointer(&mut self, element: Loc, stored: u32, region: &Region) -> String {
-        let target = (i64::from(stored) - i64::from(region.adjust)).rem_euclid(0x10000) as u32;
-        match self.a.target_of(element, target) {
+        self.adjusted_target(element, stored, region.adjust)
+            .unwrap_or_else(|| hex4(stored))
+    }
+
+    /// `label+adjust` for a stored table value, unless the value wraps
+    /// around $FFFF (the expression would then not fit).
+    fn adjusted_target(&mut self, from: Loc, stored: u32, adjust: i32) -> Option<String> {
+        let target = (i64::from(stored) - i64::from(adjust)).rem_euclid(0x10000);
+        if target + i64::from(adjust) != i64::from(stored) {
+            return None;
+        }
+        let name = match self.a.target_of(from, target as u32) {
             Target::Rom(t) => self.rom_name(t),
             Target::Outside(v) => self.symbol(v),
             Target::Ambiguous(_) => None,
-        }
-        .map_or_else(|| hex4(stored), |name| adjusted(&name, region.adjust))
+        }?;
+        Some(adjusted(&name, adjust))
     }
 
     /// A byte of a low/high table as `LOW(label)` / `HIGH(label)`.
@@ -642,27 +686,18 @@ impl Writer<'_> {
             return raw;
         };
         let low_loc = element.at(low.start + index);
-        let Some((_, address)) = self
-            .a
-            .table_entries(&low)
-            .into_iter()
-            .find(|(from, _)| *from == low_loc)
-        else {
-            return raw;
-        };
-        let name = match self.a.target_of(low_loc, address) {
-            Target::Rom(t) => self.rom_name(t),
-            Target::Outside(v) => self.symbol(v),
-            Target::Ambiguous(_) => None,
-        };
+        let high = element.at(low.pair.unwrap_or(low.start) + index);
+        let stored = u32::from(u16::from_le_bytes([
+            self.a.memory.byte(low_loc),
+            self.a.memory.byte(high),
+        ]));
         let function = if region.kind == RegionType::LowBytes {
             "LOW"
         } else {
             "HIGH"
         };
-        name.map_or(raw, |name| {
-            format!("{function}({})", adjusted(&name, low.adjust))
-        })
+        self.adjusted_target(low_loc, stored, low.adjust)
+            .map_or(raw, |expr| format!("{function}({expr})"))
     }
 
     fn text(&self, loc: Loc, limit: usize) -> (Vec<String>, usize) {

@@ -246,7 +246,8 @@ pub struct Verification {
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Mismatch {
-    /// ROM bank; absent for the iNES header (address is then the header offset).
+    /// ROM bank; absent for the iNES header and trainer (address is then the
+    /// offset in the file).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     pub address: Address,
@@ -291,6 +292,19 @@ pub fn disassemble(
     cancel: &AtomicBool,
 ) -> Result<Disassembly, Vec<Diagnostic>> {
     let errors = |errors: Vec<String>| errors.into_iter().map(error).collect::<Vec<_>>();
+    // Paths are written into `.include`/`.incbin` strings.
+    for path in [Some(source), config.base.as_deref()].into_iter().flatten() {
+        if path
+            .to_string_lossy()
+            .chars()
+            .any(|c| c == '"' || c.is_control())
+        {
+            return Err(vec![error(format!(
+                "Path '{}' contains a quote or control character",
+                path.display()
+            ))]);
+        }
+    }
     let mut analysis = Analysis::run(rom_file, config, cancel).map_err(errors)?;
     let patches = match (base_file, &config.base) {
         (Some(base), Some(_)) => Some(Patches::new(&analysis, base, config).map_err(errors)?),
@@ -333,6 +347,12 @@ pub fn disassemble(
 /// since (its marker line's checksum still matches).
 pub fn is_unedited_source(text: &str) -> bool {
     render::is_unedited(text)
+}
+
+/// Whether `chr` is the CHR file the generated main source `text` records
+/// (it was not changed since).
+pub fn is_unedited_chr(text: &str, chr: &[u8]) -> bool {
+    render::is_unedited_chr(text, chr)
 }
 
 pub struct Disassembly {
@@ -775,6 +795,15 @@ impl Disassembly {
                 if e != a {
                     differ(None, i as u32, e, a);
                 }
+            }
+            // The source cannot produce a trainer.
+            for (i, byte) in memory.trainer_bytes.iter().enumerate() {
+                differ(
+                    None,
+                    (crate::inspect::HEADER_SIZE + i) as u32,
+                    Some(*byte),
+                    None,
+                );
             }
         }
         let mut expected = vec![None; result.binary.len()];

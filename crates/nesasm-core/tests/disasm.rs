@@ -886,3 +886,150 @@ fn rom_hack_annotation_errors() {
         "patches $1000: No PRG bank holds $1000",
     );
 }
+
+#[test]
+fn trainers_fail_verification() {
+    let mut rom = nrom("Reset:\nNmi:\n  rti");
+    rom[6] |= 0x04;
+    let trainer: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+    rom.splice(16..16, trainer);
+    let d = disasm::disassemble(
+        &rom,
+        None,
+        &DisasmConfig::default(),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .unwrap();
+    assert_lines(&d, &["  .inesmir 4"]);
+    let t = Temp::new();
+    let v = d.verify(&t.0, Some(&t.0), &NEVER);
+    assert!(!v.matched);
+    assert_eq!(v.mismatch_count, 512);
+    let m = &v.mismatches[0];
+    assert_eq!(
+        (m.bank, m.address, m.actual.as_str()),
+        (None, Address(16), "none")
+    );
+}
+
+#[test]
+fn huge_annotation_values_are_errors() {
+    let rom = nrom("Reset:\n  jsr Sub\nNmi:\n  rti\nSub:\n  rts");
+    for (json, message) in [
+        (
+            r#"{"regions": [{"start": "$E000", "end": "$FFFFFFFF"}]}"#,
+            "regions $E000: the range runs past the end of bank 1 ($FFFF)",
+        ),
+        (
+            r#"{"entry_points": [{"address": "$E004", "inline_bytes": 18446744073709551615}]}"#,
+            "entry_points $E004: inline_bytes must be at most 8192",
+        ),
+        (
+            r#"{"symbols": [{"name": "buf", "value": 1, "size": 4294967295}]}"#,
+            "Symbol buf covers addresses past $FFFF",
+        ),
+    ] {
+        let e = disasm::disassemble(&rom, None, &config(json), Path::new("out.asm"), &NEVER)
+            .err()
+            .unwrap_or_else(|| panic!("{json} should fail"));
+        assert!(
+            e.iter().any(|d| d.message == message),
+            "{json}: {:?}",
+            e.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+    let bin: Vec<u8> = vec![0xea; 16];
+    let e = disasm::disassemble(
+        &bin,
+        None,
+        &config(r#"{"load_address": 0, "regions": [{"start": 0, "end": "$FFFFFFFF"}]}"#),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        e[0].message
+            .contains("the range runs past the end of bank 0"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn paths_cannot_add_source_lines() {
+    let rom = nrom("Reset:\nNmi:\n  rti");
+    let c = DisasmConfig {
+        rom: PathBuf::from("a\n  .include \"extra.asm\"\n;b.nes"),
+        ..Default::default()
+    };
+    let d = round_trip(&rom, &c);
+    assert!(
+        d.text()
+            .lines()
+            .any(|l| l == "; Source: a .include \"extra.asm\" ;b.nes"),
+        "{}",
+        d.text()
+    );
+    for (source, base) in [("out\".asm", None), ("out.asm", Some("base\n.nes"))] {
+        let c = DisasmConfig {
+            base: base.map(PathBuf::from),
+            ..Default::default()
+        };
+        let e = disasm::disassemble(&rom, Some(&rom), &c, Path::new(source), &NEVER)
+            .err()
+            .unwrap();
+        assert!(
+            e[0].message
+                .contains("contains a quote or control character"),
+            "{e:?}"
+        );
+    }
+}
+
+#[test]
+fn names_in_operand_overrides_are_defined() {
+    let rom = nrom("Reset:\n  lda #0\n  sta $2001\nNmi:\n  rti");
+    // PPUMASK is used only by the override.
+    let d = round_trip(
+        &rom,
+        &config(
+            r#"{"operands": [{"address": "$E002", "expr": "PPUMASK"}], "options": {"nes_registers": true}}"#,
+        ),
+    );
+    assert_lines(&d, &["PPUMASK         = $2001", "  sta PPUMASK"]);
+    // In a ROM hack, a label of an unchanged range named only by an override.
+    let (base, hack) = hack_roms();
+    let d = patch_round_trip(
+        &hack,
+        &base,
+        r#"{"labels": [{"address": "$E00E", "name": "Handler"}],
+            "operands": [{"address": "$E105", "expr": "Handler-3"}]}"#,
+    );
+    assert_lines(&d, &["Handler         = $E00E", "  jmp Handler-3"]);
+}
+
+#[test]
+fn adjusted_pointers_that_wrap_are_numbers() {
+    let mut c = config(
+        r#"{"load_address": "$0300", "symbols": [{"name": "Last", "value": "$FFFF"}],
+            "regions": [{"start": "$0300", "length": 2, "type": "pointers", "adjust": 514},
+                        {"start": "$0302", "length": 1, "type": "low_bytes", "pair": "$0303", "adjust": 514},
+                        {"start": "$0303", "length": 1, "type": "high_bytes"}]}"#,
+    );
+    c.rom = PathBuf::from("pointer.bin");
+    let d = round_trip(&[0x01, 0x02, 0x01, 0x02], &c);
+    assert_lines(&d, &["  .dw $0201", "  .db $01", "  .db $02"]);
+}
+
+#[test]
+fn rom_hack_banks_may_name_new_banks() {
+    let base = nrom(HACK_BASE);
+    let mut hack = base[..16].to_vec();
+    hack[4] = 2;
+    hack.extend(&base[16..]);
+    hack.extend(vec![0x60; 16384]);
+    // Bank 3 exists only in the hack.
+    let d = patch_round_trip(&hack, &base, r#"{"banks": [{"bank": 3, "org": "$A000"}]}"#);
+    assert_eq!(d.summary().diff.unwrap().new_banks, [2, 3]);
+}

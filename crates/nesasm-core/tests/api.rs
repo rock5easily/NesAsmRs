@@ -436,7 +436,15 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
     assert_eq!(kinds, [ArtifactKind::Source, ArtifactKind::Chr]);
     assert_eq!(fs::read(t.0.join("gen/game.chr")).unwrap(), vec![0; 8192]);
     assert_eq!(serde_json::to_value(ArtifactKind::Chr).unwrap(), "chr");
-    // Unedited output is replaced.
+    // Unedited output is replaced; an edited CHR file is kept.
+    write().unwrap();
+    fs::write(t.0.join("gen/game.chr"), vec![1; 8192]).unwrap();
+    let e = write().unwrap_err();
+    assert!(
+        e.contains("game.chr exists and is not an unedited generated file"),
+        "{e}"
+    );
+    fs::write(t.0.join("gen/game.chr"), vec![0; 8192]).unwrap();
     write().unwrap();
     // The CHR file is replaced only with its generated source.
     fs::remove_file(t.0.join("gen/game.asm")).unwrap();
@@ -479,4 +487,36 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
     .unwrap();
     let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes")).unwrap_err();
     assert_eq!(e, "Source output must have a .asm extension");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_disassembly_does_not_follow_links_to_other_files() {
+    let t = Temp::new();
+    let r = t.run(
+        "  .inesprg 1
+  .ineschr 1
+  .bank 1
+  .org $FFFA
+  .dw 0, 0, 0
+  .bank 2
+",
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    let never = AtomicBool::new(false);
+    let d = nesasm_core::disasm::disassemble(
+        &rom,
+        None,
+        &nesasm_core::disasm::DisasmConfig::default(),
+        Path::new("game.asm"),
+        &never,
+    )
+    .unwrap();
+    t.write("backup.nes", b"keep");
+    std::os::unix::fs::symlink(t.0.join("backup.nes"), t.0.join("game.chr")).unwrap();
+    let e = nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes")).unwrap_err();
+    assert!(e.contains("backup.nes is not a .chr file"), "{e}");
+    assert_eq!(fs::read(t.0.join("backup.nes")).unwrap(), b"keep");
 }

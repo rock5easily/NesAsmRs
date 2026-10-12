@@ -184,17 +184,35 @@ pub fn write_disassembly(
         ));
     }
     let main = files[0].1.clone();
-    let main_replaceable = match fs::read(&main) {
-        Ok(text) => crate::disasm::is_unedited_source(&String::from_utf8_lossy(&text)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+    let main_text = match fs::read(&main) {
+        Ok(text) => Some(String::from_utf8_lossy(&text).into_owned()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.to_string()),
     };
+    let main_replaceable = main_text
+        .as_deref()
+        .is_some_and(crate::disasm::is_unedited_source);
     for (kind, path, _) in &files {
         if let Some(root) = root {
             check_not_hidden(path, root)?;
         }
         if *path == rom {
             return Err("Output would overwrite the ROM".into());
+        }
+        // A link must not lead to another kind of file, such as a ROM.
+        let expected = if *kind == ArtifactKind::Chr {
+            "chr"
+        } else {
+            "asm"
+        };
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(expected))
+        {
+            return Err(format!(
+                "Output path {} is not a .{expected} file",
+                path.display()
+            ));
         }
         if path.is_dir() {
             return Err(format!("Output path is a directory: {}", path.display()));
@@ -207,7 +225,13 @@ pub fn write_disassembly(
                 let text = fs::read(path).map_err(|e| e.to_string())?;
                 crate::disasm::is_unedited_source(&String::from_utf8_lossy(&text))
             }
-            _ => main_replaceable,
+            _ => {
+                let data = fs::read(path).map_err(|e| e.to_string())?;
+                main_replaceable
+                    && main_text
+                        .as_deref()
+                        .is_some_and(|text| crate::disasm::is_unedited_chr(text, &data))
+            }
         };
         if !replaceable {
             return Err(format!(
