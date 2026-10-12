@@ -933,7 +933,22 @@ impl Analysis {
                     self.memory.byte(from),
                     self.memory.byte(from.at(from.offset + 1)),
                 ]));
-                let target = self.resolve_from(from, address);
+                // A pointer table (the automatic one or the annotations')
+                // records the reference and its issues in seed_tables.
+                let table = !covered[i]
+                    || self
+                        .region_at(from)
+                        .is_some_and(|r| r.kind == RegionType::Pointers);
+                let target = if table {
+                    self.target_of(from, address)
+                } else {
+                    let before = self.issues.len();
+                    let target = self.resolve_from(from, address);
+                    for issue in &mut self.issues[before..] {
+                        issue.spans = vec![(from.offset, 2)];
+                    }
+                    target
+                };
                 if let Target::Rom(loc) = target {
                     self.vectors.entry(loc).or_insert(name);
                     if covered[i] {
@@ -941,7 +956,7 @@ impl Analysis {
                         self.want(loc, Want::Jump);
                     }
                 }
-                if covered[i] {
+                if !table {
                     self.refs.push(Ref {
                         from,
                         kind: XrefKind::Pointer,
@@ -966,11 +981,14 @@ impl Analysis {
             for (from, address) in self.table_entries(&table) {
                 let before = self.issues.len();
                 let target = self.resolve_from(from, address);
-                // The high byte of a split table entry is part of it too.
-                if let (RegionType::LowBytes, Some(high)) = (table.kind, table.pair) {
-                    let offset = high + from.offset - table.start;
-                    for issue in &mut self.issues[before..] {
-                        issue.spans.push((offset, 1));
+                // Issues concern every byte of the entry: both bytes of a
+                // pointer, the high byte of a split entry too.
+                for issue in &mut self.issues[before..] {
+                    match (table.kind, table.pair) {
+                        (RegionType::LowBytes, Some(high)) => {
+                            issue.spans.push((high + from.offset - table.start, 1));
+                        }
+                        _ => issue.spans = vec![(from.offset, 2)],
                     }
                 }
                 if let Target::Rom(loc) = target {

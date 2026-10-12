@@ -1381,3 +1381,39 @@ fn labels_inside_words_and_instructions_keep_comments() {
         &["  bit $02A9", "; skipped by BIT", "Second = L_E002+1"],
     );
 }
+
+#[test]
+fn vector_references_are_reported_once() {
+    // Banks 0 and 1 both at $8000; the NMI vector in bank 3 points to $8000.
+    let mut bin = vec![0u8; 4 * 8192];
+    bin[3 * 8192 + 0x1ffa] = 0x00;
+    bin[3 * 8192 + 0x1ffb] = 0x80;
+    let banks = r#""banks": [{"bank": 1, "org": "$8000"}]"#;
+    let expected = ["$FFFA $8000 is held by banks 0, 1; add a references entry with target_bank"];
+    for regions in [
+        "[]",
+        r#"[{"start": "$FFFA", "length": 2, "type": "bytes"}]"#,
+        r#"[{"start": "$FFFA", "length": 6, "type": "pointers"}]"#,
+        r#"[{"start": "$FFFA", "length": 6, "type": "pointers", "code_targets": true}]"#,
+    ] {
+        let d = round_trip(
+            &bin,
+            &config(&format!(r#"{{{banks}, "regions": {regions}}}"#)),
+        );
+        assert_eq!(issues(&d, IssueKind::UnresolvedBank), expected, "{regions}");
+        assert_eq!(d.xrefs("$8000").unwrap().len(), 1, "{regions}");
+    }
+    // Either byte of the vector in a ROM hack range keeps the issue.
+    let t = Temp::new();
+    t.write("base.bin", &bin);
+    for patch in ["$FFFA", "$FFFB"] {
+        let mut c = config(&format!(
+            r#"{{{banks}, "regions": [{{"start": "$FFFA", "length": 2, "type": "bytes"}}],
+                "patches": [{{"bank": 3, "start": "{patch}", "length": 1}}]}}"#
+        ));
+        c.base = Some(PathBuf::from("base.bin"));
+        let d = disasm::disassemble(&bin, Some(&bin), &c, Path::new("out.asm"), &NEVER).unwrap();
+        assert!(d.verify(&t.0, Some(&t.0), &NEVER).matched);
+        assert_eq!(issues(&d, IssueKind::UnresolvedBank), expected, "{patch}");
+    }
+}
