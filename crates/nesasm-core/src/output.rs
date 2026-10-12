@@ -510,9 +510,21 @@ fn commit_all(
         let previous = backup.as_ref().map_or_else(String::new, |backup| {
             format!(" (its previous content is in {})", backup.display())
         });
-        if placed && (placed_stamp.is_none() || stamp(&path) != placed_stamp) {
+        // Whatever is at the destination now, if it is not the new file.
+        let other = if placed {
+            match (placed_stamp, stamp(&path)) {
+                (Some(placed), Some(current)) if placed == current => None,
+                (Some(_), Some(_)) => Some("replaced by another program since"),
+                _ => Some("could not be checked for changes by another program"),
+            }
+        } else if backup.is_some() && fs::symlink_metadata(&path).is_ok() {
+            Some("created by another program since")
+        } else {
+            None
+        };
+        if let Some(other) = other {
             kept.push(format!(
-                "{}: replaced by another program since, so left as it is{previous}",
+                "{}: {other}, so left as it is{previous}",
                 path.display()
             ));
             continue;
@@ -805,6 +817,49 @@ mod tests {
                  (its previous content is in {})",
                 path("b.asm"),
                 path("a.asm"),
+                path(backup)
+            )
+        );
+    }
+
+    #[test]
+    fn files_created_by_another_program_are_not_overwritten() {
+        // The renames: 1 backs up a, 2 places a, 3 backs up b, and before
+        // 4 fails to place b, another program creates b.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.asm"), "old a").unwrap();
+        fs::write(dir.path().join("b.asm"), "old b").unwrap();
+        let staged = stage(dir.path(), &[("a.asm", b"new a"), ("b.asm", b"new b")]);
+        let b = dir.path().join("b.asm");
+        let mut fail = failing_rename(&[4]);
+        let mut call = 0;
+        let e = commit_all(staged, &mut |from, to| {
+            call += 1;
+            if call == 4 {
+                fs::write(&b, "another b").unwrap();
+            }
+            fail(from, to)
+        })
+        .unwrap_err();
+        let files = contents(dir.path());
+        assert_eq!(files.len(), 3, "{files:?}");
+        let (backup, old) = &files[0];
+        assert!(
+            backup.starts_with(".b.asm.") && backup.ends_with(".bak"),
+            "{backup}"
+        );
+        assert_eq!(old, b"old b");
+        assert_eq!(files[1], ("a.asm".into(), b"old a".to_vec()));
+        assert_eq!(files[2], ("b.asm".into(), b"another b".to_vec()));
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "Could not write {}: rename 4 failed; these changes could not be undone: \
+                 {}: created by another program since, so left as it is \
+                 (its previous content is in {})",
+                path("b.asm"),
+                path("b.asm"),
                 path(backup)
             )
         );
