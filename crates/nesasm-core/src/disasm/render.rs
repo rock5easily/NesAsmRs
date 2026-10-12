@@ -3,6 +3,7 @@
 
 use super::analysis::{Analysis, Class, FILL_RUN, Insn, Loc, Region, Target};
 use super::config::{ChrMode, RegionType};
+use super::patch::Patches;
 use super::{Address, RomFormat, SourceLine};
 use crate::opcode::Mode;
 use std::collections::BTreeSet;
@@ -55,8 +56,12 @@ struct Writer<'a> {
     /// Symbols (outside the ROM) the code refers to.
     used: BTreeSet<String>,
     /// Offsets of each bank where a data line must end: labels, comments,
-    /// operands, region bounds and instructions.
+    /// operands, region bounds, instructions and patch ranges.
     stops: Vec<Vec<usize>>,
+    /// For a ROM hack, the ranges written as source.
+    patches: Option<&'a Patches>,
+    /// ROM locations whose labels the source refers to.
+    used_labels: BTreeSet<Loc>,
 }
 
 /// A path as written in `.include`/`.incbin` (forward slashes).
@@ -70,7 +75,12 @@ fn file_text(lines: &[SourceLine]) -> String {
     format!("{MARKER}; checksum {:016x}\n{body}", checksum(&body))
 }
 
-pub(crate) fn render(a: &Analysis, rom_name: &str, source: &Path) -> Rendered {
+pub(crate) fn render(
+    a: &Analysis,
+    rom_name: &str,
+    source: &Path,
+    patches: Option<&Patches>,
+) -> Rendered {
     let mut stops: Vec<BTreeSet<usize>> = a
         .memory
         .banks
@@ -91,11 +101,18 @@ pub(crate) fn render(a: &Analysis, rom_name: &str, source: &Path) -> Rendered {
     for (loc, insn) in &a.insns {
         stops[loc.bank].extend([loc.offset, loc.offset + insn.len]);
     }
+    for (bank, ranges) in patches.iter().flat_map(|p| p.ranges.iter().enumerate()) {
+        for range in ranges {
+            stops[bank].extend([range.start, range.end]);
+        }
+    }
     let mut w = Writer {
         a,
         lines: Vec::new(),
         used: BTreeSet::new(),
         stops: stops.into_iter().map(|s| s.into_iter().collect()).collect(),
+        patches,
+        used_labels: BTreeSet::new(),
     };
     for bank in a.memory.prg_banks() {
         w.prg_bank(bank.index);
@@ -114,6 +131,12 @@ pub(crate) fn render(a: &Analysis, rom_name: &str, source: &Path) -> Rendered {
         })
     };
     push(format!("; Source: {rom_name}"));
+    if let Some(p) = patches {
+        push(format!(
+            "; Changed ranges are disassembled; the rest is included from {}.",
+            p.path
+        ));
+    }
     match a.memory.format {
         RomFormat::Nes => {
             let h = &a.memory.header;
@@ -145,6 +168,23 @@ pub(crate) fn render(a: &Analysis, rom_name: &str, source: &Path) -> Rendered {
                 text.push_str(&format!(" ; {}", one_line(comment)));
             }
             push(text);
+        }
+    }
+    // Labels of a ROM hack's unchanged ranges, which the source does not contain.
+    let outside: Vec<(String, u32)> = w
+        .used_labels
+        .iter()
+        .filter(|loc| patches.is_some_and(|p| p.range_at(**loc).is_none()))
+        .filter_map(|loc| {
+            let label = a.labels.get(loc)?.first()?;
+            Some((label.name.clone(), a.memory.address(*loc)))
+        })
+        .collect();
+    if !outside.is_empty() {
+        push(String::new());
+        push("; Labels in the unchanged ranges".into());
+        for (name, address) in outside {
+            push(format!("{name:<15} = {}", hex4(address)));
         }
     }
     let size: usize = head.iter().chain(&body).map(|l| l.text.len() + 1).sum();
@@ -270,6 +310,29 @@ impl Writer<'_> {
                 bank: index,
                 offset,
             };
+            if let Some(patches) = self.patches {
+                match patches.range_at(loc) {
+                    Some(range) if range.start == offset => {
+                        if let Some(comment) = &range.comment {
+                            let address = Some(org + offset as u32);
+                            for line in comment.lines() {
+                                let text = format!("; {line}").trim_end().to_owned();
+                                self.push(index, address, 0, text);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        let next = patches.ranges[index]
+                            .iter()
+                            .map(|r| r.start)
+                            .find(|s| *s > offset)
+                            .unwrap_or(end);
+                        offset += self.include_base(loc, next - offset);
+                        continue;
+                    }
+                }
+            }
             self.prelude(loc);
             let size = match self.a.class[index][offset] {
                 Class::Insn => self.instruction(loc),
@@ -277,6 +340,34 @@ impl Writer<'_> {
             };
             offset += size;
         }
+    }
+
+    /// `.incbin` of `size` unchanged bytes from the base ROM.
+    fn include_base(&mut self, loc: Loc, size: usize) -> usize {
+        let patches = self.patches.expect("patch mode");
+        let offset = patches
+            .file_offset(loc.bank, loc.offset)
+            .expect("unchanged bytes have a base bank");
+        let text = format!("  .incbin \"{}\", {offset}, {size}", patches.path);
+        let address = if self.a.memory.banks[loc.bank].chr {
+            loc.offset as u32
+        } else {
+            self.a.memory.address(loc)
+        };
+        self.push(loc.bank, Some(address), size, text);
+        size
+    }
+
+    /// The name of a ROM location, noting that the source uses it.
+    fn rom_name(&mut self, loc: Loc) -> Option<String> {
+        let name = self.a.rom_name(loc)?;
+        let labelled = if self.a.labels.contains_key(&loc) {
+            Some(loc)
+        } else {
+            self.a.containing(loc)
+        };
+        self.used_labels.extend(labelled);
+        Some(name)
     }
 
     /// Comments and labels before the line at `loc`.
@@ -375,7 +466,7 @@ impl Writer<'_> {
             Mode::Imm => format!("#{}", hex2(value)),
             Mode::Zp | Mode::Zpx | Mode::Zpy | Mode::Zi | Mode::Zix | Mode::Ziy => {
                 let expr = match self.a.memory.resolve(Some(loc.bank), value) {
-                    super::analysis::Resolved::Rom(t) => self.a.rom_name(t),
+                    super::analysis::Resolved::Rom(t) => self.rom_name(t),
                     _ => self.symbol(value),
                 }
                 .unwrap_or_else(|| hex2(value));
@@ -414,7 +505,7 @@ impl Writer<'_> {
     /// A name for `value` as referred to from `from`, or the number.
     fn target(&mut self, from: Loc, value: u32) -> String {
         match self.a.target_of(from, value) {
-            Target::Rom(t) => self.a.rom_name(t),
+            Target::Rom(t) => self.rom_name(t),
             Target::Ambiguous(_) => None,
             Target::Outside(v) => self.symbol(v),
         }
@@ -528,7 +619,7 @@ impl Writer<'_> {
     fn pointer(&mut self, element: Loc, stored: u32, region: &Region) -> String {
         let target = (i64::from(stored) - i64::from(region.adjust)).rem_euclid(0x10000) as u32;
         match self.a.target_of(element, target) {
-            Target::Rom(t) => self.a.rom_name(t),
+            Target::Rom(t) => self.rom_name(t),
             Target::Outside(v) => self.symbol(v),
             Target::Ambiguous(_) => None,
         }
@@ -560,7 +651,7 @@ impl Writer<'_> {
             return raw;
         };
         let name = match self.a.target_of(low_loc, address) {
-            Target::Rom(t) => self.a.rom_name(t),
+            Target::Rom(t) => self.rom_name(t),
             Target::Outside(v) => self.symbol(v),
             Target::Ambiguous(_) => None,
         };
@@ -613,6 +704,14 @@ impl Writer<'_> {
             let data = bank.data[bank.start..bank.end].to_vec();
             self.push(index, None, 0, String::new());
             self.push(index, None, 0, format!("  .bank {index}"));
+            let loc = Loc {
+                bank: index,
+                offset: bank.start,
+            };
+            if self.patches.is_some_and(|p| p.range_at(loc).is_none()) {
+                self.include_base(loc, data.len());
+                continue;
+            }
             match self.a.options.chr {
                 ChrMode::Incbin => {
                     let text = format!("  .incbin \"{chr_name}\", {}, {}", file.len(), data.len());
@@ -661,7 +760,7 @@ impl Writer<'_> {
             }
             file.extend(data);
         }
-        (self.a.options.chr == ChrMode::Incbin).then_some(file)
+        (self.a.options.chr == ChrMode::Incbin && !file.is_empty()).then_some(file)
     }
 }
 

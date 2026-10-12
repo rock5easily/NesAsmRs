@@ -8,16 +8,18 @@
 
 mod analysis;
 pub mod config;
+mod patch;
 mod render;
 
 pub use config::{
     Address, BankLayout, ChrMode, CommentDef, CommentPosition, DisasmConfig, DisasmOptions,
-    EntryPoint, LabelDef, OperandDef, ReferenceDef, RegionDef, RegionType, SymbolDef,
+    EntryPoint, LabelDef, OperandDef, PatchDef, ReferenceDef, RegionDef, RegionType, SymbolDef,
 };
 
 use crate::state::BANK_SIZE;
 use crate::{AssembleOptions, AssembleRequest, Diagnostic, DiagnosticCode, SourceLocation};
 use analysis::{Analysis, Class, Loc, Target};
+use patch::Patches;
 use render::Rendered;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
@@ -134,6 +136,52 @@ pub struct Summary {
     pub routines: usize,
     /// Number of issues of each kind.
     pub issues: BTreeMap<IssueKind, usize>,
+    /// For a ROM hack: how it differs from the base ROM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct DiffSummary {
+    /// Bytes that differ from the base ROM (including banks it lacks).
+    pub changed_bytes: usize,
+    /// Ranges written as source; the rest is included from the base ROM.
+    pub ranges: usize,
+    /// Bytes in those ranges.
+    pub source_bytes: usize,
+    /// Banks the base ROM does not have (an expanded ROM).
+    pub new_banks: Vec<usize>,
+}
+
+/// A range of a ROM hack written as source: changed bytes, widened to whole
+/// instructions and the `patches` of the annotations.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct Diff {
+    pub bank: usize,
+    pub chr: bool,
+    /// First and last CPU address (offsets in the bank for CHR banks).
+    pub start: Address,
+    pub end: Address,
+    /// Bytes in the range that differ from the base ROM.
+    pub changed_bytes: usize,
+    pub code_bytes: usize,
+    pub data_bytes: usize,
+    pub unknown_bytes: usize,
+    /// The value the base ROM held throughout the range, when it was free
+    /// space (new code or data rather than a change).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_fill: Option<String>,
+    /// Labels and routines in the range.
+    pub labels: Vec<String>,
+    pub routines: Vec<String>,
+    /// References from outside the range into it, such as hooks into new code.
+    pub referenced_from: Vec<Xref>,
+    /// The first bytes of the ROM and of the base ROM in the range.
+    pub bytes: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub base_bytes: String,
 }
 
 /// A routine: code reached from an entry point or call target without
@@ -177,7 +225,7 @@ pub struct Xref {
     pub kind: XrefKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routine: Option<String>,
-    /// The referring source line.
+    /// The referring source line; empty in a ROM hack's unchanged ranges.
     pub line: String,
 }
 
@@ -231,18 +279,52 @@ fn error(message: impl Into<String>) -> Diagnostic {
 /// Disassembles `rom_file` (the bytes of `config.rom`) as annotated. `source`
 /// is the path of the generated source relative to the working directory; a
 /// CHR file is read from the same stem with `.chr`.
+///
+/// For a ROM hack, `base_file` holds the bytes of `config.base`: only the
+/// ranges that differ (widened by `config.patches`) are disassembled, and the
+/// source includes the rest from the base ROM.
 pub fn disassemble(
     rom_file: &[u8],
+    base_file: Option<&[u8]>,
     config: &DisasmConfig,
     source: &Path,
     cancel: &AtomicBool,
 ) -> Result<Disassembly, Vec<Diagnostic>> {
-    let analysis = Analysis::run(rom_file, config, cancel)
-        .map_err(|errors| errors.into_iter().map(error).collect::<Vec<_>>())?;
-    let rendered = render::render(&analysis, &config.rom.to_string_lossy(), source);
+    let errors = |errors: Vec<String>| errors.into_iter().map(error).collect::<Vec<_>>();
+    let mut analysis = Analysis::run(rom_file, config, cancel).map_err(errors)?;
+    let patches = match (base_file, &config.base) {
+        (Some(base), Some(_)) => Some(Patches::new(&analysis, base, config).map_err(errors)?),
+        (None, None) => {
+            if !config.patches.is_empty() {
+                return Err(vec![error("patches applies only with base")]);
+            }
+            None
+        }
+        (None, Some(_)) => return Err(vec![error("The base ROM was not given")]),
+        (Some(_), None) => return Err(vec![error("A base ROM was given without base")]),
+    };
+    if let Some(patches) = &patches {
+        // Only the changed ranges matter.
+        let memory = &analysis.memory;
+        analysis.issues.retain(|issue| {
+            issue.bank.is_none_or(|bank| {
+                let offset = i64::from(issue.address.0) - i64::from(memory.banks[bank].org);
+                patches.ranges[bank]
+                    .iter()
+                    .any(|r| offset >= r.start as i64 && offset <= r.end as i64)
+            })
+        });
+    }
+    let rendered = render::render(
+        &analysis,
+        &config.rom.to_string_lossy(),
+        source,
+        patches.as_ref(),
+    );
     Ok(Disassembly {
         analysis,
         rendered,
+        patches,
         source: source.to_owned(),
     })
 }
@@ -256,6 +338,7 @@ pub fn is_unedited_source(text: &str) -> bool {
 pub struct Disassembly {
     analysis: Analysis,
     rendered: Rendered,
+    patches: Option<Patches>,
     source: PathBuf,
 }
 
@@ -334,7 +417,108 @@ impl Disassembly {
             labels: a.labels.values().map(Vec::len).sum(),
             routines: a.routines.len(),
             issues,
+            diff: self.patches.as_ref().map(|p| DiffSummary {
+                changed_bytes: p.changed.iter().flatten().filter(|c| **c).count(),
+                ranges: p.ranges.iter().map(Vec::len).sum(),
+                source_bytes: p.ranges.iter().flatten().map(|r| r.end - r.start).sum(),
+                new_banks: (0..p.base_bank.len())
+                    .filter(|b| p.base_bank[*b].is_none())
+                    .collect(),
+            }),
         }
+    }
+
+    /// For a ROM hack, the ranges written as source, with what is known about
+    /// each; empty without a base ROM.
+    pub fn diffs(&self) -> Vec<Diff> {
+        let Some(p) = &self.patches else {
+            return Vec::new();
+        };
+        let a = &self.analysis;
+        let lines = self.line_map();
+        let mut diffs = Vec::new();
+        for (bank, ranges) in p.ranges.iter().enumerate() {
+            let image = &a.memory.banks[bank];
+            for range in ranges {
+                let (start, end) = patch::bounds(a, bank, range);
+                let classes = &a.class[bank][range.start..range.end];
+                let count = |f: fn(&Class) -> bool| {
+                    if image.chr {
+                        0
+                    } else {
+                        classes.iter().filter(|c| f(c)).count()
+                    }
+                };
+                let base = p.base_bank[bank].map(|b| &p.base.banks[b]);
+                let base_data = base.map_or(&[][..], |b| {
+                    &b.data[range.start.max(b.start).min(b.end)..range.end.min(b.end)]
+                });
+                let base_fill = (base_data.len() == range.end - range.start
+                    && base_data.iter().all(|b| *b == base_data[0]))
+                .then(|| format!("{:02X}", base_data[0]));
+                let inside = |loc: &Loc| {
+                    loc.bank == bank && loc.offset >= range.start && loc.offset < range.end
+                };
+                let labels: Vec<String> = a
+                    .labels
+                    .range(
+                        Loc {
+                            bank,
+                            offset: range.start,
+                        }..Loc {
+                            bank,
+                            offset: range.end,
+                        },
+                    )
+                    .flat_map(|(_, labels)| labels.iter().map(|l| l.name.clone()))
+                    .take(MAX_NAMES)
+                    .collect();
+                let routines: BTreeSet<String> = a
+                    .insns
+                    .range(
+                        Loc {
+                            bank,
+                            offset: range.start,
+                        }..Loc {
+                            bank,
+                            offset: range.end,
+                        },
+                    )
+                    .filter_map(|(loc, _)| a.routine_of(*loc))
+                    .map(|head| self.name(head))
+                    .collect();
+                let referenced_from = a
+                    .refs
+                    .iter()
+                    .filter(|r| {
+                        !inside(&r.from) && matches!(&r.target, Target::Rom(t) if inside(t))
+                    })
+                    .take(MAX_NAMES)
+                    .map(|r| self.xref(r, &lines))
+                    .collect();
+                let shown = 16.min(range.end - range.start);
+                diffs.push(Diff {
+                    bank,
+                    chr: image.chr,
+                    start,
+                    end,
+                    changed_bytes: p.changed[bank][range.start..range.end]
+                        .iter()
+                        .filter(|c| **c)
+                        .count(),
+                    code_bytes: count(|c| matches!(c, Class::Insn | Class::Operand)),
+                    data_bytes: count(|c| *c == Class::Data),
+                    unknown_bytes: count(|c| *c == Class::Unknown),
+                    base_fill,
+                    labels,
+                    routines: routines.into_iter().take(MAX_NAMES).collect(),
+                    referenced_from,
+                    bytes: crate::inspect::hex(&image.data[range.start..range.start + shown]),
+                    base_bytes: crate::inspect::hex(&base_data[..shown.min(base_data.len())]),
+                });
+            }
+        }
+        diffs
     }
 
     /// Lines of `bank` (any bank if `None`) whose address is within `from..=to`.
@@ -468,33 +652,46 @@ impl Disassembly {
                     || address.is_some_and(|a| a.0 == *v)
             }
         };
-        let lines: BTreeMap<(usize, u32), &SourceLine> = self
-            .rendered
+        let lines = self.line_map();
+        Ok(a.refs
+            .iter()
+            .filter(|r| matches(&r.target))
+            .map(|r| self.xref(r, &lines))
+            .collect())
+    }
+
+    /// Source lines that produce bytes, by bank and address.
+    fn line_map(&self) -> BTreeMap<(usize, u32), &SourceLine> {
+        self.rendered
             .lines
             .iter()
             .filter(|l| l.size > 0)
             .filter_map(|l| Some(((l.bank?, l.address?.0), l)))
-            .collect();
-        Ok(a.refs
-            .iter()
-            .filter(|r| matches(&r.target))
-            .map(|r| {
-                let at = a.memory.address(r.from);
-                let line = lines
-                    .range(..=(r.from.bank, at))
-                    .next_back()
-                    .filter(|((bank, start), l)| *bank == r.from.bank && at < start + l.size as u32)
-                    .map(|(_, l)| l.text.trim().to_owned())
-                    .unwrap_or_default();
-                Xref {
-                    bank: r.from.bank,
-                    address: Address(at),
-                    kind: r.kind,
-                    routine: a.routine_of(r.from).map(|h| self.name(h)),
-                    line,
-                }
-            })
-            .collect())
+            .collect()
+    }
+
+    fn xref(&self, r: &analysis::Ref, lines: &BTreeMap<(usize, u32), &SourceLine>) -> Xref {
+        let a = &self.analysis;
+        let at = a.memory.address(r.from);
+        // A ROM hack's unchanged ranges have no source lines.
+        let included = self
+            .patches
+            .as_ref()
+            .is_some_and(|p| p.range_at(r.from).is_none());
+        let line = lines
+            .range(..=(r.from.bank, at))
+            .next_back()
+            .filter(|_| !included)
+            .filter(|((bank, start), l)| *bank == r.from.bank && at < start + l.size as u32)
+            .map(|(_, l)| l.text.trim().to_owned())
+            .unwrap_or_default();
+        Xref {
+            bank: r.from.bank,
+            address: Address(at),
+            kind: r.kind,
+            routine: a.routine_of(r.from).map(|h| self.name(h)),
+            line,
+        }
     }
 
     /// Assembles the generated source in memory (with its CHR file) and

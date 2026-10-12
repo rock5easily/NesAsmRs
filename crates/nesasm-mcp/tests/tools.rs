@@ -502,3 +502,75 @@ fn export_writes_verified_sources_and_keeps_edits() {
     );
     assert!(!c.root.join("nes2.asm").exists());
 }
+
+#[test]
+fn rom_hacks_become_patch_sources() {
+    let mut c = Client::start();
+    let body = "Reset:\n  jsr Init\nLoop:\n  jmp Loop\nInit:\n  rts\nNmi:\n  rti\n";
+    let hook = "  .org $E100\nNewInit:\n  lda #1\n  jmp Init\n";
+    for (name, code) in [
+        ("base", body.to_owned()),
+        ("hack", body.replace("jsr Init", "jsr NewInit") + hook),
+    ] {
+        let source = format!(
+            "  .inesprg 1\n  .bank 1\n  .org $E000\n{code}  .org $FFFA\n  .dw Nmi, Reset, Nmi\n"
+        );
+        let r = c.call(
+            "assemble",
+            json!({"input":"src.asm","sources":{"src.asm":source},"output":format!("roms/{name}.nes")}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+    }
+    c.write(
+        "hack.disasm.json",
+        r#"{"rom": "roms/hack.nes", "base": "roms/base.nes"}"#,
+    );
+    let r = c.call("disassemble", json!({"annotations":"hack.disasm.json"}));
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["verification"]["matched"], true, "{r}");
+    assert_eq!(report["summary"]["diff"]["ranges"], 2);
+    let diffs = &report["diffs"]["items"];
+    assert_eq!(diffs[1]["start"], "$E100");
+    assert_eq!(diffs[1]["base_fill"], "00");
+    assert_eq!(diffs[1]["referenced_from"][0]["line"], "jsr sub_E100");
+    let text = Client::text(&r);
+    for line in [
+        "ROM hack: 7 bytes differ from the base ROM; 2 ranges (8 bytes) are source, the rest is included from the base",
+        "Changed ranges: 2",
+        "  bank 1 $E000-$E002: 2 changed; code 3, data 0, unknown 0; labels [RESET]; in [RESET]; from [bank 1 $FFFC pointer]",
+        "  bank 1 $E100-$E104: 5 changed; code 5, data 0, unknown 0; base was free space (00); labels [sub_E100]; in [sub_E100]; from [bank 1 $E000 jsr sub_E100]",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    // The exported source rebuilds the hack from the base ROM.
+    let r = c.call(
+        "export_disassembly",
+        json!({"annotations":"hack.disasm.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let source = std::fs::read_to_string(c.root.join("roms/hack.asm")).unwrap();
+    assert!(
+        source.contains("  .incbin \"roms/base.nes\", 16, 8192"),
+        "{source}"
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"roms/hack.asm","output":"rebuilt.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        std::fs::read(c.root.join("rebuilt.nes")).unwrap(),
+        std::fs::read(c.root.join("roms/hack.nes")).unwrap()
+    );
+    // The base ROM must be inside the root.
+    let r = c.call(
+        "disassemble",
+        json!({"inline":{"rom":"roms/hack.nes","base":"../base.nes"}}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert_eq!(r["structuredContent"]["diagnostics"][0]["code"], "E_IO");
+}

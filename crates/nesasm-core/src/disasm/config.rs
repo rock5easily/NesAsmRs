@@ -89,6 +89,13 @@ pub struct DisasmConfig {
     /// For a raw .bin fragment: the CPU address of its first byte. Required
     /// when the file is not a whole number of 8 KiB banks.
     pub load_address: Option<Address>,
+    /// For a ROM hack: the original ROM (same format) relative to the project
+    /// root. The source then includes unchanged ranges from it with `.incbin`
+    /// and disassembles only the changed ranges.
+    pub base: Option<PathBuf>,
+    /// With `base`: ranges to disassemble besides the changed bytes, to widen
+    /// the source (a whole routine, a table). Changed bytes are always included.
+    pub patches: Vec<PatchDef>,
     /// CPU window ($8000, $A000, $C000 or $E000) of PRG banks; others use the
     /// default layout (the last two banks at $C000/$E000, the rest alternating
     /// $8000/$A000; a single 8 KiB bank at $E000).
@@ -238,6 +245,19 @@ pub struct OperandDef {
     /// The operand as written after the mnemonic (`#LOW(Table)`, `<ptr+1`,
     /// `[ptr],y`) or the data value (`Table-1`). The round-trip check verifies it.
     pub expr: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PatchDef {
+    pub bank: Option<usize>,
+    pub start: Address,
+    /// Last address (inclusive); give this or `length`.
+    pub end: Option<Address>,
+    pub length: Option<u32>,
+    /// Comment placed above the range.
+    pub comment: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

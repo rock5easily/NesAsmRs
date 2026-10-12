@@ -2,8 +2,8 @@ use nesasm_core::{
     Artifact, AssembleOptions, AssembleRequest, AssembleResult, BankUsage, Diagnostic,
     DiagnosticCode, LineRecord, ReferenceTopic, Region, Severity, SourceLocation, Symbol,
     disasm::{
-        self, Address, DisasmConfig, Disassembly, Issue, IssueKind, RamUse, Routine, SourceLine,
-        Summary, Verification, Xref,
+        self, Address, Diff, DisasmConfig, Disassembly, Issue, IssueKind, RamUse, Routine,
+        SourceLine, Summary, Verification, Xref,
     },
     inspect::{Disassembled, HexRow, InesHeader, Rom, Vectors},
 };
@@ -44,6 +44,7 @@ const MAX_ROM_FILE: u64 = 8 * 1024 * 1024;
 /// Largest annotation file the disassembler reads.
 const MAX_ANNOTATIONS_FILE: u64 = 8 * 1024 * 1024;
 const DEFAULT_ISSUE_LIMIT: usize = 20;
+const DEFAULT_DIFF_LIMIT: usize = 20;
 const DEFAULT_ITEM_LIMIT: usize = 100;
 const MAX_ITEM_LIMIT: usize = 1000;
 /// Bytes a view without `to` covers.
@@ -198,6 +199,10 @@ struct DisasmInput {
     output: Option<PathBuf>,
     /// Issues to return (default: the first 20).
     issues: Option<IssueQuery>,
+    /// For a ROM hack (annotations with `base`): the changed ranges written
+    /// as source, with their code/data bytes, labels, routines and references
+    /// from outside (default: the first 20).
+    diffs: Option<PageQuery>,
     /// Generated source lines (with their bytes) in an address range.
     view: Option<ViewQuery>,
     /// References to each label, symbol name or address ("$C000").
@@ -260,6 +265,8 @@ struct DisasmReport {
     artifacts: Vec<Artifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issues: Option<Page<Issue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diffs: Option<Page<Diff>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     view: Option<Page<SourceLine>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -738,6 +745,14 @@ impl Server {
             )]);
         }
         let (rom, bytes) = read_limited(root, &config.rom, MAX_ROM_FILE).map_err(|d| vec![d])?;
+        let base = match &config.base {
+            Some(path) => Some(
+                read_limited(root, path, MAX_ROM_FILE)
+                    .map_err(|d| vec![d])?
+                    .1,
+            ),
+            None => None,
+        };
         let output = output.map_or_else(|| disasm::default_output(&config.rom), Path::to_owned);
         if !output
             .extension()
@@ -752,8 +767,8 @@ impl Server {
         let source = nesasm_core::resolve_path(&output, root, Some(root))
             .map_err(|e| vec![error(DiagnosticCode::Output, e)])?;
         let source = Self::relative(root, &source);
-        let disassembly =
-            disasm::disassemble(&bytes, &config, &source, cancel).map_err(|errors| {
+        let disassembly = disasm::disassemble(&bytes, base.as_deref(), &config, &source, cancel)
+            .map_err(|errors| {
                 errors
                     .into_iter()
                     .map(|d| Diagnostic {
@@ -803,6 +818,16 @@ impl Server {
             DEFAULT_ISSUE_LIMIT,
             MAX_ITEM_LIMIT,
         ));
+        if report.summary.as_ref().is_some_and(|s| s.diff.is_some()) {
+            let page = input.diffs.clone().unwrap_or_default();
+            report.diffs = Some(Page::of(
+                &d.diffs(),
+                page.offset,
+                page.limit,
+                DEFAULT_DIFF_LIMIT,
+                MAX_ITEM_LIMIT,
+            ));
+        }
         if let Some(view) = &input.view {
             let to = view
                 .to
@@ -923,6 +948,18 @@ impl Server {
                     bank.unknown_bytes
                 ));
             }
+            if let Some(diff) = &summary.diff {
+                let new_banks = if diff.new_banks.is_empty() {
+                    String::new()
+                } else {
+                    let banks: Vec<String> = diff.new_banks.iter().map(usize::to_string).collect();
+                    format!("; banks not in the base ROM: {}", banks.join(", "))
+                };
+                text.push(format!(
+                    "ROM hack: {} bytes differ from the base ROM; {} ranges ({} bytes) are source, the rest is included from the base{new_banks}",
+                    diff.changed_bytes, diff.ranges, diff.source_bytes
+                ));
+            }
             if !summary.issues.is_empty() {
                 let counts: Vec<String> = summary
                     .issues
@@ -982,6 +1019,52 @@ impl Server {
                 ));
             }
         }
+        if let Some(page) = report.diffs.as_ref().filter(|p| p.total > 0) {
+            text.push(heading(
+                "Changed ranges",
+                page.total,
+                page.offset,
+                page.items.len(),
+            ));
+            for d in &page.items {
+                let mut entry = format!(
+                    "  {}bank {} {}-{}: {} changed; code {}, data {}, unknown {}",
+                    if d.chr { "CHR " } else { "" },
+                    d.bank,
+                    d.start,
+                    d.end,
+                    d.changed_bytes,
+                    d.code_bytes,
+                    d.data_bytes,
+                    d.unknown_bytes
+                );
+                if let Some(fill) = &d.base_fill {
+                    entry.push_str(&format!("; base was free space ({fill})"));
+                }
+                if !d.labels.is_empty() {
+                    entry.push_str(&format!("; labels [{}]", d.labels.join(", ")));
+                }
+                if !d.routines.is_empty() {
+                    entry.push_str(&format!("; in [{}]", d.routines.join(", ")));
+                }
+                if !d.referenced_from.is_empty() {
+                    let from: Vec<String> = d
+                        .referenced_from
+                        .iter()
+                        .map(|x| {
+                            let what = if x.line.is_empty() {
+                                json_name(&x.kind)
+                            } else {
+                                x.line.clone()
+                            };
+                            format!("bank {} {} {what}", x.bank, x.address)
+                        })
+                        .collect();
+                    entry.push_str(&format!("; from [{}]", from.join(", ")));
+                }
+                text.push(entry);
+            }
+        }
         if let Some(page) = &report.view {
             text.push(heading("Lines", page.total, page.offset, page.items.len()));
             for line in &page.items {
@@ -996,10 +1079,12 @@ impl Server {
                     .routine
                     .as_ref()
                     .map_or(String::new(), |r| format!(" in {r}"));
-                text.push(format!(
-                    "  bank {} {}{routine}: {}",
-                    x.bank, x.address, x.line
-                ));
+                let what = if x.line.is_empty() {
+                    json_name(&x.kind)
+                } else {
+                    x.line.clone()
+                };
+                text.push(format!("  bank {} {}{routine}: {what}", x.bank, x.address));
             }
         }
         if let Some(page) = &report.routines {
@@ -1079,7 +1164,7 @@ impl Server {
         let summary = Self::inspect_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Disassemble a ROM (.nes, or raw .bin) into NESASM source, guided by annotations: a JSON file in the root (or inline) that names the ROM and records labels, symbols, code/data regions and comments taken from the author's notes. Code is traced from the interrupt vectors and entry points. Returns a summary, issues to settle in the annotations and whether the source reassembles to the same ROM; optionally source lines of a range, references, routines and RAM use. Writes nothing. See get_reference topic disassembler.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=true))]
+    #[tool(description="Disassemble a ROM (.nes, or raw .bin) into NESASM source, guided by annotations: a JSON file in the root (or inline) that names the ROM and records labels, symbols, code/data regions and comments taken from the author's notes. Code is traced from the interrupt vectors and entry points. For a ROM hack, give the original ROM as base: only the changed ranges become source (widen them with patches) and the rest is included from the base. Returns a summary, issues to settle in the annotations and whether the source reassembles to the same ROM; optionally source lines of a range, references, routines and RAM use. Writes nothing. See get_reference topic disassembler.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=true))]
     async fn disassemble(&self, Parameters(input): Parameters<DisasmInput>) -> CallToolResult {
         let report = self
             .guarded(move |root, cancel| Self::disasm_report(root, &input, cancel))

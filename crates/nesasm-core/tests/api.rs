@@ -424,6 +424,7 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
     let never = AtomicBool::new(false);
     let d = nesasm_core::disasm::disassemble(
         &rom,
+        None,
         &nesasm_core::disasm::DisasmConfig::default(),
         Path::new("gen/game.asm"),
         &never,
@@ -460,6 +461,7 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
     // The ROM is never overwritten, and only .asm sources are written.
     let d = nesasm_core::disasm::disassemble(
         &rom,
+        None,
         &nesasm_core::disasm::DisasmConfig::default(),
         Path::new("game.ASM"),
         &never,
@@ -469,6 +471,7 @@ fn write_disassembly_replaces_only_unedited_generated_files() {
     assert_eq!(e, "Output would overwrite the ROM");
     let d = nesasm_core::disasm::disassemble(
         &rom,
+        None,
         &nesasm_core::disasm::DisasmConfig::default(),
         Path::new("game.txt"),
         &never,

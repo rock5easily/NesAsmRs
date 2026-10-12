@@ -27,7 +27,7 @@ fn config(json: &str) -> DisasmConfig {
 /// Disassembles `rom` and checks that the source reassembles to it.
 fn round_trip(rom: &[u8], config: &DisasmConfig) -> Disassembly {
     let t = Temp::new();
-    let d = disasm::disassemble(rom, config, Path::new("out.asm"), &NEVER)
+    let d = disasm::disassemble(rom, None, config, Path::new("out.asm"), &NEVER)
         .unwrap_or_else(|e| panic!("{e:?}"));
     let v = d.verify(&t.0, Some(&t.0), &NEVER);
     assert!(v.matched, "{v:#?}\n{}", d.text());
@@ -73,8 +73,14 @@ fn every_compat_fixture_round_trips() {
             continue;
         }
         let rom = rom_file(&result);
-        let d = disasm::disassemble(&rom, &DisasmConfig::default(), Path::new("out.asm"), &NEVER)
-            .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
+        let d = disasm::disassemble(
+            &rom,
+            None,
+            &DisasmConfig::default(),
+            Path::new("out.asm"),
+            &NEVER,
+        )
+        .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
         let t = Temp::new();
         let v = d.verify(&t.0, Some(&t.0), &NEVER);
         assert!(v.matched, "{}: {v:#?}", path.display());
@@ -401,6 +407,7 @@ fn fragments_are_placed_at_their_load_address() {
     );
     let e = disasm::disassemble(
         &code,
+        None,
         &DisasmConfig::default(),
         Path::new("out.asm"),
         &NEVER,
@@ -446,8 +453,14 @@ fn chr_banks_are_included_or_written_as_data() {
 fn unsupported_header_fields_are_reported_and_fail_verification() {
     let mut rom = nrom("Reset:\nNmi:\n  rti");
     rom[7] = 0x08;
-    let d =
-        disasm::disassemble(&rom, &DisasmConfig::default(), Path::new("out.asm"), &NEVER).unwrap();
+    let d = disasm::disassemble(
+        &rom,
+        None,
+        &DisasmConfig::default(),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .unwrap();
     assert_eq!(
         issues(&d, IssueKind::Header),
         [
@@ -540,7 +553,7 @@ fn annotation_errors_name_the_entry() {
         ),
         (
             r#"{"regions": [{"start": "$FFFF", "length": 2}]}"#,
-            "regions $FFFF: the region runs past the end of bank 1 ($FFFF)",
+            "regions $FFFF: the range runs past the end of bank 1 ($FFFF)",
         ),
         (
             r#"{"banks": [{"bank": 0, "org": "$9000"}]}"#,
@@ -555,7 +568,7 @@ fn annotation_errors_name_the_entry() {
             "operands $E000: the expression must be one line without a comment",
         ),
     ] {
-        let e = disasm::disassemble(&rom, &config(json), Path::new("out.asm"), &NEVER)
+        let e = disasm::disassemble(&rom, None, &config(json), Path::new("out.asm"), &NEVER)
             .err()
             .unwrap_or_else(|| panic!("{json} should fail"));
         assert!(
@@ -672,4 +685,204 @@ fn large_sources_are_split_into_bank_files() {
     assert!(d.files().iter().all(|(_, text)| text.len() < 512 * 1024));
     let d = round_trip(&rom, &config(r#"{"options": {"split_banks": false}}"#));
     assert_eq!(d.files().len(), 1);
+}
+
+/// Disassembles a ROM hack of `base` (written as base.nes) and checks the
+/// source reassembles to the hack.
+fn patch_round_trip(rom: &[u8], base: &[u8], json: &str) -> Disassembly {
+    let t = Temp::new();
+    t.write("base.nes", base);
+    let mut c = config(json);
+    c.base = Some(PathBuf::from("base.nes"));
+    let d = disasm::disassemble(rom, Some(base), &c, Path::new("out.asm"), &NEVER)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let v = d.verify(&t.0, Some(&t.0), &NEVER);
+    assert!(v.matched, "{v:#?}\n{}", d.text());
+    d
+}
+
+const HACK_BASE: &str = concat!(
+    "Reset:\n  lda #0\n  sta $2000\n  jsr Init\nLoop:\n  jmp Loop\n",
+    "Init:\n  lda #1\n  rts\nNmi:\n  rti\nLoose:\n  .db 1, 2, 3\n",
+);
+
+fn hack_roms() -> (Vec<u8>, Vec<u8>) {
+    let base = nrom(HACK_BASE);
+    let hack = nrom(&format!(
+        "{}\n  .org $E100\nNewInit:\n  lda #2\n  sta $0300\n  jmp Init",
+        HACK_BASE.replace("jsr Init", "jsr NewInit")
+    ));
+    (base, hack)
+}
+
+#[test]
+fn rom_hacks_disassemble_only_the_changes() {
+    let (base, hack) = hack_roms();
+    let d = patch_round_trip(&hack, &base, "{}");
+    assert_lines(
+        &d,
+        &[
+            "; Changed ranges are disassembled; the rest is included from base.nes.",
+            "; Labels in the unchanged ranges",
+            "L_E00B          = $E00B",
+            "  .bank 0",
+            "  .org $C000",
+            "  .incbin \"base.nes\", 16, 8192",
+            "  .bank 1",
+            "  .org $E000",
+            "  .incbin \"base.nes\", 8208, 5",
+            "  jsr sub_E100",
+            "  .incbin \"base.nes\", 8216, 248",
+            "sub_E100:",
+            "  lda #$02",
+            "  sta $0300",
+            "  jmp L_E00B",
+            "  .incbin \"base.nes\", 8472, 7928",
+        ],
+    );
+    assert!(!d.text().contains("RESET:"), "{}", d.text());
+    let diffs = d.diffs();
+    assert_eq!(diffs.len(), 2);
+    let (hook, new) = (&diffs[0], &diffs[1]);
+    assert_eq!(
+        (
+            hook.bank,
+            hook.start,
+            hook.end,
+            hook.changed_bytes,
+            hook.code_bytes
+        ),
+        (1, Address(0xe005), Address(0xe007), 2, 3)
+    );
+    assert_eq!(
+        (hook.bytes.as_str(), hook.base_bytes.as_str()),
+        ("20 00 E1", "20 0B E0")
+    );
+    assert_eq!(hook.routines, ["RESET"]);
+    assert_eq!(hook.base_fill, None);
+    assert_eq!(
+        (
+            new.start,
+            new.end,
+            new.changed_bytes,
+            new.base_fill.as_deref()
+        ),
+        (Address(0xe100), Address(0xe107), 7, Some("00"))
+    );
+    assert_eq!(new.labels, ["sub_E100"]);
+    assert_eq!(new.referenced_from.len(), 1);
+    assert_eq!(
+        (
+            new.referenced_from[0].address,
+            new.referenced_from[0].line.as_str()
+        ),
+        (Address(0xe005), "jsr sub_E100")
+    );
+    let summary = d.summary().diff.unwrap();
+    assert_eq!(
+        (summary.changed_bytes, summary.ranges, summary.source_bytes),
+        (9, 2, 11)
+    );
+    assert!(summary.new_banks.is_empty());
+    // Issues outside the changes (the loose bytes) are left out.
+    assert!(issues(&d, IssueKind::UnknownRange).is_empty());
+    let full = round_trip(&hack, &DisasmConfig::default());
+    assert_eq!(issues(&full, IssueKind::UnknownRange).len(), 1);
+}
+
+#[test]
+fn patches_widen_the_disassembled_ranges() {
+    let (base, hack) = hack_roms();
+    let d = patch_round_trip(
+        &hack,
+        &base,
+        r#"{"patches": [{"start": "$E002", "length": 2, "comment": "Hooked start-up"},
+                        {"start": "$E00C", "end": "$E00D"}]}"#,
+    );
+    assert_lines(
+        &d,
+        &[
+            "  .incbin \"base.nes\", 8208, 2",
+            "; Hooked start-up",
+            "  sta PPUCTRL",
+            "  jsr sub_E100",
+            "  .incbin \"base.nes\", 8216, 3",
+            "  lda #$01",
+            "  rts",
+        ],
+    );
+    let diffs = d.diffs();
+    // The second patch starts inside `lda #1` and is widened to it.
+    assert_eq!(
+        diffs.iter().map(|d| (d.start, d.end)).collect::<Vec<_>>(),
+        [
+            (Address(0xe002), Address(0xe007)),
+            (Address(0xe00b), Address(0xe00d)),
+            (Address(0xe100), Address(0xe107))
+        ]
+    );
+    assert_eq!(diffs[1].changed_bytes, 0);
+}
+
+#[test]
+fn expanded_rom_hacks_line_up_chr_banks() {
+    let mut base = nrom(HACK_BASE);
+    base[5] = 1;
+    base.extend(vec![0x55; 8192]);
+    // Two more PRG banks before the same CHR bank.
+    let mut hack = base[..16].to_vec();
+    hack[4] = 2;
+    hack.extend(&base[16..16 + 16384]);
+    hack.extend((0..16384u32).map(|i| (i % 7) as u8));
+    hack.extend(&base[16 + 16384..]);
+    let d = patch_round_trip(&hack, &base, "{}");
+    let summary = d.summary().diff.unwrap();
+    assert_eq!(summary.new_banks, [2, 3]);
+    assert_lines(&d, &["  .bank 4", "  .incbin \"base.nes\", 16400, 8192"]);
+    assert!(d.chr_file().is_none());
+}
+
+#[test]
+fn rom_hack_annotation_errors() {
+    let (base, hack) = hack_roms();
+    let fails = |rom: &[u8], base_file: Option<&[u8]>, json: &str, message: &str| {
+        let e = disasm::disassemble(rom, base_file, &config(json), Path::new("out.asm"), &NEVER)
+            .err()
+            .unwrap_or_else(|| panic!("{json} should fail"));
+        assert!(
+            e.iter().any(|d| d.message.contains(message)),
+            "{json}: {:?}",
+            e.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    };
+    fails(
+        &hack,
+        None,
+        r#"{"patches": [{"start": "$E000", "length": 1}]}"#,
+        "patches applies only with base",
+    );
+    fails(
+        &hack,
+        None,
+        r#"{"base": "base.nes"}"#,
+        "The base ROM was not given",
+    );
+    fails(
+        &hack,
+        Some(&base),
+        "{}",
+        "A base ROM was given without base",
+    );
+    fails(
+        &hack,
+        Some(&base[16..]),
+        r#"{"base": "base.bin"}"#,
+        "base must have the same format as rom",
+    );
+    fails(
+        &hack,
+        Some(&base),
+        r#"{"base": "base.nes", "patches": [{"start": "$1000", "length": 1}]}"#,
+        "patches $1000: No PRG bank holds $1000",
+    );
 }

@@ -245,6 +245,34 @@ impl Memory {
         }
     }
 
+    /// The start and end offset of a range an annotation names by start and
+    /// end (inclusive) or length; it must lie in one bank.
+    pub fn span(
+        &self,
+        bank: Option<usize>,
+        start: Address,
+        end: Option<Address>,
+        length: Option<u32>,
+    ) -> Result<(Loc, usize), String> {
+        let loc = self.locate(bank, start)?;
+        let length = match (end, length) {
+            (Some(end), None) if end.0 >= start.0 => end.0 - start.0 + 1,
+            (None, Some(length)) if length > 0 => length,
+            (Some(_), None) => return Err("end is before start".into()),
+            _ => return Err("give either end or a nonzero length".into()),
+        };
+        let bank = &self.banks[loc.bank];
+        let end = loc.offset + length as usize;
+        if end > bank.end {
+            return Err(format!(
+                "the range runs past the end of bank {} (${:04X})",
+                loc.bank,
+                bank.org + bank.end as u32 - 1
+            ));
+        }
+        Ok((loc, end))
+    }
+
     pub fn prg_banks(&self) -> impl Iterator<Item = &BankImage> {
         self.banks.iter().filter(|b| !b.chr)
     }
@@ -549,35 +577,13 @@ impl Analysis {
     fn apply_regions(&mut self, config: &DisasmConfig, errors: &mut Vec<String>) {
         for def in &config.regions {
             let what = format!("regions {}", def.start);
-            let loc = match self.memory.locate(def.bank, def.start) {
-                Ok(loc) => loc,
+            let (loc, end) = match self.memory.span(def.bank, def.start, def.end, def.length) {
+                Ok(span) => span,
                 Err(e) => {
                     errors.push(format!("{what}: {e}"));
                     continue;
                 }
             };
-            let length = match (def.end, def.length) {
-                (Some(end), None) if end.0 >= def.start.0 => end.0 - def.start.0 + 1,
-                (None, Some(length)) if length > 0 => length,
-                (Some(_), None) => {
-                    errors.push(format!("{what}: end is before start"));
-                    continue;
-                }
-                _ => {
-                    errors.push(format!("{what}: give either end or a nonzero length"));
-                    continue;
-                }
-            };
-            let bank = &self.memory.banks[loc.bank];
-            let end = loc.offset + length as usize;
-            if end > bank.end {
-                errors.push(format!(
-                    "{what}: the region runs past the end of bank {} (${:04X})",
-                    loc.bank,
-                    bank.org + bank.end as u32 - 1
-                ));
-                continue;
-            }
             let pair = match (def.kind, def.pair) {
                 (RegionType::LowBytes | RegionType::HighBytes, Some(pair)) => {
                     match self.memory.locate(Some(loc.bank), pair) {
