@@ -1,6 +1,7 @@
 use crate::{AssembleRequest, SourceEncoding, SourceLocation};
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf, Prefix},
@@ -53,10 +54,10 @@ pub fn resolve_path(path: &Path, base: &Path, root: Option<&Path>) -> Result<Pat
     let mut tail = Vec::new();
     while !ancestor.exists() {
         let name = ancestor.file_name().ok_or("Invalid path")?;
-        // In a Windows verbatim path (`\\?\`), `/` is not a separator, so a
-        // name like `a/../..` would become `..` components once the canonical
-        // path drops the prefix.
-        if !Path::new(name).components().eq([Component::Normal(name)]) {
+        // A name from a verbatim path (`\\?\`) is appended to a canonical path
+        // that may have dropped the prefix, where `a/../..` would become `..`
+        // and `link.` a junction `link` that leads outside the root.
+        if !is_plain_name(name) {
             return Err("Invalid path".into());
         }
         tail.push(name.to_owned());
@@ -100,17 +101,29 @@ pub fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
     Some(components.as_path().to_owned())
 }
 
+/// Whether Windows reads `name` as the same single name in a path without the
+/// verbatim prefix (`\\?\`), which keeps `/` and trailing dots and spaces
+/// literal.
+fn is_plain_name(name: &OsStr) -> bool {
+    Path::new(name).components().eq([Component::Normal(name)])
+        && !(cfg!(windows) && matches!(name.as_encoded_bytes().last(), Some(b'.' | b' ')))
+}
+
 /// `fs::canonicalize` without the Windows verbatim prefix (`\\?\`) when the
-/// path stays valid without it, so diagnostics show ordinary paths that editors
-/// recognize. A long path keeps the prefix, so root checks compare paths with
-/// `relative_to_root`.
+/// path stays valid and means the same without it, so diagnostics show
+/// ordinary paths that editors recognize. A long path keeps the prefix, so
+/// root checks compare paths with `relative_to_root`.
 pub(crate) fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
     #[cfg(windows)]
     {
         const MAX_PATH: usize = 260;
+        let plain = path.components().all(|c| match c {
+            Component::Normal(name) => is_plain_name(name),
+            _ => true,
+        });
         let text = path.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if let Some(rest) = text.strip_prefix(r"\\?\").filter(|_| plain) {
             if let Some(share) = rest.strip_prefix(r"UNC\") {
                 if share.len() + 2 < MAX_PATH {
                     return Ok(PathBuf::from(format!(r"\\{share}")));

@@ -651,6 +651,47 @@ fn verbatim_paths_do_not_leave_the_root_through_slashes() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn verbatim_paths_do_not_leave_the_root_through_trailing_dots() {
+    // In a `\\?\` path, `link.` is a missing name, while without the prefix
+    // Windows drops the dot and follows the junction `link` outside the root.
+    use std::path::Path;
+    let t = Temp::new();
+    t.write("outside/secret.bin", [9]);
+    t.write("project/keep.txt", "");
+    let root = nesasm_core::resolve_path(&t.0.join("project"), &t.0, None).unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("link"))
+        .arg(t.0.join("outside"))
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let resolve = |path: &str| nesasm_core::resolve_path(Path::new(path), &root, Some(&root));
+    let root_text = root.display();
+    for name in [
+        r"link.\secret.bin",
+        r"link \secret.bin",
+        r"link\secret.bin.",
+    ] {
+        let path = format!(r"\\?\{root_text}\{name}");
+        assert_eq!(resolve(&path), Err("Invalid path".into()), "{path}");
+    }
+    // Without the prefix, the junction is followed and rejected.
+    let path = format!(r"{root_text}\link.\secret.bin");
+    assert_eq!(
+        resolve(&path),
+        Err("Path is outside the project root".into())
+    );
+    // An existing name with a trailing dot keeps the prefix in canonical paths.
+    let dotted = format!(r"\\?\{root_text}\dots.");
+    std::fs::create_dir(&dotted).unwrap();
+    std::fs::write(format!(r"{dotted}\data.bin"), [1]).unwrap();
+    let path = format!(r"{dotted}\data.bin");
+    assert_eq!(resolve(&path), Ok(Path::new(&path).to_owned()));
+}
+
 #[test]
 fn long_source_paths_within_the_root() {
     // Files whose canonical paths are long, in a directory whose path is not:
