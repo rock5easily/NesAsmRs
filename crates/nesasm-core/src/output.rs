@@ -517,8 +517,12 @@ fn commit_all(
                 (Some(_), Some(_)) => Some("replaced by another program since"),
                 _ => Some("could not be checked for changes by another program"),
             }
-        } else if backup.is_some() && fs::symlink_metadata(&path).is_ok() {
-            Some("created by another program since")
+        } else if backup.is_some() {
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Ok(_) => Some("created by another program since"),
+                Err(_) => Some("could not be checked for changes by another program"),
+            }
         } else {
             None
         };
