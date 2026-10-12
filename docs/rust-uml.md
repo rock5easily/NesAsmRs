@@ -48,6 +48,7 @@ flowchart TB
             disasm_config["config.rs：注釈（DisasmConfig）"]
             disasm_analysis["analysis.rs：バンク配置・コード追跡・命名"]
             disasm_render["render.rs：ソース生成"]
+            disasm_patch["patch.rs：ROM Hackの差分範囲"]
         end
     end
     cli_main --> api
@@ -64,7 +65,7 @@ flowchart TB
     output --> api
     output --> source
     output --> disasm_mod
-    disasm_mod --> disasm_config & disasm_analysis & disasm_render
+    disasm_mod --> disasm_config & disasm_analysis & disasm_render & disasm_patch
     disasm_mod --> engine_mod
     disasm_analysis --> inspect & opcode
     inspect --> opcode
@@ -651,6 +652,7 @@ classDiagram
     class Disassembly {
         -Analysis analysis
         -Rendered rendered
+        -Option~Patches~ patches
         -PathBuf source
         +text() str
         +files() Vec
@@ -661,6 +663,7 @@ classDiagram
         +xrefs(query)
         +routines() Vec~Routine~
         +ram() Vec~RamUse~
+        +diffs() Vec~Diff~
         +verify(working_directory, root, cancel) Verification
     }
     class Analysis {
@@ -683,6 +686,15 @@ classDiagram
         -resolve(from, address) Resolved
         -locate(bank, address) Loc
     }
+    class Patches {
+        -String path
+        -Memory base
+        -Vec base_bank
+        -Vec ranges
+        -Vec changed
+        -new(analysis, base_file, config)
+        -range_at(loc)
+    }
     class Rendered {
         -Vec files
         -Vec~SourceLine~ lines
@@ -691,7 +703,7 @@ classDiagram
     class DisasmModule {
         <<module>>
         parse_config(json)
-        disassemble(rom_file, config, source, cancel)
+        disassemble(rom_file, base_file, config, source, cancel)
         is_unedited_source(text)
     }
     DisasmModule ..> Disassembly : 生成
@@ -699,10 +711,13 @@ classDiagram
     Disassembly *-- Analysis
     Disassembly *-- Rendered
     Analysis *-- Memory
+    Disassembly *-- Patches
+    Patches *-- Memory : ベースROM
     Disassembly ..> CoreApi : verifyでassemble_with_cancel
 ```
 
 `Analysis::run` は注釈を検証・適用し（誤りは `E_DISASM` としてまとめて返す）、ベクタ・
 エントリポイント・コード領域・ジャンプ表から幅優先でコードを追跡し、参照とラベル名を決めます。
 `render` は全バンクの全バイトを順に書き、各ファイルの先頭行に本文のチェックサムを付けます。
+ROM Hackでは `Patches` がベースROMとの差分から範囲を決め、`render` は範囲外をベースROMの `.incbin` にします。
 `verify` は生成したファイルを `AssembleRequest.files` に渡してメモリ上でアセンブルし、元のROMと比較します。

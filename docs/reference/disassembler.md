@@ -21,11 +21,43 @@ Addresses in annotations and queries are numbers or strings such as `"$C000"`
 or `"0xC000"`. Reports show them as `"$C000"`. `bank` may be omitted when only
 one PRG bank holds the address.
 
+## ROM hacks
+
+For a ROM hack, give the original ROM as `base`. Only the ranges that differ
+from it become source; the rest is included from the base ROM with
+`.incbin "base.nes", offset, size`, so the source reassembles to the hack
+when the base ROM is present. `disassemble` returns the changed ranges as
+`diffs` (the first 20; select with `offset` and `limit`), each with:
+
+- `changed_bytes` and the `code_bytes`, `data_bytes` and `unknown_bytes` of
+  the range in the hack;
+- `base_fill`: the value the base held throughout the range, when the range
+  was free space (new code or data rather than a change);
+- `labels`, `routines`, and `referenced_from`: references from outside the
+  range, such as the hook (a changed JSR or JMP) into new code;
+- the first `bytes` of the hack and `base_bytes` of the base.
+
+Bytes that differ less than 4 bytes apart are one range, and ranges are
+widened to whole instructions and table entries. To make more of the ROM
+source (a whole routine around a change, a table), add `patches`. Code is
+still traced through the whole hack, so labels and routines are known;
+labels in unchanged ranges that the source uses are defined as constants
+(`L_E00B = $E00B`). Issues are reported only within the changed ranges.
+PRG banks are matched with the base's PRG banks in order, and CHR banks with
+its CHR banks, so an expanded ROM lines up; banks the base lacks are
+disassembled whole. Changed CHR banks are written whole. The base must have
+the same format as `rom` (`.nes` or whole-bank `.bin`), without a trainer;
+fragments (`load_address`) cannot have a base.
+
 ## Annotation file
 
 - `rom`: the ROM file relative to the root: `.nes` (iNES) or a raw `.bin`.
 - `load_address`: for a raw fragment, the CPU address of its first byte.
   Required unless the file is a whole number of 8 KiB banks.
+- `base`: for a ROM hack, the original ROM relative to the root (see above).
+- `patches`: `[{"start", "end" | "length", "bank", "comment"}]`, with `base`:
+  ranges to disassemble besides the changed bytes. The comment is placed above
+  the range.
 - `banks`: `[{"bank": 2, "org": "$8000"}]`, the CPU window of PRG banks
   (multiples of $2000 up to $E000). By default the last two PRG banks are at
   $C000/$E000 and the others alternate $8000/$A000; a single bank is at $E000.
@@ -102,7 +134,7 @@ table or entry points), `unresolved_bank` (add `references`), `outside_rom`
 ## Limits
 
 ROMs of up to 128 banks of 8 KiB; over MCP, ROM and annotation files of up
-to 8 MiB each. A disassembly is subject to the server's time limit.
+to 8 MiB each (also the base ROM). A disassembly is subject to the server's time limit.
 
 ## Queries
 
