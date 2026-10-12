@@ -10,7 +10,10 @@ mod source;
 mod state;
 
 pub use engine::{assemble, assemble_with_cancel};
-pub use output::{Artifact, ArtifactKind, write_artifacts, write_disassembly};
+pub use output::{
+    Artifact, ArtifactKind, DisassemblyExport, export_disassembly, write_artifacts,
+    write_disassembly,
+};
 pub use source::resolve_path;
 
 #[cfg(feature = "schema")]

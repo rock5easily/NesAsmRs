@@ -175,11 +175,6 @@ impl Patches {
             .iter()
             .find(|r| r.start <= loc.offset && loc.offset < r.end)
     }
-
-    /// The `.incbin` offset of a byte of the base bank matching `bank`.
-    pub fn file_offset(&self, bank: usize, offset: usize) -> Option<usize> {
-        self.base_bank[bank].map(|b| self.header_len + b * BANK_SIZE + offset)
-    }
 }
 
 /// Widens ranges to whole instructions and table entries, then merges

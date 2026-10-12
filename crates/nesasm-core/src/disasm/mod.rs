@@ -21,6 +21,7 @@ use crate::{AssembleOptions, AssembleRequest, Diagnostic, DiagnosticCode, Source
 use analysis::{Analysis, Class, Loc, Target};
 use patch::Patches;
 use render::Rendered;
+pub(crate) use render::Role as SourceRole;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -280,6 +281,14 @@ pub fn chr_path(source: &Path) -> PathBuf {
     source.with_extension("chr")
 }
 
+/// The file of `bank` next to a source path, when the source is split by
+/// bank: `<stem>_bankXX.asm` with the bank in uppercase hexadecimal
+/// (`_bank0A`, `_bank1F`).
+pub fn bank_path(source: &Path, bank: usize) -> PathBuf {
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    source.with_file_name(format!("{stem}_bank{bank:02X}.asm"))
+}
+
 fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(DiagnosticCode::Disasm, message, SourceLocation::default())
 }
@@ -354,6 +363,17 @@ pub fn disassemble(
 /// since (its marker line's checksum still matches).
 pub fn is_unedited_source(text: &str) -> bool {
     render::is_unedited(text)
+}
+
+/// What `text` is, if it is a generated source not edited since: the main
+/// file or the file of one bank.
+pub(crate) fn source_role(text: &str) -> Option<SourceRole> {
+    render::role(text)
+}
+
+/// The paths a generated main source `.include`s.
+pub(crate) fn source_includes(text: &str) -> Vec<String> {
+    render::includes(text)
 }
 
 /// Whether `chr` is the CHR file the generated main source `text` records

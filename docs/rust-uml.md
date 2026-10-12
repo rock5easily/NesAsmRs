@@ -554,6 +554,7 @@ classDiagram
         <<module>>
         write_artifacts(result, input, output, base, root, options)
         write_disassembly(disassembly, base, root, rom)
+        export_disassembly(disassembly, base, root, rom)
         srec(binary, map)
     }
     class StagedArtifact {
@@ -719,5 +720,7 @@ classDiagram
 `Analysis::run` は注釈を検証・適用し（誤りは `E_DISASM` としてまとめて返す）、ベクタ・
 エントリポイント・コード領域・ジャンプ表から幅優先でコードを追跡し、参照とラベル名を決めます。
 `render` は全バンクの全バイトを順に書き、各ファイルの先頭行に本文のチェックサムを付けます。
-ROM Hackでは `Patches` がベースROMとの差分から範囲を決め、`render` は範囲外をベースROMの `.incbin` にします。
+ROM Hackでは `Patches` がベースROMとの差分から範囲を決め、`render` はメインファイルでベースROMを
+`.incbin` で読み込み、各範囲を `.bank`・`.org` で上書きします。`export_disassembly` は既存ファイルを
+本文先頭の行（`; Source:` か `.bank n`）で見分け、同じ役割の未編集ファイルだけを上書きします。
 `verify` は生成したファイルを `AssembleRequest.files` に渡してメモリ上でアセンブルし、元のROMと比較します。

@@ -140,25 +140,25 @@ fn traces_code_from_the_vectors() {
     let d = round_trip(&rom, &DisasmConfig::default());
     let text = d.text();
     for line in [
-        "  .inesprg 1",
-        "  .inesmir 1",
+        "\t.inesprg 1",
+        "\t.inesmir 1",
         "PPUCTRL         = $2000",
         "RESET:",
-        "  sei",
-        "  ldx #$FF",
-        "  jsr sub_C011",
+        "\tsei",
+        "\tldx #$FF",
+        "\tjsr sub_C011",
         "L_C007:",
-        "  lda <$10",
-        "  sta $0300,x",
-        "  bne L_C007",
+        "\tlda <$10",
+        "\tsta $0300,x",
+        "\tbne L_C007",
         "sub_C011:",
-        "  lda D_C018,x",
-        "  sta PPUCTRL",
+        "\tlda D_C018,x",
+        "\tsta PPUCTRL",
         "D_C018:",
-        "  .db $01, $02, $03, $04",
+        "\t.db $01, $02, $03, $04",
         "NMI:",
-        "  rti",
-        "  .dw NMI, RESET, NMI",
+        "\trti",
+        "\t.dw NMI, RESET, NMI",
     ] {
         assert!(
             text.lines().any(|l| l == line),
@@ -238,28 +238,28 @@ fn annotations_name_and_shape_the_source() {
             "; Entry",
             "; after reset",
             "RESET:",
-            "  jsr Print",
-            "  .db $AA, $BB",
-            "  ldx buffer+1 ; read the count",
-            "  lda D_C019,x",
-            "  sta <ptr",
-            "  lda D_C01B,x",
-            "  sta <ptr+1",
-            "  jmp [ptr]",
+            "\tjsr Print",
+            "\t.db $AA, $BB",
+            "\tldx buffer+1 ; read the count",
+            "\tlda D_C019,x",
+            "\tsta <ptr",
+            "\tlda D_C01B,x",
+            "\tsta <ptr+1",
+            "\tjmp [ptr]",
             "; Prints the text after the JSR",
             "Print:",
-            "  rts",
+            "\trts",
             "L_C016:",
-            "  jmp L_C016",
+            "\tjmp L_C016",
             "D_C019:",
-            "  .db LOW(L_C016), LOW(Print)",
+            "\t.db LOW(L_C016), LOW(Print)",
             "D_C01B:",
-            "  .db HIGH(L_C016), HIGH(Print)",
-            "  .dw L_C016-1",
+            "\t.db HIGH(L_C016), HIGH(Print)",
+            "\t.dw L_C016-1",
             "; Message",
-            "  .db \"HI!\", $00",
+            "\t.db \"HI!\", $00",
             "NMI:",
-            "  rti",
+            "\trti",
         ],
     );
     assert_eq!(
@@ -279,12 +279,12 @@ fn zero_page_and_absolute_operands_keep_their_encoding() {
     assert_lines(
         &d,
         &[
-            "  lda $0012",
-            "  lda <$12",
-            "  sta $0012,y",
-            "  ldx <$12,y",
-            "  lda [$12],y",
-            "  sta [$12,x]",
+            "\tlda $0012",
+            "\tlda <$12",
+            "\tsta $0012,y",
+            "\tldx <$12,y",
+            "\tlda [$12],y",
+            "\tsta [$12,x]",
         ],
     );
     let c = config(
@@ -294,12 +294,12 @@ fn zero_page_and_absolute_operands_keep_their_encoding() {
     assert_lines(
         &d,
         &[
-            "  LDA zvar",
-            "  LDA <zvar",
-            "  STA zvar,Y",
-            "  LDX <zvar,Y",
-            "  LDA [zvar],Y",
-            "  STA [zvar,X]",
+            "\tLDA zvar",
+            "\tLDA <zvar",
+            "\tSTA zvar,Y",
+            "\tLDX <zvar,Y",
+            "\tLDA [zvar],Y",
+            "\tSTA [zvar,X]",
         ],
     );
 }
@@ -317,9 +317,9 @@ fn entries_inside_an_instruction_are_relative_to_it() {
         &[
             "sub_E000:",
             "L_E002:",
-            "  bit $02A9",
-            "  jsr sub_E000",
-            "  jsr L_E002+1",
+            "\tbit $02A9",
+            "\tjsr sub_E000",
+            "\tjsr L_E002+1",
         ],
     );
     assert_eq!(issues(&d, IssueKind::Overlap).len(), 1);
@@ -331,9 +331,9 @@ fn entries_inside_an_instruction_are_relative_to_it() {
         &d,
         &[
             "L_E002:",
-            "  bit $02A9",
+            "\tbit $02A9",
             "Second = L_E002+1",
-            "  jsr Second",
+            "\tjsr Second",
         ],
     );
 }
@@ -361,8 +361,8 @@ fn references_choose_between_banks_at_one_address() {
         &d,
         &[
             "; Assemble with -raw (no iNES header).",
-            "  .bank 3",
-            "  jsr $8000",
+            "\t.bank 3",
+            "\tjsr $8000",
         ],
     );
     assert_eq!(
@@ -376,11 +376,11 @@ fn references_choose_between_banks_at_one_address() {
     assert_lines(
         &d,
         &[
-            "  .bank 1",
-            "  .org $8000",
+            "\t.bank 1",
+            "\t.org $8000",
             "sub_01_8000:",
-            "  lda #$01",
-            "  jsr sub_01_8000",
+            "\tlda #$01",
+            "\tjsr sub_01_8000",
         ],
     );
     assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
@@ -397,12 +397,12 @@ fn fragments_are_placed_at_their_load_address() {
         &d,
         &[
             "PPUCTRL         = $2000",
-            "  .bank 0",
-            "  .org $0300",
+            "\t.bank 0",
+            "\t.org $0300",
             "Start:",
-            "  lda #$00",
-            "  sta PPUCTRL",
-            "  rts",
+            "\tlda #$00",
+            "\tsta PPUCTRL",
+            "\trts",
         ],
     );
     let e = disasm::disassemble(
@@ -431,9 +431,9 @@ fn chr_banks_are_included_or_written_as_data() {
     assert_lines(
         &d,
         &[
-            "  .ineschr 1",
-            "  .bank 2",
-            "  .incbin \"out.chr\", 0, 8192",
+            "\t.ineschr 1",
+            "\t.bank 2",
+            "\t.incbin \"out.chr\", 0, 8192",
         ],
     );
     let (path, data) = d.chr_file().unwrap();
@@ -444,7 +444,7 @@ fn chr_banks_are_included_or_written_as_data() {
     );
     assert_lines(
         &d,
-        &["  .bank 2", "  .org $0000", "  .db $00, $00, $00, $01"],
+        &["\t.bank 2", "\t.org $0000", "\t.db $00, $00, $00, $01"],
     );
     assert!(d.chr_file().is_none());
 }
@@ -506,12 +506,12 @@ fn flow_problems_are_issues() {
     assert_lines(
         &d,
         &[
-            "  sta $8000",
+            "\tsta $8000",
             "L_E008:",
-            "  .db $02",
+            "\t.db $02",
             "NMI:",
-            "  .db $01, $02, $03, $04, $05",
-            "  .ds 8171",
+            "\t.db $01, $02, $03, $04, $05",
+            "\t.ds 8171",
         ],
     );
     let summary = d.summary();
@@ -632,7 +632,7 @@ fn queries_report_routines_ram_and_references() {
         .iter()
         .map(|l| l.text.as_str())
         .collect();
-    assert_eq!(view, ["sub_E00C:", "  lda JOY1", "  inc <count", "  rts"]);
+    assert_eq!(view, ["sub_E00C:", "\tlda JOY1", "\tinc <count", "\trts"]);
 }
 
 #[test]
@@ -663,14 +663,14 @@ fn large_sources_are_split_into_bank_files() {
     assert_lines(
         &d,
         &[
-            "  .inesmir 0",
+            "\t.inesmir 0",
             "",
-            "  .include \"out_bank00.asm\"",
-            "  .include \"out_bank01.asm\"",
+            "\t.include \"out_bank00.asm\"",
+            "\t.include \"out_bank01.asm\"",
         ],
     );
     let bank1 = &d.files()[2].1;
-    assert!(bank1.lines().nth(1) == Some("  .bank 1"), "{bank1}");
+    assert!(bank1.lines().nth(1) == Some("\t.bank 1"), "{bank1}");
     assert!(
         d.files()
             .iter()
@@ -722,24 +722,29 @@ fn rom_hacks_disassemble_only_the_changes() {
     assert_lines(
         &d,
         &[
-            "; Changed ranges are disassembled; the rest is included from base.nes.",
+            "; The base ROM base.nes is included below; the changed ranges are written over it.",
             "; Labels in the unchanged ranges",
             "L_E00B          = $E00B",
-            "  .bank 0",
-            "  .org $C000",
-            "  .incbin \"base.nes\", 16, 8192",
-            "  .bank 1",
-            "  .org $E000",
-            "  .incbin \"base.nes\", 8208, 5",
-            "  jsr sub_E100",
-            "  .incbin \"base.nes\", 8216, 248",
+            // The whole base without its header, then each range at its address.
+            "\t.bank 0",
+            "\t.org $C000",
+            "\t.incbin \"base.nes\", 16, 16384",
+            "",
+            "\t.bank 1",
+            "\t.org $E005",
+            "\tjsr sub_E100",
+            "",
+            "\t.org $E100",
             "sub_E100:",
-            "  lda #$02",
-            "  sta $0300",
-            "  jmp L_E00B",
-            "  .incbin \"base.nes\", 8472, 7928",
+            "\tlda #$02",
+            "\tsta $0300",
+            "\tjmp L_E00B",
         ],
     );
+    assert_eq!(d.text().matches(".incbin").count(), 1, "{}", d.text());
+    assert!(!d.text().contains(".catbank"), "{}", d.text());
+    // Bank 0 has no changes and no lines of its own.
+    assert_eq!(d.text().matches(".bank").count(), 2, "{}", d.text());
     assert!(!d.text().contains("RESET:"), "{}", d.text());
     let diffs = d.diffs();
     assert_eq!(diffs.len(), 2);
@@ -802,13 +807,19 @@ fn patches_widen_the_disassembled_ranges() {
     assert_lines(
         &d,
         &[
-            "  .incbin \"base.nes\", 8208, 2",
+            "\t.incbin \"base.nes\", 16, 16384",
+            "\t.bank 1",
             "; Hooked start-up",
-            "  sta PPUCTRL",
-            "  jsr sub_E100",
-            "  .incbin \"base.nes\", 8216, 3",
-            "  lda #$01",
-            "  rts",
+            "\t.org $E002",
+            "\tsta PPUCTRL",
+            "\tjsr sub_E100",
+            "",
+            "\t.org $E00B",
+            "\tlda #$01",
+            "\trts",
+            "",
+            "\t.org $E100",
+            "sub_E100:",
         ],
     );
     let diffs = d.diffs();
@@ -838,8 +849,224 @@ fn expanded_rom_hacks_line_up_chr_banks() {
     let d = patch_round_trip(&hack, &base, "{}");
     let summary = d.summary().diff.unwrap();
     assert_eq!(summary.new_banks, [2, 3]);
-    assert_lines(&d, &["  .bank 4", "  .incbin \"base.nes\", 16400, 8192"]);
+    // The base's PRG banks, then its CHR bank after the new PRG banks.
+    assert_lines(
+        &d,
+        &[
+            "\t.bank 0",
+            "\t.org $8000",
+            "\t.incbin \"base.nes\", 16, 16384",
+            "\t.bank 4",
+            "\t.org $0000",
+            "\t.incbin \"base.nes\", 16400, 8192",
+            "\t.bank 2",
+            "\t.org $C000",
+        ],
+    );
+    assert_eq!(d.text().matches("\"base.nes\"").count(), 2);
     assert!(d.chr_file().is_none());
+}
+
+/// Checks that instructions and directives are indented by one tab, and
+/// that labels, constants and comments start the line.
+fn assert_tab_indented(d: &Disassembly) {
+    for (path, text) in d.files() {
+        for line in text.lines() {
+            let ok = match line.strip_prefix('\t') {
+                Some(rest) => rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '.'),
+                None => !line.starts_with(char::is_whitespace),
+            };
+            assert!(ok, "{}: {line:?}", path.display());
+            if line.trim_start().starts_with('.') {
+                assert!(line.starts_with("\t."), "{}: {line:?}", path.display());
+            }
+        }
+    }
+}
+
+/// The paths a main source includes.
+fn includes(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("\t.include \""))
+        .map(|l| PathBuf::from(l.trim_end_matches('"')))
+        .collect()
+}
+
+#[test]
+fn rom_hack_bank_files_overwrite_the_included_base() {
+    let (base_prg, hack_prg) = hack_roms();
+    let chr: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    let mut base = base_prg.clone();
+    base[5] = 1;
+    base.extend(&chr);
+    // Two new PRG banks before the CHR bank, and two changed CHR bytes.
+    let mut hack = hack_prg[..16].to_vec();
+    hack[4] = 2;
+    hack[5] = 1;
+    hack.extend(&hack_prg[16..]);
+    hack.extend((0..16384u32).map(|i| (i % 5) as u8));
+    let mut new_chr = chr.clone();
+    new_chr[0x100] ^= 0xff;
+    new_chr[0x1fff] = 0;
+    hack.extend(&new_chr);
+    let json = r#"{"options": {"split_banks": true},
+        "banks": [{"bank": 0, "org": "$C000"}, {"bank": 1, "org": "$E000"},
+                  {"bank": 2, "org": "$8000"}, {"bank": 3, "org": "$A000"}],
+        "labels": [{"address": "$E100", "name": "NewInit", "comment": "Added"}],
+        "patches": [{"start": "$E00B", "end": "$E00C", "comment": "Init"}]}"#;
+    let d = patch_round_trip(&hack, &base, json);
+    let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
+    // Bank 0 is unchanged and has no file.
+    assert_eq!(
+        names,
+        [
+            "out.asm",
+            "out_bank01.asm",
+            "out_bank02.asm",
+            "out_bank03.asm",
+            "out_bank04.asm"
+        ]
+        .map(PathBuf::from)
+    );
+    assert_eq!(includes(d.text()), names[1..]);
+    assert_tab_indented(&d);
+    // The main file includes the base once per run of banks it holds in order.
+    assert_lines(
+        &d,
+        &[
+            "\t.inesprg 2",
+            "\t.bank 0",
+            "\t.org $C000",
+            "\t.incbin \"base.nes\", 16, 16384",
+            "\t.bank 4",
+            "\t.org $0000",
+            "\t.incbin \"base.nes\", 16400, 8192",
+            "",
+            "\t.include \"out_bank01.asm\"",
+        ],
+    );
+    assert_eq!(d.text().matches(".incbin").count(), 2);
+    assert!(!d.text().contains("L_E00B          ="), "{}", d.text());
+    for (path, text) in &d.files()[1..] {
+        assert!(!text.contains("base.nes"), "{}: {text}", path.display());
+    }
+    let bank1 = &d.files()[1].1;
+    let lines: Vec<&str> = bank1.lines().skip(1).collect();
+    assert_eq!(
+        lines,
+        [
+            "\t.bank 1",
+            "\t.org $E005",
+            "\tjsr NewInit",
+            "",
+            "; Init",
+            "\t.org $E00B",
+            // Defined in the range, so not a constant of the main file.
+            "L_E00B:",
+            "\tlda #$01",
+            "",
+            "\t.org $E100",
+            "; Added",
+            "NewInit:",
+            "\tlda #$02",
+            "\tsta $0300",
+            "\tjmp L_E00B",
+        ]
+    );
+    // New banks are written whole; the changed CHR bank comes from the CHR file.
+    assert!(d.files()[2].1.contains("\t.bank 2\n\t.org $8000\n"));
+    assert!(
+        d.files()[4]
+            .1
+            .ends_with("\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\", 0, 8192\n")
+    );
+    assert_eq!(
+        d.chr_file(),
+        Some((Path::new("out.chr"), new_chr.as_slice()))
+    );
+    assert!(
+        d.files()
+            .iter()
+            .all(|(_, text)| disasm::is_unedited_source(text))
+    );
+    // As one file, and with CHR data as `.db`.
+    let d = patch_round_trip(
+        &hack,
+        &base,
+        &json.replace(r#""split_banks": true"#, r#""chr": "db""#),
+    );
+    assert_eq!(d.files().len(), 1);
+    assert_tab_indented(&d);
+    assert_lines(
+        &d,
+        &[
+            "\t.bank 4",
+            "\t.org $0000",
+            "\t.db $00, $01, $02, $03, $04, $05, $06, $07",
+        ],
+    );
+}
+
+#[test]
+fn raw_rom_hacks_name_bank_files_in_hexadecimal() {
+    let t = Temp::new();
+    // 18 banks, each filled with its number.
+    let base: Vec<u8> = (0..18 * 8192).map(|i| (i / 8192) as u8).collect();
+    let mut hack = base.clone();
+    // Two changes far apart in bank 10, one in banks 16 and 17, and a new bank 18.
+    hack[10 * 8192 + 0x100..10 * 8192 + 0x103].copy_from_slice(&[1, 2, 3]);
+    hack[10 * 8192 + 0x1800] = 4;
+    hack[16 * 8192 + 5] = 5;
+    hack[17 * 8192 + 0x1ff0] = 6;
+    hack.extend(vec![0xea; 8192]);
+    t.write("base.bin", &base);
+    let c = config(r#"{"base": "base.bin", "options": {"split_banks": true}}"#);
+    let d = disasm::disassemble(&hack, Some(&base), &c, Path::new("src/hack.asm"), &NEVER)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let v = d.verify(&t.0, Some(&t.0), &NEVER);
+    assert!(v.matched, "{v:#?}");
+    let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(
+        names,
+        [
+            "src/hack.asm",
+            "src/hack_bank0A.asm",
+            "src/hack_bank10.asm",
+            "src/hack_bank11.asm",
+            "src/hack_bank12.asm"
+        ]
+        .map(PathBuf::from)
+    );
+    assert_eq!(includes(d.text()), names[1..]);
+    assert_tab_indented(&d);
+    assert_lines(
+        &d,
+        &[
+            "; Assemble with -raw (no iNES header).",
+            "\t.bank 0",
+            "\t.org $8000",
+            "\t.incbin \"base.bin\", 0, 147456",
+        ],
+    );
+    assert_eq!(d.text().matches(".incbin").count(), 1);
+    // Each file holds its bank, by number; the name is hexadecimal.
+    for (name, bank) in [(1, 10), (2, 16), (3, 17), (4, 18)] {
+        let text = &d.files()[name].1;
+        assert_eq!(
+            text.lines().nth(1),
+            Some(format!("\t.bank {bank}").as_str()),
+            "{text}"
+        );
+    }
+    let bank10 = &d.files()[1].1;
+    let orgs: Vec<&str> = bank10.lines().filter(|l| l.contains(".org")).collect();
+    assert_eq!(orgs, ["\t.org $8100", "\t.org $9800"]);
+    assert!(d.files()[3].1.contains("\t.org $DFF0\n"));
+    assert_eq!(
+        disasm::bank_path(Path::new("a/x.asm"), 63),
+        Path::new("a/x_bank3F.asm")
+    );
+    assert_eq!(d.summary().diff.unwrap().new_banks, [18]);
 }
 
 #[test]
@@ -901,7 +1128,7 @@ fn trainers_fail_verification() {
         &NEVER,
     )
     .unwrap();
-    assert_lines(&d, &["  .inesmir 4"]);
+    assert_lines(&d, &["\t.inesmir 4"]);
     let t = Temp::new();
     let v = d.verify(&t.0, Some(&t.0), &NEVER);
     assert!(!v.matched);
@@ -997,7 +1224,7 @@ fn names_in_operand_overrides_are_defined() {
             r#"{"operands": [{"address": "$E002", "expr": "PPUMASK"}], "options": {"nes_registers": true}}"#,
         ),
     );
-    assert_lines(&d, &["PPUMASK         = $2001", "  sta PPUMASK"]);
+    assert_lines(&d, &["PPUMASK         = $2001", "\tsta PPUMASK"]);
     // In a ROM hack, a label of an unchanged range named only by an override.
     let (base, hack) = hack_roms();
     let d = patch_round_trip(
@@ -1006,7 +1233,7 @@ fn names_in_operand_overrides_are_defined() {
         r#"{"labels": [{"address": "$E00E", "name": "Handler"}],
             "operands": [{"address": "$E105", "expr": "Handler-3"}]}"#,
     );
-    assert_lines(&d, &["Handler         = $E00E", "  jmp Handler-3"]);
+    assert_lines(&d, &["Handler         = $E00E", "\tjmp Handler-3"]);
 }
 
 #[test]
@@ -1019,7 +1246,7 @@ fn adjusted_pointers_that_wrap_are_numbers() {
     );
     c.rom = PathBuf::from("pointer.bin");
     let d = round_trip(&[0x01, 0x02, 0x01, 0x02], &c);
-    assert_lines(&d, &["  .dw $0201", "  .db $01", "  .db $02"]);
+    assert_lines(&d, &["\t.dw $0201", "\t.db $01", "\t.db $02"]);
 }
 
 #[test]
@@ -1061,7 +1288,7 @@ fn every_name_in_an_override_is_defined() {
             "operands": [{"address": "$E105", "expr": "Second"}]}"#,
     );
     // Only the name the source uses needs a definition.
-    assert_lines(&d, &["Second          = $E00B", "  jmp Second"]);
+    assert_lines(&d, &["Second          = $E00B", "\tjmp Second"]);
     assert!(!d.text().contains("First"), "{}", d.text());
 }
 
@@ -1075,7 +1302,7 @@ fn overrides_apply_in_text_regions() {
             r#"{{{regions}, "operands": [{{"address": "$E001", "expr": "'H'"}}]}}"#
         )),
     );
-    assert_lines(&d, &["  .db 'H'", "  .db \"I\""]);
+    assert_lines(&d, &["\t.db 'H'", "\t.db \"I\""]);
     // A value that changes the byte fails verification.
     let d = disasm::disassemble(
         &rom,
@@ -1228,7 +1455,7 @@ fn words_are_not_split_by_names_inside_them() {
         &d,
         &[
             "D_7000:",
-            "  .dw $7777, $7777 ; high byte",
+            "\t.dw $7777, $7777 ; high byte",
             "Mid = D_7000+1",
         ],
     );
@@ -1238,7 +1465,7 @@ fn words_are_not_split_by_names_inside_them() {
         &rom,
         &config(r#"{"regions": [{"start": "$E004", "length": 4, "type": "words"}]}"#),
     );
-    assert_lines(&d, &["  lda D_E004+1", "D_E004:", "  .dw $1234, $5678"]);
+    assert_lines(&d, &["\tlda D_E004+1", "D_E004:", "\t.dw $1234, $5678"]);
     // An expression cannot replace half a word.
     let e = disasm::disassemble(
         &[0x77; 4],
@@ -1273,7 +1500,7 @@ fn inline_arguments_may_be_described_by_regions() {
     );
     assert_lines(
         &d,
-        &["  jsr sub_E007", "  .db \"A\"", "  lda <$20", "  rts"],
+        &["\tjsr sub_E007", "\t.db \"A\"", "\tlda <$20", "\trts"],
     );
     assert!(issues(&d, IssueKind::CodeDataConflict).is_empty());
     let reset = d
@@ -1314,11 +1541,11 @@ fn vectors_are_traced_whatever_regions_cover() {
         &d,
         &[
             "RESET:",
-            "  lda #$01",
+            "\tlda #$01",
             "NMI:",
-            "  rti",
-            "  .dw $E002",
-            "  .dw RESET, NMI",
+            "\trti",
+            "\t.dw $E002",
+            "\t.dw RESET, NMI",
         ],
     );
     // The automatic vector table is a pointer table too.
@@ -1365,7 +1592,7 @@ fn labels_inside_words_and_instructions_keep_comments() {
             "labels": [{"address": "$7001", "name": "Mid", "comment": "keep this note"}]}"#,
     );
     let d = round_trip(&[0x77; 2], &c);
-    assert_lines(&d, &["  .dw $7777", "; keep this note", "Mid = D_7000+1"]);
+    assert_lines(&d, &["\t.dw $7777", "; keep this note", "Mid = D_7000+1"]);
     let rom = nrom(concat!(
         "First:\n  lda #1\n  .db $2C\nSecond:\n  lda #2\n  rts\n",
         "Reset:\n  jsr First\n  jsr Second\n  jmp Reset\nNmi:\n  rti",
@@ -1378,7 +1605,7 @@ fn labels_inside_words_and_instructions_keep_comments() {
     );
     assert_lines(
         &d,
-        &["  bit $02A9", "; skipped by BIT", "Second = L_E002+1"],
+        &["\tbit $02A9", "; skipped by BIT", "Second = L_E002+1"],
     );
 }
 
