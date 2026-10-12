@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Seek, SeekFrom},
-    path::{Component, Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
     rc::Rc,
 };
 
@@ -61,16 +61,42 @@ pub fn resolve_path(path: &Path, base: &Path, root: Option<&Path>) -> Result<Pat
     }
     if let Some(root) = root {
         let root = canonicalize(root)?;
-        if !resolved.starts_with(root) {
+        if relative_to_root(&resolved, &root).is_none() {
             return Err("Path is outside the project root".into());
         }
     }
     Ok(resolved)
 }
 
+/// `path` relative to `root`, or `None` if it is not within `root`. Both are
+/// expected to be canonical, as `resolve_path` returns them. They are compared
+/// by component, ignoring the Windows verbatim prefix (`\\?\`) that only the
+/// longer of them may keep.
+pub fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    fn plain(prefix: Prefix<'_>) -> Prefix<'_> {
+        match prefix {
+            Prefix::VerbatimDisk(disk) => Prefix::Disk(disk),
+            Prefix::VerbatimUNC(server, share) => Prefix::UNC(server, share),
+            prefix => prefix,
+        }
+    }
+    let mut components = path.components();
+    for expected in root.components() {
+        let same = match (components.next()?, expected) {
+            (Component::Prefix(a), Component::Prefix(b)) => plain(a.kind()) == plain(b.kind()),
+            (a, b) => a == b,
+        };
+        if !same {
+            return None;
+        }
+    }
+    Some(components.as_path().to_owned())
+}
+
 /// `fs::canonicalize` without the Windows verbatim prefix (`\\?\`) when the
 /// path stays valid without it, so diagnostics show ordinary paths that editors
-/// recognize. Root checks compare paths produced by this same function.
+/// recognize. A long path keeps the prefix, so root checks compare paths with
+/// `relative_to_root`.
 pub(crate) fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
     #[cfg(windows)]

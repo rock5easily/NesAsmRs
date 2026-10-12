@@ -2,6 +2,7 @@ mod common;
 
 use common::Client;
 use serde_json::{Value, json};
+use std::path::Path;
 
 fn project(source: &str) -> Value {
     json!({"input":"main.asm","sources":{"main.asm":source}})
@@ -111,6 +112,34 @@ fn line_map_details() {
     let fill = at(8);
     assert_eq!(fill["size"], 100);
     assert_eq!(fill["bytes"].as_str().unwrap().split(' ').count(), 64);
+}
+
+#[test]
+fn long_paths_within_the_root() {
+    // Existing files whose canonical paths are long, in a directory whose
+    // path is not: on Windows, only the files' paths keep the `\\?\` prefix.
+    let mut c = Client::start();
+    let dir = common::long_dir(&c.root);
+    c.write(&format!("{dir}included_file.asm"), "  .db 2\n");
+    c.write(
+        &format!("{dir}source_file.asm"),
+        "  .include \"included_file.asm\"\n",
+    );
+    let arguments = json!({"input": format!("{dir}source_file.asm"), "include_paths": [dir],
+                           "output": format!("{dir}output_file.nes"), "lines": {}});
+    // The second build overwrites the ROM.
+    for _ in 0..2 {
+        let r = c.call("assemble", arguments.clone());
+        assert_eq!(r["isError"], false, "{r}");
+        // Lines name their files relative to the root.
+        let file = r["structuredContent"]["lines"]["lines"][0]["file"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            Path::new(file),
+            Path::new(&format!("{dir}included_file.asm"))
+        );
+    }
 }
 
 #[test]

@@ -14,7 +14,7 @@ pub use output::{
     Artifact, ArtifactKind, DisassemblyExport, export_disassembly, write_artifacts,
     write_disassembly,
 };
-pub use source::resolve_path;
+pub use source::{relative_to_root, resolve_path};
 
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;

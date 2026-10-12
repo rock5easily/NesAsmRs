@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
@@ -149,6 +149,25 @@ impl Client {
         }
         std::fs::write(path, data).unwrap();
     }
+}
+
+/// A relative directory, ending in `/`, whose canonical path within `root`
+/// stays below 260 characters while a file in it with a name of 12 or more
+/// characters exceeds that. On Windows, canonical paths keep the verbatim
+/// prefix (`\?\`) only from that length.
+pub fn long_dir(root: &Path) -> String {
+    let root = std::fs::canonicalize(root).unwrap();
+    let root = root.to_string_lossy();
+    let length = root.strip_prefix(r"\?\").unwrap_or(&root).len();
+    let mut dir = String::new();
+    while length + 1 + dir.len() < 250 {
+        dir.push(if dir.len() % 50 == 49 { '/' } else { 'd' });
+    }
+    if dir.ends_with('/') {
+        dir.push('d');
+    }
+    dir.push('/');
+    dir
 }
 
 impl Client {

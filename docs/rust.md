@@ -128,6 +128,8 @@ iNES/raw/S-record、リスト出力、watchを提供します。PCE専用機能�
   -1（`$FFFFFFFF`）を返します。
 
 ローカルMCPは `--root` を必須とし、正規化した依存ファイルと出力パスをこの範囲に制限します。
+Windowsでは260文字以上の正規化したパスが `\\?\` 接頭辞を保つため、ルート内かどうかは接頭辞の有無を
+区別せずにコンポーネント単位で判定します（`nesasm_core::relative_to_root`）。
 includeパスは各要求の `include_paths` で渡します。サーバは `NES_INCLUDE` を暗黙に使いません。
 stdoutにはMCP通信だけを出力します。JSONとして解析できない行にはJSON-RPCの
 `-32700 Parse error` を返します。サーバ名は `nesasm-mcp` として通知します。ROMバイト列は応答に含めず、成果物パスを返します。

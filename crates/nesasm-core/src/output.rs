@@ -131,9 +131,8 @@ fn check_rooted_output(rom: &Path, root: &Path) -> Result<(), String> {
 
 fn check_not_hidden(path: &Path, root: &Path) -> Result<(), String> {
     let root = crate::source::canonicalize(root)?;
-    let relative = path
-        .strip_prefix(&root)
-        .map_err(|_| "Path is outside the project root")?;
+    let relative =
+        crate::relative_to_root(path, &root).ok_or("Path is outside the project root")?;
     if relative
         .components()
         .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))

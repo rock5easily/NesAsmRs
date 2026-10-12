@@ -624,6 +624,34 @@ fn source_files_outside_the_root_and_absolute_paths() {
 }
 
 #[test]
+fn long_source_paths_within_the_root() {
+    // Files whose canonical paths are long, in a directory whose path is not:
+    // on Windows, only the files' paths keep the `\\?\` prefix.
+    let t = Temp::new();
+    let dir = common::long_dir(&t.0);
+    t.write(&format!("{dir}included_file.asm"), "  .db 2\n");
+    t.write(&format!("{dir}binary_data.bin"), [3]);
+    t.write(
+        &format!("{dir}source_file.asm"),
+        "  .db 1\n  .include \"included_file.asm\"\n  .incbin \"binary_data.bin\"\n",
+    );
+    let mut request = t.request(AssembleOptions::default());
+    request.input = format!("{dir}source_file.asm").into();
+    request.include_paths = vec![t.0.join(&dir)];
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[..3], [1, 2, 3]);
+    // So are in-memory files.
+    request.files.insert(
+        format!("{dir}included_file.asm").into(),
+        b"  .db 4\n".to_vec(),
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(r.binary[..3], [1, 4, 3]);
+}
+
+#[test]
 fn expanded_source_limit() {
     let t = Temp::new();
     // Six levels of ten calls expand to a million lines.
