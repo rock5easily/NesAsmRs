@@ -1,7 +1,7 @@
 //! NESASM source from an analysis. Every byte of the ROM is emitted in
 //! order, so the source reassembles to the same ROM.
 
-use super::analysis::{Analysis, Class, FILL_RUN, Insn, Loc, Region, Target};
+use super::analysis::{Analysis, Class, FILL_RUN, Insn, Label, Loc, Region, Target};
 use super::config::{ChrMode, RegionType};
 use super::patch::Patches;
 use super::{Address, RomFormat, SourceLine};
@@ -432,15 +432,16 @@ impl Writer<'_> {
             );
         }
         for label in self.a.labels.get(&loc).into_iter().flatten() {
-            for line in label.comment.iter().flat_map(|c| c.lines()) {
-                self.push(
-                    loc.bank,
-                    Some(address),
-                    0,
-                    format!("; {line}").trim_end().to_owned(),
-                );
-            }
+            self.label_comment(loc.bank, address, label);
             self.push(loc.bank, Some(address), 0, format!("{}:", label.name));
+        }
+    }
+
+    /// The comment lines of a label.
+    fn label_comment(&mut self, bank: usize, address: u32, label: &Label) {
+        for line in label.comment.iter().flat_map(|c| c.lines()) {
+            let text = format!("; {line}").trim_end().to_owned();
+            self.push(bank, Some(address), 0, text);
         }
     }
 
@@ -484,9 +485,11 @@ impl Writer<'_> {
             };
             for label in self.a.labels.get(&inner).into_iter().flatten() {
                 let base = base.name.clone();
+                let inner_address = address + (offset - loc.offset) as u32;
+                self.label_comment(loc.bank, inner_address, label);
                 self.push(
                     loc.bank,
-                    Some(address + (offset - loc.offset) as u32),
+                    Some(inner_address),
                     0,
                     format!("{} = {base}+{}", label.name, offset - loc.offset),
                 );
@@ -672,6 +675,7 @@ impl Writer<'_> {
             };
             let base = base.name.clone();
             for label in self.a.labels.get(&inner).into_iter().flatten() {
+                self.label_comment(loc.bank, address, label);
                 self.push(
                     loc.bank,
                     Some(address),

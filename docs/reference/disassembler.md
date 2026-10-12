@@ -102,7 +102,8 @@ are reserved.
 
 - Automatic labels: `sub_C123` (JSR targets), `L_C123` (jumps and branches),
   `D_C123` (data read by code or named by tables), and `NMI`, `RESET`, `IRQ`
-  for the vectors. When several banks hold the address, the bank is included
+  for the vectors. The vectors are always traced; those no region describes
+  are written as a pointer table. When several banks hold the address, the bank is included
   (`L_03_8123`). A target inside an instruction, or in the second byte of a
   word of a `words`/`pointers` region, is written `label+n`; a named one is
   defined as `name = label+n`, so instructions and words are never split.

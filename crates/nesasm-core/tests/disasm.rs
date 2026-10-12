@@ -1301,3 +1301,83 @@ fn rom_hack_issues_cover_whole_instructions() {
         ]
     );
 }
+
+#[test]
+fn vectors_are_traced_whatever_regions_cover() {
+    let rom = nrom("Reset:\n  lda #1\nNmi:\n  rti");
+    // A region over the NMI vector only.
+    let d = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$FFFA", "length": 2, "type": "words"}]}"#),
+    );
+    assert_lines(
+        &d,
+        &[
+            "RESET:",
+            "  lda #$01",
+            "NMI:",
+            "  rti",
+            "  .dw $E002",
+            "  .dw RESET, NMI",
+        ],
+    );
+    // The automatic vector table is a pointer table too.
+    let e = disasm::disassemble(
+        &rom,
+        None,
+        &config(r#"{"operands": [{"address": "$FFFB", "expr": "$00"}]}"#),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        e[0].message,
+        "operands $FFFB: the second byte of a word; give the expression at the word"
+    );
+}
+
+#[test]
+fn rom_hack_table_issues_include_the_high_byte() {
+    // Banks 0 and 1 both at $8000; the table in bank 3 points to $8000.
+    let mut bin = vec![0u8; 4 * 8192];
+    bin[3 * 8192 + 0x10] = 0x80;
+    let json = r#"{"banks": [{"bank": 1, "org": "$8000"}],
+        "regions": [{"start": "$E000", "length": 1, "type": "low_bytes", "pair": "$E010"},
+                    {"start": "$E010", "length": 1, "type": "high_bytes"}],
+        "patches": [{"start": "$E010", "length": 1}]}"#;
+    let t = Temp::new();
+    t.write("base.bin", &bin);
+    let mut c = config(json);
+    c.base = Some(PathBuf::from("base.bin"));
+    let d = disasm::disassemble(&bin, Some(&bin), &c, Path::new("out.asm"), &NEVER).unwrap();
+    assert!(d.verify(&t.0, Some(&t.0), &NEVER).matched);
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        ["$E000 $8000 is held by banks 0, 1; add a references entry with target_bank"]
+    );
+}
+
+#[test]
+fn labels_inside_words_and_instructions_keep_comments() {
+    let c = config(
+        r#"{"load_address": "$7000", "regions": [{"start": "$7000", "length": 2, "type": "words"}],
+            "labels": [{"address": "$7001", "name": "Mid", "comment": "keep this note"}]}"#,
+    );
+    let d = round_trip(&[0x77; 2], &c);
+    assert_lines(&d, &["  .dw $7777", "; keep this note", "Mid = D_7000+1"]);
+    let rom = nrom(concat!(
+        "First:\n  lda #1\n  .db $2C\nSecond:\n  lda #2\n  rts\n",
+        "Reset:\n  jsr First\n  jsr Second\n  jmp Reset\nNmi:\n  rti",
+    ));
+    let d = round_trip(
+        &rom,
+        &config(
+            r#"{"labels": [{"address": "$E003", "name": "Second", "comment": "skipped by BIT"}]}"#,
+        ),
+    );
+    assert_lines(
+        &d,
+        &["  bit $02A9", "; skipped by BIT", "Second = L_E002+1"],
+    );
+}

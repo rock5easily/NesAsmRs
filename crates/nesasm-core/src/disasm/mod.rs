@@ -80,10 +80,10 @@ pub struct Issue {
     pub bank: Option<usize>,
     pub address: Address,
     pub message: String,
-    /// Offset and length in the bank of the bytes concerned.
+    /// Offsets and lengths in the bank of the bytes concerned.
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
-    pub(crate) span: Option<(usize, usize)>,
+    pub(crate) spans: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -327,14 +327,14 @@ pub fn disassemble(
     };
     if let Some(patches) = &patches {
         // Only the changed ranges matter.
-        analysis
-            .issues
-            .retain(|issue| match (issue.bank, issue.span) {
-                (Some(bank), Some((start, length))) => patches.ranges[bank]
+        analysis.issues.retain(|issue| match issue.bank {
+            Some(bank) if !issue.spans.is_empty() => issue.spans.iter().any(|(start, length)| {
+                patches.ranges[bank]
                     .iter()
-                    .any(|r| start < r.end && start + length > r.start),
-                _ => true,
-            });
+                    .any(|r| *start < r.end && start + length > r.start)
+            }),
+            _ => true,
+        });
     }
     let rendered = render::render(
         &analysis,

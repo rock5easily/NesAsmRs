@@ -458,7 +458,7 @@ impl Analysis {
             bank: loc.map(|l| l.bank),
             address: Address(address),
             message,
-            span: loc.map(|l| (l.offset, 1)),
+            spans: loc.map(|l| (l.offset, 1)).into_iter().collect(),
         });
     }
 
@@ -596,21 +596,6 @@ impl Analysis {
             }
         }
         self.apply_regions(config, &mut errors);
-        if errors.is_empty() {
-            let mut inside: Vec<Loc> = self
-                .operands
-                .keys()
-                .filter(|l| self.in_word(**l))
-                .copied()
-                .collect();
-            inside.sort();
-            for loc in inside {
-                errors.push(format!(
-                    "operands ${:04X}: the second byte of a word; give the expression at the word",
-                    self.memory.address(loc)
-                ));
-            }
-        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -825,6 +810,25 @@ impl Analysis {
 
     fn trace_all(&mut self, cancel: &AtomicBool) -> Result<(), Vec<String>> {
         self.seed_vectors();
+        // Checked after the vectors, which are a pointer table too.
+        let mut inside: Vec<Loc> = self
+            .operands
+            .keys()
+            .filter(|l| self.in_word(**l))
+            .copied()
+            .collect();
+        if !inside.is_empty() {
+            inside.sort();
+            return Err(inside
+                .into_iter()
+                .map(|loc| {
+                    format!(
+                        "operands ${:04X}: the second byte of a word; give the expression at the word",
+                        self.memory.address(loc)
+                    )
+                })
+                .collect());
+        }
         self.seed_tables();
         let code_regions: Vec<Region> = self
             .regions
@@ -885,25 +889,41 @@ impl Analysis {
             .collect();
         for bank in banks {
             let start = (VECTORS - self.memory.banks[bank].org) as usize;
-            let covered = self.regions[bank]
-                .iter()
-                .any(|r| r.start < start + 6 && start < r.end);
-            if covered {
-                continue;
+            // Vectors no region describes form a pointer table (seed_tables
+            // traces them); the others are traced here.
+            let covered: Vec<bool> = (0..3)
+                .map(|i| {
+                    let entry = start + 2 * i;
+                    self.regions[bank]
+                        .iter()
+                        .any(|r| r.start < entry + 2 && entry < r.end)
+                })
+                .collect();
+            let mut i = 0;
+            while i < 3 {
+                if covered[i] {
+                    i += 1;
+                    continue;
+                }
+                let first = i;
+                while i < 3 && !covered[i] {
+                    i += 1;
+                }
+                let (begin, end) = (start + 2 * first, start + 2 * i);
+                self.regions[bank].push(Region {
+                    bank,
+                    start: begin,
+                    end,
+                    kind: RegionType::Pointers,
+                    pair: None,
+                    code_targets: true,
+                    adjust: 0,
+                    columns: None,
+                    comment: None,
+                });
+                self.class[bank][begin..end].fill(Class::Data);
             }
-            self.regions[bank].push(Region {
-                bank,
-                start,
-                end: start + 6,
-                kind: RegionType::Pointers,
-                pair: None,
-                code_targets: true,
-                adjust: 0,
-                columns: None,
-                comment: None,
-            });
             self.regions[bank].sort_by_key(|r| r.start);
-            self.class[bank][start..start + 6].fill(Class::Data);
             for (i, name) in NAMES.into_iter().enumerate() {
                 let from = Loc {
                     bank,
@@ -913,8 +933,20 @@ impl Analysis {
                     self.memory.byte(from),
                     self.memory.byte(from.at(from.offset + 1)),
                 ]));
-                if let Target::Rom(loc) = self.resolve_from(from, address) {
+                let target = self.resolve_from(from, address);
+                if let Target::Rom(loc) = target {
                     self.vectors.entry(loc).or_insert(name);
+                    if covered[i] {
+                        self.work.push_back((loc, Some(from)));
+                        self.want(loc, Want::Jump);
+                    }
+                }
+                if covered[i] {
+                    self.refs.push(Ref {
+                        from,
+                        kind: XrefKind::Pointer,
+                        target,
+                    });
                 }
             }
         }
@@ -932,7 +964,15 @@ impl Analysis {
             .collect();
         for table in tables {
             for (from, address) in self.table_entries(&table) {
+                let before = self.issues.len();
                 let target = self.resolve_from(from, address);
+                // The high byte of a split table entry is part of it too.
+                if let (RegionType::LowBytes, Some(high)) = (table.kind, table.pair) {
+                    let offset = high + from.offset - table.start;
+                    for issue in &mut self.issues[before..] {
+                        issue.spans.push((offset, 1));
+                    }
+                }
                 if let Target::Rom(loc) = target {
                     if table.code_targets {
                         self.work.push_back((loc, Some(from)));
@@ -1154,7 +1194,7 @@ impl Analysis {
                 format!("The instruction at ${address:04X}{source} would overlap other code, data or the end of the bank"),
             );
             if let Some(issue) = self.issues.last_mut() {
-                issue.span = Some((loc.offset, len.min(end - loc.offset)));
+                issue.spans = vec![(loc.offset, len.min(end - loc.offset))];
             }
             return None;
         }
@@ -1181,8 +1221,8 @@ impl Analysis {
         let before = self.issues.len();
         self.reference(loc, insn);
         for issue in &mut self.issues[before..] {
-            if issue.span == Some((loc.offset, 1)) {
-                issue.span = Some((loc.offset, len));
+            if issue.spans == [(loc.offset, 1)] {
+                issue.spans = vec![(loc.offset, len)];
             }
         }
         Some(insn)
@@ -1560,7 +1600,7 @@ impl Analysis {
                 ),
             );
             if let Some(issue) = self.issues.last_mut() {
-                issue.span = Some((loc.offset, length));
+                issue.spans = vec![(loc.offset, length)];
             }
         }
     }
