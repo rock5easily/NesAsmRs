@@ -11,6 +11,9 @@ use crate::state::{BANK_SIZE, MAX_BANKS};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Instructions followed per routine for the routine report.
+pub(crate) const MAX_ROUTINE: usize = 16384;
+
 /// Runs of one value at least this long are padding (`.ds`), not unknown data.
 pub(crate) const FILL_RUN: usize = 16;
 
@@ -391,7 +394,9 @@ pub(crate) struct Analysis {
     pub options: config::DisasmOptions,
     pub vectors: BTreeMap<Loc, &'static str>,
     /// The routine of each instruction in a routine body (the first routine found).
-    pub routine_index: HashMap<Loc, Loc>,
+    pub routine_index: HashMap<Loc, Vec<Loc>>,
+    /// Routines whose code exceeds [`MAX_ROUTINE`] instructions.
+    pub truncated: HashSet<Loc>,
     references: HashMap<Loc, usize>,
     entries: HashMap<Loc, Routine>,
     /// ROM targets of calls, jumps and branches.
@@ -430,6 +435,7 @@ impl Analysis {
             options: config.options.clone(),
             vectors: BTreeMap::new(),
             routine_index: HashMap::new(),
+            truncated: HashSet::new(),
             references: HashMap::new(),
             entries: HashMap::new(),
             flow: HashMap::new(),
@@ -452,6 +458,7 @@ impl Analysis {
             bank: loc.map(|l| l.bank),
             address: Address(address),
             message,
+            span: loc.map(|l| (l.offset, 1)),
         });
     }
 
@@ -1404,9 +1411,12 @@ impl Analysis {
             let mut seen = HashSet::new();
             let mut stack = vec![head];
             while let Some(loc) = stack.pop() {
-                if body.len() >= 4096 || (loc != head && heads.contains(&loc)) || !seen.insert(loc)
-                {
+                if (loc != head && heads.contains(&loc)) || !seen.insert(loc) {
                     continue;
+                }
+                if body.len() >= MAX_ROUTINE {
+                    self.truncated.insert(head);
+                    break;
                 }
                 let Some(insn) = self.insns.get(&loc) else {
                     continue;
@@ -1429,14 +1439,20 @@ impl Analysis {
                         }
                         next += routine.inline_bytes;
                     }
-                    if next < self.memory.banks[loc.bank].end {
+                    let bank = &self.memory.banks[loc.bank];
+                    if next < bank.end {
                         stack.push(loc.at(next));
+                    } else if let Resolved::Rom(n) =
+                        self.memory.resolve(Some(loc.bank), bank.org + next as u32)
+                    {
+                        // As traced, code continues into the bank holding the next address.
+                        stack.push(n);
                     }
                 }
             }
             body.sort();
             for loc in &body {
-                self.routine_index.entry(*loc).or_insert(head);
+                self.routine_index.entry(*loc).or_default().push(head);
             }
             self.routines.insert(head, body);
         }
@@ -1489,6 +1505,9 @@ impl Analysis {
                     first + length as u32 - 1
                 ),
             );
+            if let Some(issue) = self.issues.last_mut() {
+                issue.span = Some((loc.offset, length));
+            }
         }
     }
 
@@ -1504,6 +1523,11 @@ impl Analysis {
 
     /// The routine containing the instruction at `loc`.
     pub fn routine_of(&self, loc: Loc) -> Option<Loc> {
-        self.routine_index.get(&loc).copied()
+        self.routines_of(loc).first().copied()
+    }
+
+    /// Every routine whose code includes the instruction at `loc`.
+    pub fn routines_of(&self, loc: Loc) -> &[Loc] {
+        self.routine_index.get(&loc).map_or(&[], Vec::as_slice)
     }
 }

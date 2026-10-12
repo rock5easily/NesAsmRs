@@ -185,7 +185,8 @@ pub fn write_disassembly(
     }
     let main = files[0].1.clone();
     let main_text = match fs::read(&main) {
-        Ok(text) => Some(String::from_utf8_lossy(&text).into_owned()),
+        // Text that is not UTF-8 was not generated (or was edited).
+        Ok(text) => Some(String::from_utf8(text).unwrap_or_default()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.to_string()),
     };
@@ -223,7 +224,7 @@ pub fn write_disassembly(
         let replaceable = match kind {
             ArtifactKind::Source => {
                 let text = fs::read(path).map_err(|e| e.to_string())?;
-                crate::disasm::is_unedited_source(&String::from_utf8_lossy(&text))
+                std::str::from_utf8(&text).is_ok_and(crate::disasm::is_unedited_source)
             }
             _ => {
                 let data = fs::read(path).map_err(|e| e.to_string())?;

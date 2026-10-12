@@ -80,6 +80,10 @@ pub struct Issue {
     pub bank: Option<usize>,
     pub address: Address,
     pub message: String,
+    /// Offset and length in the bank of the bytes concerned.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) span: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -201,6 +205,9 @@ pub struct Routine {
     /// Addresses outside the ROM it reads and writes.
     pub reads: Vec<String>,
     pub writes: Vec<String>,
+    /// The routine has more instructions than are followed (16384).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Accesses of an address outside the ROM (RAM, I/O, SRAM).
@@ -297,10 +304,11 @@ pub fn disassemble(
         if path
             .to_string_lossy()
             .chars()
-            .any(|c| c == '"' || c.is_control())
+            // A backslash is a separator only on Windows.
+            .any(|c| c == '"' || c.is_control() || (c == '\\' && !cfg!(windows)))
         {
             return Err(vec![error(format!(
-                "Path '{}' contains a quote or control character",
+                "Path '{}' contains a quote, control character or backslash",
                 path.display()
             ))]);
         }
@@ -319,15 +327,14 @@ pub fn disassemble(
     };
     if let Some(patches) = &patches {
         // Only the changed ranges matter.
-        let memory = &analysis.memory;
-        analysis.issues.retain(|issue| {
-            issue.bank.is_none_or(|bank| {
-                let offset = i64::from(issue.address.0) - i64::from(memory.banks[bank].org);
-                patches.ranges[bank]
+        analysis
+            .issues
+            .retain(|issue| match (issue.bank, issue.span) {
+                (Some(bank), Some((start, length))) => patches.ranges[bank]
                     .iter()
-                    .any(|r| offset >= r.start as i64 && offset <= r.end as i64)
-            })
-        });
+                    .any(|r| start < r.end && start + length > r.start),
+                _ => true,
+            });
     }
     let rendered = render::render(
         &analysis,
@@ -456,6 +463,12 @@ impl Disassembly {
         };
         let a = &self.analysis;
         let lines = self.line_map();
+        let mut by_target: BTreeMap<Loc, Vec<&analysis::Ref>> = BTreeMap::new();
+        for r in &a.refs {
+            if let Target::Rom(t) = r.target {
+                by_target.entry(t).or_default().push(r);
+            }
+        }
         let mut diffs = Vec::new();
         for (bank, ranges) in p.ranges.iter().enumerate() {
             let image = &a.memory.banks[bank];
@@ -464,7 +477,8 @@ impl Disassembly {
                 let classes = &a.class[bank][range.start..range.end];
                 let count = |f: fn(&Class) -> bool| {
                     if image.chr {
-                        0
+                        // CHR banks are data, as in the bank summary.
+                        if f(&Class::Data) { classes.len() } else { 0 }
                     } else {
                         classes.iter().filter(|c| f(c)).count()
                     }
@@ -507,12 +521,18 @@ impl Disassembly {
                     .filter_map(|(loc, _)| a.routine_of(*loc))
                     .map(|head| self.name(head))
                     .collect();
-                let referenced_from = a
-                    .refs
-                    .iter()
-                    .filter(|r| {
-                        !inside(&r.from) && matches!(&r.target, Target::Rom(t) if inside(t))
-                    })
+                let referenced_from = by_target
+                    .range(
+                        Loc {
+                            bank,
+                            offset: range.start,
+                        }..Loc {
+                            bank,
+                            offset: range.end,
+                        },
+                    )
+                    .flat_map(|(_, refs)| refs.iter())
+                    .filter(|r| !inside(&r.from))
                     .take(MAX_NAMES)
                     .map(|r| self.xref(r, &lines))
                     .collect();
@@ -611,6 +631,7 @@ impl Disassembly {
                     calls: cap(calls),
                     reads: cap(reads),
                     writes: cap(writes),
+                    truncated: a.truncated.contains(head),
                 }
             })
             .collect()
@@ -629,8 +650,8 @@ impl Disassembly {
                 XrefKind::Read | XrefKind::Pointer => entry.0 += 1,
                 _ => {}
             }
-            if let Some(head) = a.routine_of(r.from) {
-                entry.2.insert(self.name(head));
+            for head in a.routines_of(r.from) {
+                entry.2.insert(self.name(*head));
             }
         }
         uses.into_iter()

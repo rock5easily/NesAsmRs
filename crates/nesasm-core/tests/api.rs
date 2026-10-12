@@ -568,3 +568,38 @@ fn write_disassembly_protects_split_sources_and_chr() {
         "{e}"
     );
 }
+
+#[test]
+fn write_disassembly_keeps_sources_that_are_not_utf8() {
+    let t = Temp::new();
+    let r = t.run("  .inesprg 1\n  .bank 1\n  .org $FFFA\n  .dw 0, 0, 0\n");
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    let never = AtomicBool::new(false);
+    // A comment with U+FFFD, which a lossy conversion would also produce.
+    let config = nesasm_core::disasm::parse_config(
+        r#"{"comments": [{"address": "$E000", "text": "�", "position": "above"}]}"#,
+    )
+    .unwrap();
+    let d = nesasm_core::disasm::disassemble(&rom, None, &config, Path::new("game.asm"), &never)
+        .unwrap();
+    let write = || nesasm_core::write_disassembly(&d, &t.0, None, Path::new("game.nes"));
+    write().unwrap();
+    let path = t.0.join("game.asm");
+    let bytes = fs::read(&path).unwrap();
+    let at = bytes
+        .windows(3)
+        .position(|w| w == [0xef, 0xbf, 0xbd])
+        .unwrap();
+    let mut edited = bytes[..at].to_vec();
+    edited.push(0xff);
+    edited.extend(&bytes[at + 3..]);
+    fs::write(&path, &edited).unwrap();
+    let e = write().unwrap_err();
+    assert!(
+        e.contains("game.asm exists and is not an unedited generated file"),
+        "{e}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), edited);
+}

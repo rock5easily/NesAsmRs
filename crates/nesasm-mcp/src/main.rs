@@ -909,6 +909,12 @@ impl Server {
                 DiagnosticCode::Disasm,
                 "The generated source does not reassemble to the ROM; nothing was written (see verification)",
             ));
+        } else if cancel.load(Ordering::Relaxed) {
+            // The time limit passed; nothing is written after the reply.
+            report.diagnostics.push(error(
+                DiagnosticCode::Cancelled,
+                "The time limit passed before writing; nothing was written",
+            ));
         } else {
             match nesasm_core::write_disassembly(d, root, Some(root), &loaded.rom) {
                 Ok(artifacts) => {

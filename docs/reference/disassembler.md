@@ -120,7 +120,8 @@ are reserved.
   `.asm` files and the `.chr` file (also after following links), outside
   hidden directories and never over the ROM.
 - Paths written into `.include` and `.incbin` (the output and `base`) cannot
-  contain quotes or control characters.
+  contain quotes or control characters, nor (outside Windows) backslashes.
+  Source files that are not valid UTF-8 are never replaced.
 
 ## Issues
 
@@ -150,5 +151,7 @@ to 8 MiB each (also the base ROM). A disassembly is subject to the server's time
 `offset` and `limit`. `view` returns the source lines of `from`-`to` (default
 256 bytes) with their bytes. `xrefs` lists the references to each label,
 symbol or address. `routines` lists code reached from each entry without
-following calls, with callers, calls and the RAM it reads and writes. `ram`
-lists addresses outside the ROM with read and write counts.
+following calls (also into the next bank), with callers, calls and the RAM
+it reads and writes; a routine is followed for up to 16384 instructions and
+marked `truncated` beyond. `ram` lists addresses outside the ROM with read
+and write counts and every routine that accesses them.

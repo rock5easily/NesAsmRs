@@ -981,7 +981,7 @@ fn paths_cannot_add_source_lines() {
             .unwrap();
         assert!(
             e[0].message
-                .contains("contains a quote or control character"),
+                .contains("contains a quote, control character or backslash"),
             "{e:?}"
         );
     }
@@ -1096,5 +1096,121 @@ fn overrides_apply_in_text_regions() {
             v.mismatches[0].actual.as_str()
         ),
         ("48", "00")
+    );
+}
+
+#[test]
+fn routines_continue_into_the_next_bank() {
+    // NOP at $DFFF (bank 0), then LDA <$20 / RTS at $E000 (bank 1).
+    let c = config(
+        r#"{"load_address": "$DFFF", "entry_points": [{"address": "$DFFF", "name": "Split"}]}"#,
+    );
+    let d = round_trip(&[0xea, 0xa5, 0x20, 0x60], &c);
+    let split = d
+        .routines()
+        .into_iter()
+        .find(|r| r.name == "Split")
+        .unwrap();
+    assert_eq!(
+        (split.size, split.reads.clone()),
+        (4, vec!["$0020".to_owned()])
+    );
+}
+
+#[test]
+fn long_routines_are_marked_truncated() {
+    let mut code = vec![0xea; 16385];
+    code.push(0x60);
+    let c = config(
+        r#"{"load_address": "$8000", "entry_points": [{"address": "$8000", "name": "Long"}]}"#,
+    );
+    let d = round_trip(&code, &c);
+    let long = d.routines().into_iter().find(|r| r.name == "Long").unwrap();
+    assert_eq!((long.size, long.truncated), (16384, true));
+    let json = serde_json::to_value(d.routines()).unwrap();
+    assert_eq!(json[0]["truncated"], true);
+    let short = round_trip(&[0xea, 0x60], &c);
+    assert!(
+        serde_json::to_value(short.routines()).unwrap()[0]
+            .get("truncated")
+            .is_none()
+    );
+}
+
+#[test]
+fn ram_lists_every_routine_sharing_code() {
+    let rom = nrom(concat!(
+        "Reset:\n  jsr One\n  jsr Two\n  jmp Reset\n",
+        "One:\n  jmp Tail\nTwo:\n  jmp Tail\nTail:\n  lda <$20\n  rts\nNmi:\n  rti",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    let ram = d.ram();
+    let zp = ram.iter().find(|r| r.address == Address(0x20)).unwrap();
+    assert_eq!(zp.routines, ["sub_E009", "sub_E00C"]);
+}
+
+#[test]
+fn rom_hack_issues_overlapping_a_change_are_kept() {
+    let base = nrom(HACK_BASE);
+    let mut hack = base.clone();
+    // A byte inside the loose data at $E00F-$E011.
+    hack[16 + 8192 + 0x10] = 9;
+    let d = patch_round_trip(&hack, &base, "{}");
+    assert_eq!(
+        d.diffs()
+            .iter()
+            .map(|d| (d.start, d.end))
+            .collect::<Vec<_>>(),
+        [(Address(0xe010), Address(0xe010))]
+    );
+    assert_eq!(
+        issues(&d, IssueKind::UnknownRange),
+        ["$E00F $E00F-$E011 (3 bytes) is not reached by code nor described by a region"]
+    );
+    // The issue after a change is left out.
+    let mut hack = base.clone();
+    hack[16 + 8192 + 0x0e] = 0x40;
+    let d = patch_round_trip(&hack, &base, "{}");
+    assert!(issues(&d, IssueKind::UnknownRange).is_empty());
+}
+
+#[test]
+fn changed_chr_banks_count_as_data() {
+    let mut base = nrom(HACK_BASE);
+    base[5] = 1;
+    base.extend(vec![0x55; 8192]);
+    let mut hack = base.clone();
+    let last = hack.len() - 1;
+    hack[last] = 0;
+    let d = patch_round_trip(&hack, &base, "{}");
+    let chr = d.diffs().into_iter().find(|d| d.chr).unwrap();
+    assert_eq!(
+        (
+            chr.changed_bytes,
+            chr.data_bytes,
+            chr.code_bytes,
+            chr.unknown_bytes
+        ),
+        (1, 8192, 0, 0)
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn backslashes_are_not_separators_outside_windows() {
+    let rom = nrom("Reset:\nNmi:\n  rti");
+    let e = disasm::disassemble(
+        &rom,
+        None,
+        &DisasmConfig::default(),
+        Path::new("a\\b.asm"),
+        &NEVER,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        e[0].message
+            .contains("contains a quote, control character or backslash"),
+        "{e:?}"
     );
 }
