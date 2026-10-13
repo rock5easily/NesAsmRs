@@ -50,14 +50,99 @@ labels in unchanged ranges that the source uses are defined as constants
 (`L_E00B = $E00B`). Issues are reported only within the changed ranges.
 PRG banks are matched with the base's PRG banks in order, and CHR banks with
 its CHR banks, so an expanded ROM lines up; banks the base lacks are
-disassembled whole. Changed CHR banks are written whole, in the main file
-after the base ROM's `.incbin`: `.bank`, `.org $0000`, then
-`.incbin "<stem>.chr", offset, size`, so a split source has no bank files of
-CHR banks. The `.chr` file holds the changed CHR banks in order as raw data
-(edit it with a CHR tool), and `offset` is the position in it. `chr: "db"`
-does not apply with `base` and is an error. The base must have
+disassembled whole. The base ROM's `.incbin` covers its PRG banks only. The
+whole CHR ROM of the hack, changed or not, is extracted to `<stem>.chr` in its
+original order (edit it with a CHR tool) and included once at the end of the
+main file: `.bank` of the first CHR bank (the number of 8 KiB PRG banks),
+`.org $0000`, then `.incbin "<stem>.chr"`. A split source has no bank files of
+CHR banks, and a ROM with CHR RAM has no CHR file. `diffs` still list the
+changed CHR banks with their `changed_bytes`; the extraction does not count as
+a change. `chr: "db"` does not apply with `base` and is an error. The base must have
 the same format as `rom` (`.nes` or whole-bank `.bin`), without a trainer;
 fragments (`load_address`) cannot have a base.
+
+## How code is traced
+
+Code is traced from the vectors, `entry_points`, `code` regions and jump
+tables, following JSR, JMP and branches. The disassembler never decodes
+unreached bytes as code: what is not traced stays `.db` (`unknown_range`).
+Along each path it keeps the values it knows, so that it can follow code that
+only runs after some setup. Where it cannot be sure, a value is unknown and
+nothing is inferred from it:
+
+- Registers, RAM ($0000-$07FF, $6000-$7FFF) and pushed values that are
+  constants: loaded immediately, from RAM written on the path, or from a ROM
+  byte; moved, incremented, added to. A write whose address is not known
+  (indexed by an unknown register, or through a pointer) forgets the RAM it
+  may reach, and one through a pointer that is not known also the banks.
+  Indexed writes wrap around $FFFF.
+- The PRG banks at $8000 and $A000. In a switched bank ($8000/$A000 window of
+  the layout), code runs with its own bank switched in; code that writes
+  another bank, or one that is not known, into its own window is not
+  followed further, nor is code after a call to a routine that writes the
+  bank of that window to the mapper itself (or through the routines it
+  calls) unless the bank it leaves is known. A call whose effects are not
+  known, and a write through a pointer that is not known, are taken to
+  leave the bank the code runs in (a convention: code does not switch its
+  own bank out that way). On mapper 4
+  (MMC3), writes of known values to the bank select ($8000) and bank data
+  ($8001) registers switch R6 ($8000) and R7 ($A000) in PRG mode 0; a bank
+  select for PRG mode 1 or of an unknown value, and any other write to the
+  bank data register, make the bank at $8000 (or both) unknown. References
+  into $8000-$BFFF resolve to the bank switched in there; if the layout places
+  that bank at another window, the reference is `unresolved_bank`, naming the
+  `banks` entry to add. A call into a switched bank runs with the caller's
+  banks.
+- What a called routine does: each of its paths is followed with symbolic
+  values (up to 4096 instructions in all, calls nested 6 deep; paths that
+  join or loop back are walked again knowing only what they share, until
+  they know nothing new), giving the banks and RAM it sets in terms of the caller's registers
+  and RAM. A routine that switches the bank in A, or the banks a game keeps in
+  RAM, is recognised from its code; the caller then knows the banks after the
+  call. A routine with too many paths keeps the banks only if no code it
+  reaches writes to $8000-$FFFF or jumps where the scan cannot follow. A path
+  through code that cannot be followed (an indirect jump, a routine that is
+  not known) makes the banks after the call unknown. If the routine would
+  switch in banks held in RAM were that code to change nothing,
+  `bank_switch` names the routine and the `switch_banks` to give it in
+  `entry_points` if it always does.
+- Where paths that know different values join, the code is traced again
+  knowing only what they share (up to 16 times), so a reference never uses a
+  bank that only one of the paths switched in.
+
+From these values it also follows:
+
+- Indirect jumps through a pointer the path knows (`JMP [$xxFF]` reads its
+  high byte from $xx00, as the NMOS 6502 does), and the constant addresses
+  code stores into the pointer of an indirect JMP elsewhere (thread entries,
+  interrupt handlers that chain): two stores in a row into its two bytes, still
+  unchanged when the path jumps, calls or branches, unless code also reads
+  data through that pointer (`lda [ptr],y`) or the address is in
+  $8000-$BFFF (the bank there at the jump is not known). The `indirect_jump`
+  issue lists where they were stored.
+- A return address pushed before a jump (`pha` of a constant address-1): the
+  code there runs when the routine jumped to returns, if a path of it that
+  can be followed returns. Before a jump through a pointer that is not known,
+  `indirect_jump` names the address to give in `entry_points` if the targets
+  return. An RTS after pushing a constant address jumps to it plus one.
+- Routines that take their return address. One that jumps through a pointer
+  read through it (a jump table after each JSR to it) makes the words after
+  each JSR a jump table: an entry at a time, while the two bytes are
+  unclassified, before the first target that follows the table, and point to
+  an instruction in the banks of the call (up to 128 entries); `jump_table`
+  reports each table to confirm. One that reads arguments after the JSR stops
+  the trace after the JSR (`return_address`), until `entry_points` gives its
+  `inline_bytes`.
+- For jumps through values read from ROM tables (`lda table,x` stored into
+  the pointer, or pushed before an RTS), `indirect_jump` names the tables and
+  the region to add (`pointers`, or `low_bytes` with its `pair`, and
+  `adjust: -1` for RTS jumps).
+
+Annotations take precedence: `references` over the banks a path knows,
+`entry_points` with `no_return`, `inline_bytes`, `switch_banks` or `keeps_banks` over what a
+routine is found to do, and regions over jump tables found after a JSR.
+Writes to $8000-$FFFF are mapper registers: their operands are numbers
+(`sta $8000`), and the `mapper_write` issue explains the MMC3 registers.
 
 ## Mapper 4 fixed PRG banks
 
@@ -107,11 +192,20 @@ these two banks as one range, $C000-$FFFF:
   (multiples of $2000 up to $E000). By default the last two PRG banks are at
   $C000/$E000 and the others alternate $8000/$A000; a single bank is at $E000.
   CHR banks follow the PRG banks.
-- `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes"}]`.
+- `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes", "switch_banks", "keeps_banks"}]`.
   Code is traced from the interrupt vectors and these addresses. `no_return`:
   a JSR to the routine does not return. `inline_bytes`: bytes of inline
   arguments after each JSR to it, emitted as data (or as the regions that
-  describe them).
+  describe them). `switch_banks`: `["$F5", "$F6"]`, the RAM addresses holding
+  the PRG banks the routine switches in at $8000 and $A000 (`null` for a
+  window it leaves); a call to the routine, or code going on into it, then
+  switches those banks in and changes no other RAM the caller knows. If the
+  value in the RAM is not known at the call, the bank there is not known,
+  and code calling it from that window is taken to keep its own bank (the
+  convention for calls above). The addresses must be RAM ($0000-$07FF, $6000-$7FFF). `keeps_banks: true`: the
+  routine returns with the banks it was called with (such as a thread yield,
+  during which other code switches banks); nothing else about it is assumed.
+  An entry point gives `switch_banks` or `keeps_banks`, not both.
 - `labels`: `[{"address", "bank", "name", "comment"}]`, names of ROM
   addresses. The comment is placed above the label.
 - `symbols`: `[{"name", "value", "size", "comment"}]`, names of RAM, I/O and
@@ -125,6 +219,11 @@ these two banks as one range, $C000-$FFFF:
   length), `text` (ASCII as `.db "..."`). For tables, `code_targets: true`
   makes the targets code entry points (jump tables) and `adjust` is the stored
   value minus the target (`-1` for RTS jump tables, written `label-1`).
+  `bank_table` on `pointers` and `low_bytes` is the start of a table in the
+  same bank with a byte per entry: the PRG bank (8 KiB) switched in for that
+  entry. A target that bank holds resolves to it; other targets (the fixed
+  banks, the table's own bank) resolve as usual. Code targets run with the
+  table's bank and the entry's bank switched in.
 - `comments`: `[{"address", "bank", "text", "position"}]`; `position` is
   `line` (end of the line, default) or `above` (lines of their own).
 - `operands`: `[{"address", "bank", "expr"}]` replaces the operand of the
@@ -161,15 +260,17 @@ are reserved.
 - Bytes no code reaches and no region describes are `.db`; runs of 16 or more
   equal bytes are `.ds n` or `.ds n, fill`.
 - CHR banks are `.incbin "<stem>.chr", offset, size` (written next to the
-  source by `export_disassembly`) or `.db` lines.
+  source by `export_disassembly`) or `.db` lines. A ROM hack includes the whole
+  `<stem>.chr` once (see ROM hacks).
+- Writes to $8000-$FFFF (mapper registers) keep numeric operands.
 - Instructions and directives are indented by one tab; labels, constants and
   comments start the line.
 - Paths in `.include` and `.incbin` are relative to the project root.
 - Bank files are `<stem>_bankXX.asm`, with the bank number in two uppercase
   hexadecimal digits (`_bank0A.asm` for bank 10, `_bank3F.asm` for bank 63),
   included from the main file; with `mapper4_fixed_prg_16k`, the last two PRG
-  banks share `<stem>_bankXX_YY.asm`. A ROM hack writes its changed CHR banks
-  in the main file. Older versions used decimal (`_bank10.asm` for
+  banks share `<stem>_bankXX_YY.asm`. A ROM hack includes its CHR ROM in the
+  main file. Older versions used decimal (`_bank10.asm` for
   bank 10), so an old name may now name another bank.
 - The first line of each file is `; Generated by nesasm disassembler; checksum ...`.
   `export_disassembly` replaces an existing file only if it is such a file
@@ -185,7 +286,9 @@ are reserved.
   edited ones are kept. Without the old main file, an old name that
   now names another bank is an error, and nothing is written. The main file
   also records the checksum of the `.chr` file, which is replaced only together
-  with an unedited main file and only if it was not changed either. It writes
+  with an unedited main file and only if it was not changed either (so the
+  CHR file of the changed banks that older versions wrote for a ROM hack is
+  replaced by the whole CHR ROM). It writes
   only `.asm` files and the `.chr` file (also after following links), outside
   hidden directories and never over the ROM. If one of the files cannot be
   replaced (for example, another program has it open), none of them is
@@ -201,12 +304,22 @@ mismatch), `invalid_opcode` (flow reaches a byte that is not an NMOS 6502
 instruction: wrong flow or data), `overlap` (code enters the middle of an
 instruction, as in BIT skip tricks, or an instruction would cross the end of a
 bank; see `mapper4_fixed_prg_16k`), `code_data_conflict` (code reaches a data
-region), `indirect_jump` (`JMP [ptr]`: describe the targets with a pointer
-table or entry points), `unresolved_bank` (add `references`), `outside_rom`
+region), `indirect_jump` (`JMP [ptr]`, or an RTS after pushes, whose targets
+are not known: describe them with a pointer table or entry points; the
+message names the tables the pointer was read from, or where addresses
+stored into it were followed), `jump_table` (a jump table found after a JSR
+to a routine that jumps through its return address: confirm its length with
+a `pointers` region), `return_address` (a routine takes its return address,
+so the code after the JSR is not followed: give its `inline_bytes`),
+`bank_switch` (a routine switches in banks held in RAM on the paths that can
+be followed, but other paths run code that cannot: give it `switch_banks` if
+it always does),
+`unresolved_bank` (add `references`, or the `banks` entry the message names
+for a bank switched in where the layout does not place it), `outside_rom`
 (code in RAM or SRAM is called), `flow_leaves_rom` (code runs off a bank),
-`mapper_write` (a write to $8000-$FFFF, usually bank switching), and
-`unknown_range` (bytes not described; padding runs are not reported).
-65C02-only encodings are treated as data.
+`mapper_write` (a write to $8000-$FFFF, usually bank switching; MMC3 writes
+are explained), and `unknown_range` (bytes not described; padding runs are
+not reported). 65C02-only encodings are treated as data.
 
 ## Limits
 
@@ -216,6 +329,12 @@ whose adjusted target would wrap around $FFFF are written as numbers.
 
 ROMs of up to 128 banks of 8 KiB; over MCP, ROM and annotation files of up
 to 8 MiB each (also the base ROM). A disassembly is subject to the server's time limit.
+
+The trace remembers up to 32 RAM values and 16 pushed values per path, and
+is repeated at most 16 times for joins of paths. A routine's summary follows
+up to 4096 instructions over all its paths and calls nested up to 6 deep;
+the scan for mapper writes in longer routines follows up to 16384
+instructions. A jump table after a JSR has at most 128 entries.
 
 ## Queries
 

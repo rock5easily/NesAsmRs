@@ -265,7 +265,7 @@ fn annotations_name_and_shape_the_source() {
     assert_eq!(
         issues(&d, IssueKind::IndirectJump),
         [
-            "$C012 Indirect JMP [$0010] at $C012; describe its targets with a pointers region (code_targets) or entry_points"
+            "$C012 Indirect JMP [$0010] at $C012; the address comes from the table at $C019 indexed by X, which a region describes"
         ]
     );
 }
@@ -849,22 +849,33 @@ fn expanded_rom_hacks_line_up_chr_banks() {
     let d = patch_round_trip(&hack, &base, "{}");
     let summary = d.summary().diff.unwrap();
     assert_eq!(summary.new_banks, [2, 3]);
-    // The base's PRG banks, then its CHR bank after the new PRG banks.
+    // The base's PRG banks, the new PRG banks, then the whole CHR ROM
+    // (unchanged, but after the new PRG banks) from the CHR file.
     assert_lines(
         &d,
         &[
             "\t.bank 0",
             "\t.org $8000",
             "\t.incbin \"base.nes\", 16, 16384",
-            "\t.bank 4",
-            "\t.org $0000",
-            "\t.incbin \"base.nes\", 16400, 8192",
+            "",
             "\t.bank 2",
             "\t.org $C000",
         ],
     );
-    assert_eq!(d.text().matches("\"base.nes\"").count(), 2);
-    assert!(d.chr_file().is_none());
+    assert!(
+        d.text()
+            .ends_with("\n\n\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+        "{}",
+        d.text()
+    );
+    assert_eq!(d.text().matches("\"base.nes\"").count(), 1);
+    assert_eq!(
+        d.chr_file(),
+        Some((Path::new("out.chr"), &base[16 + 16384..]))
+    );
+    // Only the new PRG banks differ; the CHR bank is no change.
+    assert_eq!(summary.changed_bytes, 16384);
+    assert!(d.diffs().iter().all(|d| !d.chr));
 }
 
 /// Checks that instructions and directives are indented by one tab, and
@@ -916,7 +927,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
         "patches": [{"start": "$E00B", "end": "$E00C", "comment": "Init"}]}"#;
     let d = patch_round_trip(&hack, &base, json);
     let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
-    // Bank 0 is unchanged and has no file; the CHR bank 4 has none either.
+    // Bank 0 is unchanged and has no file; the CHR bank 4 has none at all.
     assert_eq!(
         names,
         [
@@ -929,7 +940,8 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
     );
     assert_eq!(includes(d.text()), names[1..]);
     assert_tab_indented(&d);
-    // The main file includes the base once per run of banks it holds in order.
+    // The main file includes the base's PRG banks once, and the whole CHR
+    // ROM from the CHR file at its end.
     assert_lines(
         &d,
         &[
@@ -937,26 +949,24 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
             "\t.bank 0",
             "\t.org $C000",
             "\t.incbin \"base.nes\", 16, 16384",
-            "\t.bank 4",
-            "\t.org $0000",
-            "\t.incbin \"base.nes\", 16400, 8192",
             "",
             "\t.include \"out_bank01.asm\"",
             "\t.include \"out_bank03.asm\"",
-            // The changed CHR bank is written over the base in the main file.
             "",
             "\t.bank 4",
             "\t.org $0000",
-            "\t.incbin \"out.chr\", 0, 8192",
+            "\t.incbin \"out.chr\"",
         ],
     );
     assert!(
-        d.text()
-            .ends_with("\t.include \"out_bank03.asm\"\n\n\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\", 0, 8192\n"),
+        d.text().ends_with(
+            "\t.include \"out_bank03.asm\"\n\n\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\"\n"
+        ),
         "{}",
         d.text()
     );
-    assert_eq!(d.text().matches("\"base.nes\"").count(), 2);
+    assert_eq!(d.text().matches("\"base.nes\"").count(), 1);
+    assert_eq!(d.text().matches("\"out.chr\"").count(), 1);
     assert!(!d.text().contains("L_E00B          ="), "{}", d.text());
     for (path, text) in &d.files()[1..] {
         assert!(!text.contains("base.nes"), "{}: {text}", path.display());
@@ -985,7 +995,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
             "\tjmp L_E00B",
         ]
     );
-    // New banks are written whole; the changed CHR bank comes from the CHR file.
+    // New banks are written whole; the CHR bank comes from the CHR file.
     assert!(d.files()[2].1.contains("\t.bank 2\n\t.org $8000\n"));
     assert_eq!(
         d.chr_file(),
@@ -1006,7 +1016,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
     assert_tab_indented(&d);
     assert!(
         d.text()
-            .ends_with("\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\", 0, 8192\n"),
+            .ends_with("\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
         "{}",
         d.text()
     );
@@ -1014,7 +1024,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
         d.chr_file(),
         Some((Path::new("out.chr"), new_chr.as_slice()))
     );
-    // A ROM hack always includes its changed CHR banks from the CHR file
+    // A ROM hack always includes its CHR ROM from the CHR file
     // (edited with CHR tools), never as `.db` lines.
     for split in ["true", "false"] {
         let mut c = config(&json.replace(
@@ -1029,7 +1039,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
         assert_eq!(
             messages,
             [
-                "options.chr \"db\" does not apply with base: changed CHR banks are included from the CHR file"
+                "options.chr \"db\" does not apply with base: the CHR ROM is included from the CHR file"
             ]
         );
     }
@@ -1448,6 +1458,22 @@ fn changed_chr_banks_count_as_data() {
         ),
         (1, 8192, 0, 0)
     );
+    // The CHR file holds the whole CHR ROM, but only the changed byte counts.
+    assert_eq!(d.summary().diff.unwrap().changed_bytes, 1);
+    assert_eq!(d.chr_file().unwrap().1, &hack[16 + 16384..]);
+}
+
+#[test]
+fn rom_hacks_with_chr_ram_have_no_chr_file() {
+    let (base, hack) = hack_roms();
+    assert_eq!(hack[5], 0);
+    for split in ["true", "false"] {
+        let json = format!(r#"{{"options": {{"split_banks": {split}}}}}"#);
+        let d = patch_round_trip(&hack, &base, &json);
+        assert!(d.chr_file().is_none());
+        assert!(d.files().iter().all(|(_, text)| !text.contains(".chr")));
+        assert!(!d.text().contains("CHR file checksum"), "{}", d.text());
+    }
 }
 
 #[cfg(not(windows))]
@@ -2064,18 +2090,15 @@ fn rom_hacks_with_many_changed_chr_banks_keep_a_small_main_file() {
     let d = patch_round_trip(&hack, &base, r#"{"options": {"split_banks": true}}"#);
     assert_eq!(d.files().len(), 1);
     assert!(d.text().len() < 4096, "{}", d.text().len());
-    assert_eq!(d.text().matches("\t.incbin \"out.chr\", ").count(), 32);
-    assert_lines(
-        &d,
-        &[
-            "\t.bank 2",
-            "\t.org $0000",
-            "\t.incbin \"out.chr\", 0, 8192",
-            "\t.bank 33",
-            "\t.org $0000",
-            "\t.incbin \"out.chr\", 253952, 8192",
-        ],
+    assert_eq!(d.text().matches("\"out.chr\"").count(), 1);
+    assert!(
+        d.text()
+            .ends_with("\n\n\t.bank 2\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+        "{}",
+        d.text()
     );
+    // The diffs still name each changed CHR bank.
+    assert_eq!(d.diffs().iter().filter(|d| d.chr).count(), 32);
     assert_eq!(d.chr_file().unwrap().1, &hack[16 + 16384..]);
 }
 
@@ -2141,4 +2164,1057 @@ fn mapper4_fixed_prg_16k_resolves_within_the_pair_unless_references_say() {
     let d = round_trip(&rom, &config(&chosen));
     assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
     assert_lines(&d, &["RESET:", "\tsei", "\tldx #$00", "\tjsr sub_01_E010"]);
+}
+
+/// A mapper 4 ROM of eight PRG banks: `banks` (sources of banks 0-5), then
+/// `reset` in bank 7, followed by `Halt` and the bank switching routines
+/// `SwitchSeq` (bank A at $8000, A+1 at $A000) and `Switch` ($F5 at $8000,
+/// $F6 at $A000).
+fn switching_rom(banks: &str, reset: &str) -> Vec<u8> {
+    assemble(&format!(
+        "  .inesprg 4\n  .inesmap 4\n{banks}\n  .bank 7\n  .org $E000\nReset:\n{reset}\nHalt:\n  jmp Halt\n\
+         SwitchSeq:\n  sta <$F5\n  sta <$F6\n  inc <$F6\n\
+         Switch:\n  lda #$06\n  sta $8000\n  lda <$F5\n  sta $8001\n  lda #$07\n  sta $8000\n  lda <$F6\n  sta $8001\n  rts\n\
+         Nmi:\n  rti\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n"
+    ))
+}
+
+/// Banks 0, 2 and 4 start with code at $8000 (bank 2's calls $A000), banks
+/// 1, 3 and 5 at $A000.
+const SWITCHED_BANKS: &str = concat!(
+    "  .bank 0\n  .org $8000\n  lda #$00\n  rts\n",
+    "  .bank 1\n  .org $A000\n  lda #$01\n  rts\n",
+    "  .bank 2\n  .org $8000\n  lda #$02\n  jsr $A000\n  rts\n",
+    "  .bank 3\n  .org $A000\n  ldx #$03\n  rts\n",
+    "  .bank 4\n  .org $8000\n  lda #$04\n  rts\n",
+    "  .bank 5\n  .org $A000\n  lda #$05\n  rts\n",
+);
+
+#[test]
+fn calls_after_a_bank_switch_go_to_the_switched_bank() {
+    // Bank 2 through a routine taking A; bank 4 by writing the registers;
+    // bank 0 through a routine reading $F5 and $F6.
+    let rom = switching_rom(
+        SWITCHED_BANKS,
+        concat!(
+            "  lda #$02\n  jsr SwitchSeq\n  jsr $8000\n",
+            "  lda #$06\n  sta $8000\n  lda #$04\n  sta $8001\n  jsr $8000\n",
+            "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  sta $E000\n",
+        ),
+    );
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(
+        issues(&d, IssueKind::UnresolvedBank).is_empty(),
+        "{:?}",
+        d.issues()
+    );
+    assert_lines(
+        &d,
+        &[
+            "\tjsr sub_E025",
+            "\tjsr sub_02_8000",
+            "\tsta $8000",
+            "\tsta $8001",
+            "\tjsr sub_04_8000",
+            "\tjsr sub_E02B",
+            "\tjsr sub_00_8000",
+            "\tsta $E000",
+        ],
+    );
+    // Code in bank 2 runs with bank 3 at $A000, switched in with it.
+    assert_lines(
+        &d,
+        &[
+            "sub_00_8000:",
+            "sub_02_8000:",
+            "\tlda #$02",
+            "\tjsr sub_03_A000",
+            "sub_03_A000:",
+            "\tldx #$03",
+            "sub_04_8000:",
+        ],
+    );
+    // Banks 1 and 5 are never switched in: their code stays data.
+    assert!(d.text().contains("\t.db $A9, $01, $60"), "{}", d.text());
+    assert!(d.text().contains("\t.db $A9, $05, $60"), "{}", d.text());
+    let writes = issues(&d, IssueKind::MapperWrite);
+    for write in [
+        "$E00A Write to ROM address $8000 at $E00A: MMC3 bank select $06: R6 (PRG bank at $8000)",
+        "$E00F Write to ROM address $8001 at $E00F: MMC3 R6 = $04: the PRG bank at $8000",
+        "$E01F Write to ROM address $E000 at $E01F: MMC3 IRQ disable",
+    ] {
+        assert!(writes.contains(&write.to_owned()), "{writes:?}");
+    }
+}
+
+#[test]
+fn a_bank_the_layout_places_elsewhere_is_suggested() {
+    // Bank 3 is switched in at $8000, but by default it is at $A000.
+    let banks = SWITCHED_BANKS.replace(".bank 3\n  .org $A000", ".bank 3\n  .org $8000");
+    let rom = switching_rom(
+        &banks,
+        "  lda #$03\n  sta <$F5\n  jsr Switch\n  jsr $8000\n",
+    );
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        [
+            "$E007 $8000 is in bank 3 here (switched in at $8000), but the layout places bank 3 at $A000; add {\"bank\": 3, \"org\": \"$8000\"} to banks"
+        ]
+    );
+    let d = round_trip(&rom, &config(r#"{"banks": [{"bank": 3, "org": "$8000"}]}"#));
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(&d, &["sub_03_8000:", "\tldx #$03", "\tjsr sub_03_8000"]);
+}
+
+#[test]
+fn paths_that_switched_different_banks_do_not_choose_one() {
+    // The two paths switch banks 2 and 4 before they join at the call.
+    let reset = concat!(
+        "  lda $0300\n  beq Other\n  lda #$02\n  jmp Common\n",
+        "Other:\n  lda #$04\nCommon:\n  jsr SwitchSeq\n  jsr $8000\n",
+    );
+    let rom = switching_rom(SWITCHED_BANKS, reset);
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        ["$E00F $8000 is held by banks 0, 2, 4; add a references entry with target_bank"]
+    );
+    assert_lines(&d, &["\tjsr $8000"]);
+    for code in [
+        "$A9, $00, $60",
+        "$A9, $02, $20, $00, $A0, $60",
+        "$A9, $04, $60",
+    ] {
+        assert!(d.text().contains(&format!("\t.db {code}")), "{}", d.text());
+    }
+    // Paths that switch the same bank agree.
+    let rom = switching_rom(SWITCHED_BANKS, &reset.replace("#$04", "#$02"));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(&d, &["\tjsr sub_02_8000"]);
+}
+
+#[test]
+fn addresses_stored_into_a_jump_pointer_are_code() {
+    // RESET stores a thread entry into $93/$94; the scheduler jumps through it.
+    let code = concat!(
+        "Reset:\n  lda #LOW(Thread)\n  sta <$93\n  lda #HIGH(Thread)\n  sta <$94\n  jsr Run\n",
+        "Halt:\n  jmp Halt\nRun:\n  jmp [$0093]\n",
+        "Thread:\n  lda #$01\n  sta $0300\n  rts\nNmi:\n  rti\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert_lines(&d, &["sub_E00E:", "\tjmp [$0093]", "L_E011:", "\tlda #$01"]);
+    assert_eq!(
+        issues(&d, IssueKind::IndirectJump),
+        [
+            "$E00E Indirect JMP [$0093] at $E00E: the addresses written to $0093 at $E006 are followed as code; give entry_points for its other targets"
+        ]
+    );
+    // A pointer that code also reads data through is not a code pointer.
+    let code = code.replace("Run:\n", "Run:\n  ldy #$00\n  lda [$93],y\n");
+    let d = round_trip(&nrom(&code), &DisasmConfig::default());
+    assert!(!d.text().contains("\tlda #$01"), "{}", d.text());
+    assert!(
+        d.text().contains("\t.db $A9, $01, $8D, $00, $03, $60"),
+        "{}",
+        d.text()
+    );
+}
+
+/// A routine that jumps to the A-th address of the word table after the
+/// JSR to it, through its return address.
+const DISPATCH: &str = concat!(
+    "Dispatch:\n  asl a\n  tay\n  iny\n  pla\n  sta <$C1\n  pla\n  sta <$C2\n",
+    "  lda [$C1],y\n  pha\n  iny\n  lda [$C1],y\n  sta <$C2\n  pla\n  sta <$C1\n  jmp [$00C1]\n",
+);
+
+#[test]
+fn jump_tables_after_a_dispatching_jsr_are_followed() {
+    // The first handler follows the table, which ends before it.
+    let rom = nrom(&format!(
+        "Reset:\n  lda $0300\n  jsr Dispatch\n  .dw First, Second\n\
+         First:\n  lda #$01\n  rts\nSecond:\n  lda #$02\n  rts\n{DISPATCH}Nmi:\n  rti\n"
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &[
+            "\tjsr sub_E010",
+            "\t.dw L_E00A, L_E00D",
+            "L_E00A:",
+            "\tlda #$01",
+            "L_E00D:",
+            "\tlda #$02",
+        ],
+    );
+    assert_eq!(
+        issues(&d, IssueKind::JumpTable),
+        [
+            "$E006 JSR $E010 at $E003 jumps through its return address: 2 entries of a jump table were found at $E006-$E009; confirm the length with a pointers region (\"code_targets\": true)"
+        ]
+    );
+    // A region describes the table instead.
+    let d = round_trip(
+        &rom,
+        &config(
+            r#"{"regions": [{"start": "$E006", "length": 4, "type": "pointers", "code_targets": true}]}"#,
+        ),
+    );
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    assert_lines(&d, &["\t.dw L_E00A, L_E00D", "L_E00A:", "\tlda #$01"]);
+    // Code reached by other paths ends a table: the word after the entry
+    // (the bytes of `lda #$00`, $00A9) is not an entry.
+    let rom = nrom(&format!(
+        "Reset:\n  lda $0300\n  beq Skip\n  jsr Dispatch\n  .dw First\nSkip:\n  lda #$00\n  rts\n\
+         First:\n  lda #$01\n  rts\n{DISPATCH}Nmi:\n  rti\n"
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &[
+            "\t.dw L_E00D",
+            "L_E00A:",
+            "\tlda #$00",
+            "L_E00D:",
+            "\tlda #$01",
+        ],
+    );
+    assert_eq!(
+        issues(&d, IssueKind::JumpTable),
+        [
+            "$E008 JSR $E010 at $E005 jumps through its return address: 1 entry of a jump table was found at $E008-$E009; confirm the length with a pointers region (\"code_targets\": true)"
+        ]
+    );
+}
+
+#[test]
+fn routines_taking_their_return_address_stop_the_trace() {
+    // Print reads the two bytes after the JSR and returns past them.
+    let print = concat!(
+        "Print:\n  pla\n  sta <$02\n  pla\n  sta <$03\n  ldy #$01\n  lda [$02],y\n  sta $0300\n",
+        "  lda <$02\n  clc\n  adc #$02\n  sta <$02\n  lda <$03\n  adc #$00\n  pha\n  lda <$02\n  pha\n  rts\n",
+    );
+    let rom = nrom(&format!(
+        "Reset:\n  jsr Print\n  .db $A9, $07\n  jmp Reset\n{print}Nmi:\n  rti\n"
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::ReturnAddress),
+        [
+            "$E000 JSR $E008 at $E000: the routine takes its return address (arguments after the JSR?), so the code after the JSR is not followed; give the routine \"inline_bytes\" or \"no_return\" in entry_points"
+        ]
+    );
+    assert!(
+        d.text().contains("\t.db $A9, $07, $4C, $00, $E0"),
+        "{}",
+        d.text()
+    );
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E008", "inline_bytes": 2}]}"#),
+    );
+    assert!(issues(&d, IssueKind::ReturnAddress).is_empty());
+    assert_lines(&d, &["\tjsr sub_E008", "\t.db $A9, $07", "\tjmp RESET"]);
+    // Pulling the return address only to return to the caller's caller
+    // does not stop the trace of the caller.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Check\n  lda #$05\n  jmp Reset\n",
+        "Check:\n  lda $0300\n  bne Out\n  pla\n  pla\nOut:\n  rts\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::ReturnAddress).is_empty());
+    assert_lines(&d, &["\tjsr sub_E008", "\tlda #$05"]);
+}
+
+#[test]
+fn pushed_return_addresses_and_rts_jumps_are_followed() {
+    // A return address pushed before a jump through a pointer that is not
+    // known: whether the targets return is not known either, so the issue
+    // suggests it as an entry point.
+    let code = concat!(
+        "Reset:\n  lda #HIGH(Back-1)\n  pha\n  lda #LOW(Back-1)\n  pha\n  jmp [$0000]\n",
+        "Back:\n  lda #HIGH(Next-1)\n  pha\n  lda #LOW(Next-1)\n  pha\n  rts\n",
+        "Next:\n  jmp Next\nNmi:\n  rti\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::IndirectJump),
+        [
+            "$E006 Indirect JMP [$0000] at $E006; describe its targets with a pointers region (code_targets) or entry_points (it pushes the return address $E009 first: if the targets return, give it in entry_points)"
+        ]
+    );
+    assert!(!d.text().contains("L_E009:"), "{}", d.text());
+    // Through a known pointer to a routine that returns, and an RTS to a
+    // pushed constant.
+    let code = code.replace(
+        "Reset:\n",
+        "Reset:\n  lda #LOW(Done)\n  sta <$00\n  lda #HIGH(Done)\n  sta <$01\n",
+    ) + "Done:\n  rts\n";
+    let d = round_trip(&nrom(&code), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &[
+            "\tjmp [$0000]",
+            "L_E011:",
+            "\tlda #$E0",
+            "\trts",
+            "L_E018:",
+            "\tjmp L_E018",
+        ],
+    );
+    // An RTS to an address pushed from tables: how to describe them.
+    let rom = nrom(concat!(
+        "Reset:\n  ldx $0300\n  lda Hi,x\n  pha\n  lda Lo,x\n  pha\n  rts\n",
+        "A1:\n  rts\nA2:\n  rts\nLo:\n  .db LOW(A1-1), LOW(A2-1)\nHi:\n  .db HIGH(A1-1), HIGH(A2-1)\n",
+        "Nmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::IndirectJump),
+        [
+            "$E00B RTS at $E00B jumps to an address pushed before it; the address comes from the low bytes at $E00E and the high bytes at $E010 indexed by X: describe them with a low_bytes region (\"pair\": \"$E010\", \"code_targets\": true, \"adjust\": -1) and a high_bytes region"
+        ]
+    );
+}
+
+#[test]
+fn bank_tables_give_the_bank_of_each_entry() {
+    // Handlers at $A000 in banks 1, 3 and 5; the table at $E018 gives the
+    // bank switched in for each.
+    let rom = switching_rom(
+        SWITCHED_BANKS,
+        concat!(
+            "  ldy $0300\n  lda Banks,y\n  sta <$F6\n  jsr Switch\n",
+            "  lda Lows,y\n  sta <$00\n  lda Highs,y\n  sta <$01\n  jmp [$0000]\n",
+            "Banks:\n  .db 1, 3, 5\nLows:\n  .db $00, $00, $00\nHighs:\n  .db $A0, $A0, $A0\n",
+        ),
+    );
+    let regions = r#"{"regions": [
+        {"start": "$E018", "length": 3, "type": "bytes"},
+        {"start": "$E01B", "length": 3, "type": "low_bytes", "pair": "$E01E", "code_targets": true, "bank_table": "$E018"},
+        {"start": "$E01E", "length": 3, "type": "high_bytes"}]}"#;
+    let d = round_trip(&rom, &config(regions));
+    assert!(
+        issues(&d, IssueKind::UnresolvedBank).is_empty(),
+        "{:?}",
+        d.issues()
+    );
+    assert_lines(
+        &d,
+        &[
+            "\t.db LOW(L_01_A000), LOW(L_03_A000), LOW(L_05_A000)",
+            "\t.db HIGH(L_01_A000), HIGH(L_03_A000), HIGH(L_05_A000)",
+        ],
+    );
+    assert_lines(
+        &d,
+        &[
+            "L_01_A000:",
+            "\tlda #$01",
+            "L_03_A000:",
+            "\tldx #$03",
+            "L_05_A000:",
+            "\tlda #$05",
+        ],
+    );
+    // Without it, the entries could be in any of the banks.
+    let d = round_trip(
+        &rom,
+        &config(&regions.replace(r#", "bank_table": "$E018""#, "")),
+    );
+    assert_eq!(issues(&d, IssueKind::UnresolvedBank).len(), 3);
+    let wrong = regions.replace(
+        r#""type": "bytes"}"#,
+        r#""type": "bytes", "bank_table": "$E01B"}"#,
+    );
+    let e = disasm::disassemble(&rom, None, &config(&wrong), Path::new("out.asm"), &NEVER)
+        .err()
+        .expect("bank_table on bytes should fail");
+    assert_eq!(
+        e[0].message,
+        "regions $E018: bank_table applies only to pointers and low_bytes"
+    );
+}
+
+#[test]
+fn rom_hacks_write_whole_instructions_reached_after_a_bank_switch() {
+    // The hack changes only the operand of `lda #$02` in bank 2, which is
+    // code only because the bank switch is followed.
+    let base = switching_rom(SWITCHED_BANKS, "  lda #$02\n  jsr SwitchSeq\n  jsr $8000\n");
+    let mut hack = base.clone();
+    hack[16 + 2 * 8192 + 1] = 0x22;
+    let d = patch_round_trip(&hack, &base, "{}");
+    let diffs: Vec<_> = d
+        .diffs()
+        .iter()
+        .map(|d| (d.bank, d.start, d.end, d.changed_bytes, d.code_bytes))
+        .collect();
+    assert_eq!(diffs, [(2, Address(0x8000), Address(0x8001), 1, 2)]);
+    assert_lines(
+        &d,
+        &["\t.bank 2", "\t.org $8000", "sub_02_8000:", "\tlda #$22"],
+    );
+}
+
+/// The issue of a call to $8000 that no known bank resolves (banks 0, 2
+/// and 4 hold it), and the code of banks 2 and 4 kept as data.
+fn assert_unresolved_8000(d: &Disassembly) {
+    let unresolved = issues(d, IssueKind::UnresolvedBank);
+    assert!(
+        unresolved.iter().any(|i| i
+            .ends_with("$8000 is held by banks 0, 2, 4; add a references entry with target_bank")),
+        "{unresolved:?}\n{}",
+        d.text()
+    );
+    for code in ["$A9, $02, $20, $00, $A0, $60", "$A9, $04, $60"] {
+        assert!(d.text().contains(&format!("\t.db {code}")), "{}", d.text());
+    }
+}
+
+#[test]
+fn loops_in_routines_are_summarised_over_every_pass() {
+    // The loop selects bank 2, then 4: the bank after the call is not the
+    // one of the first pass.
+    let reset = concat!(
+        "  jsr Select\n  jsr $8000\n  jmp Halt\n",
+        "Select:\n  lda #$06\n  sta $8000\n  ldx #$00\n",
+        "Loop:\n  inx\n  inx\n  stx $8001\n  cpx #$04\n  bne Loop\n  rts\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_unresolved_8000(&d);
+}
+
+#[test]
+fn writes_to_unknown_addresses_forget_values() {
+    let code = concat!(
+        "Reset:\n  lda #$00\n  sta <$00\n  lda #$E1\n  sta <$01\n",
+        "  ldx $0300\n  lda #$E2\n  sta <$00,x\n  jmp [$0000]\nNmi:\n  rti\n",
+        "  .org $E100\n  lda #$07\n  rts\n  .org $E200\n  lda #$08\n  rts\n",
+    );
+    // An indexed write may have changed the pointer.
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $07, $60"), "{}", d.text());
+    assert!(d.text().contains("\t.db $A9, $08, $60"), "{}", d.text());
+    assert_eq!(issues(&d, IssueKind::IndirectJump).len(), 1);
+    // With a known index, it is the high byte.
+    let d = round_trip(
+        &nrom(&code.replace("ldx $0300", "ldx #$01")),
+        &DisasmConfig::default(),
+    );
+    assert!(d.text().contains("\t.db $A9, $07, $60"), "{}", d.text());
+    assert_lines(&d, &["L_E200:", "\tlda #$08"]);
+    // A read-modify-write of the bank data register switches an unknown bank.
+    let reset = "  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n  inc $8001\n  jsr $8000\n";
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_unresolved_8000(&d);
+}
+
+#[test]
+fn code_that_switches_its_own_bank_out_is_not_followed_further() {
+    // Bank 0 switches bank 2 in at $8000, where it runs: the bytes after
+    // the switch in bank 0 are not what runs next.
+    let banks = concat!(
+        "  .bank 0\n  .org $8000\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+        "  .db $A9, $33, $60\n",
+        "  .bank 2\n  .org $8000\n  .db $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA\n  lda #$44\n  rts\n",
+    );
+    let reset = "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n";
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert_lines(&d, &["sub_00_8000:", "\tsta $8001", "\t.db $A9, $33, $60"]);
+    assert!(!d.text().contains("\tlda #$44"), "{}", d.text());
+}
+
+#[test]
+fn prg_mode_1_or_an_unknown_bank_select_forgets_the_bank_at_8000() {
+    for select in ["  lda #$46\n  sta $8000\n", "  lda $0300\n  sta $8000\n"] {
+        let reset =
+            format!("  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n{select}  jsr $8000\n");
+        let d = round_trip(
+            &switching_rom(SWITCHED_BANKS, &reset),
+            &DisasmConfig::default(),
+        );
+        assert_unresolved_8000(&d);
+    }
+}
+
+#[test]
+fn indirect_jumps_read_the_high_byte_from_the_same_page() {
+    // JMP [$00FF] reads $00FF and $0000, not $0100.
+    let code = concat!(
+        "Reset:\n  lda #$00\n  sta <$FF\n  lda #$E2\n  sta <$00\n  lda #$E1\n  sta $0100\n",
+        "  jmp [$00FF]\nNmi:\n  rti\n",
+        "  .org $E100\n  lda #$07\n  rts\n  .org $E200\n  lda #$08\n  rts\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert_lines(&d, &["\tjmp [$00FF]", "L_E200:", "\tlda #$08"]);
+    assert!(d.text().contains("\t.db $A9, $07, $60"), "{}", d.text());
+}
+
+#[test]
+fn values_a_routine_no_longer_remembers_are_unknown() {
+    // Select stores 2 into $20, then 32 other values, then selects the bank
+    // in $20: the caller's 4 is not the bank.
+    let mut reset = String::from(
+        "  lda #$04\n  sta <$20\n  jsr Select\n  jsr $8000\n  jmp Halt\nSelect:\n  lda #$02\n  sta <$20\n",
+    );
+    for i in 0..32 {
+        reset.push_str(&format!("  sta <${:02X}\n", 0x30 + i));
+    }
+    reset.push_str("  lda #$06\n  sta $8000\n  lda <$20\n  sta $8001\n  rts\n");
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, &reset),
+        &DisasmConfig::default(),
+    );
+    assert_unresolved_8000(&d);
+}
+
+#[test]
+fn a_switched_bank_the_layout_places_elsewhere_is_unresolved_even_if_one_bank_holds_the_address() {
+    // Bank 1 is switched in at $8000; only bank 0 is at $8000 in the layout.
+    let rom = assemble(concat!(
+        "  .inesprg 2\n  .inesmap 4\n",
+        "  .bank 0\n  .org $8000\n  lda #$00\n  rts\n",
+        "  .bank 1\n  .org $A000\n  lda #$01\n  rts\n",
+        "  .bank 3\n  .org $E000\nReset:\n  lda #$06\n  sta $8000\n  lda #$01\n  sta $8001\n",
+        "  jsr $8000\nHalt:\n  jmp Halt\nNmi:\n  rti\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        [
+            "$E00A $8000 is in bank 1 here (switched in at $8000), but the layout places bank 1 at $A000; add {\"bank\": 1, \"org\": \"$8000\"} to banks"
+        ]
+    );
+    assert!(d.text().contains("\t.db $A9, $00, $60"), "{}", d.text());
+}
+
+#[test]
+fn routines_reading_arguments_then_jumping_elsewhere_are_not_dispatchers() {
+    // Args takes two bytes after the JSR, then jumps through a pointer it
+    // sets itself: the bytes are no jump table, so $E110 is not code.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Args\n  .db $10, $E1\n  jmp Reset\n",
+        "Args:\n  pla\n  sta <$02\n  pla\n  sta <$03\n  ldy #$01\n  lda [$02],y\n  sta $0300\n",
+        "  lda #LOW(Post)\n  sta <$10\n  lda #HIGH(Post)\n  sta <$11\n  jmp [$0010]\n",
+        "Post:\n  rts\nNmi:\n  rti\n  .org $E110\n  .db $A9, $07, $60\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
+    assert!(d.text().contains("\t.db $A9, $07, $60"), "{}", d.text());
+}
+
+#[test]
+fn pointers_changed_a_byte_at_a_time_are_followed_only_when_whole() {
+    // The pointer is $E100 (changed before the call), then $E210; $E110
+    // is only half way.
+    let rom = nrom(concat!(
+        "Reset:\n  lda #$00\n  sta <$00\n  lda #$E1\n  sta <$01\n",
+        "  lda #$10\n  sta <$00\n  lda #$E2\n  sta <$01\n  jsr Run\n",
+        "Halt:\n  jmp Halt\nRun:\n  jmp [$0000]\nNmi:\n  rti\n",
+        "  .org $E100\n  lda #$06\n  rts\n  .org $E110\n  lda #$07\n  rts\n",
+        "  .org $E210\n  lda #$08\n  rts\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_lines(&d, &["L_E210:", "\tlda #$08"]);
+    assert!(!d.text().contains("\tlda #$06"), "{}", d.text());
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn pushed_addresses_are_returns_only_from_routines_that_return() {
+    // Hang never returns: the pushed $E10F+1 is no return address.
+    let code = concat!(
+        "Reset:\n  lda #$E1\n  pha\n  lda #$0F\n  pha\n  jmp Hang\n",
+        "Hang:\n  jmp Hang\nNmi:\n  rti\n  .org $E110\n  lda #$07\n  rts\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $07, $60"), "{}", d.text());
+    // A routine that returns goes back there.
+    let d = round_trip(
+        &nrom(&code.replace("Hang:\n  jmp Hang", "Hang:\n  lda #$01\n  rts")),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["L_E110:", "\tlda #$07"]);
+}
+
+#[test]
+fn routines_switching_banks_from_ram_can_be_annotated() {
+    // Switch2 selects the bank in $F5, but may also run code that cannot be
+    // followed (Sound), so the bank after a call to it is not known.
+    let reset = concat!(
+        "  lda #$02\n  sta <$F5\n  jsr Switch2\n  jsr $8000\n  jmp Halt\n",
+        "Switch2:\n  lda #$06\n  sta $8000\n  lda <$F5\n  sta $8001\n",
+        "  lda <$F8\n  beq Done\n  jsr Sound\nDone:\n  rts\nSound:\n  jmp [$0010]\n",
+    );
+    let rom = switching_rom(SWITCHED_BANKS, reset);
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_unresolved_8000(&d);
+    assert_eq!(
+        issues(&d, IssueKind::BankSwitch),
+        [
+            "$E00D The routine at $E00D switches in the bank in $00F5 at $8000 on the paths that can be followed, but others run code whose effects are not known, so the banks after a call to it are not known; if it always does, give it \"switch_banks\": [\"$00F5\", null] in entry_points"
+        ]
+    );
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E00D", "switch_banks": ["$F5", null]}]}"#),
+    );
+    assert!(issues(&d, IssueKind::BankSwitch).is_empty());
+    // Only bank 2's call to $A000, whose bank Switch2 does not switch.
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        ["$8002 $A000 is held by banks 1, 3, 5; add a references entry with target_bank"]
+    );
+    assert_lines(
+        &d,
+        &[
+            "sub_02_8000:",
+            "\tlda #$02",
+            "\tjsr sub_E00D",
+            "\tjsr sub_02_8000",
+        ],
+    );
+    // Code that goes on into it, as SwitchSeq does into Switch, too.
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, "  lda #$02\n  jsr SwitchSeq\n  jsr $8000\n"),
+        &config(r#"{"entry_points": [{"address": "$E011", "switch_banks": ["$F5", "$F6"]}]}"#),
+    );
+    assert!(
+        issues(&d, IssueKind::UnresolvedBank).is_empty(),
+        "{:?}",
+        d.issues()
+    );
+    assert_lines(&d, &["\tjsr sub_02_8000", "sub_E011:"]);
+    let e = disasm::disassemble(
+        &rom,
+        None,
+        &config(r#"{"entry_points": [{"address": "$E00D", "switch_banks": ["$8000", null]}]}"#),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .err()
+    .expect("switch_banks outside RAM should fail");
+    assert_eq!(
+        e[0].message,
+        "entry_points $E00D: switch_banks $8000 is not RAM ($0000-$07FF, $6000-$7FFF)"
+    );
+}
+
+#[test]
+fn values_pushed_before_a_loop_are_kept_through_it() {
+    // Restore saves $F5/$F6, loops around calls that cannot be followed
+    // (pushing $10 around it), restores them and goes on into Switch.
+    let rom = assemble(concat!(
+        "  .inesprg 4\n  .inesmap 4\n",
+        "  .bank 2\n  .org $8000\n  lda #$02\n  rts\n",
+        "  .bank 7\n  .org $E000\nReset:\n  lda #$02\n  sta <$F5\n  jsr Restore\n  jsr $8000\n",
+        "Halt:\n  jmp Halt\n",
+        "Restore:\n  lda <$F5\n  pha\n  lda <$F6\n  pha\n",
+        "Loop:\n  lda <$10\n  pha\n  jsr Yield\n  pla\n  sta <$10\n  jsr Yield\n  lda <$1E\n  bne Loop\n",
+        "  pla\n  sta <$F6\n  pla\n  sta <$F5\n  jmp Switch\n",
+        "Yield:\n  jmp [$0010]\n",
+        "Switch:\n  lda #$06\n  sta $8000\n  lda <$F5\n  sta $8001\n",
+        "  lda #$07\n  sta $8000\n  lda <$F6\n  sta $8001\n  rts\n",
+        "Nmi:\n  rti\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    ));
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E02F", "switch_banks": ["$F5", "$F6"]}]}"#),
+    );
+    assert!(
+        issues(&d, IssueKind::BankSwitch).is_empty(),
+        "{:?}",
+        d.issues()
+    );
+    assert!(
+        issues(&d, IssueKind::UnresolvedBank).is_empty(),
+        "{:?}",
+        d.issues()
+    );
+    assert_lines(&d, &["sub_02_8000:", "\tjsr sub_E00D", "\tjsr sub_02_8000"]);
+}
+
+#[test]
+fn summaries_of_routines_with_many_branches_stay_small() {
+    // 32 values stored, then 4000 branches: the summary keeps one state per
+    // instruction rather than the history of every path.
+    let mut code = String::from("Reset:\n  jsr Many\nHalt:\n  jmp Halt\nMany:\n");
+    for i in 0..32 {
+        code.push_str(&format!("  sta <${:02X}\n", 0x20 + i));
+    }
+    for _ in 0..2000 {
+        code.push_str("  bne *+2\n");
+    }
+    code.push_str("  rts\nNmi:\n  rti\n");
+    let started = std::time::Instant::now();
+    round_trip(&nrom(&code), &DisasmConfig::default());
+    assert!(started.elapsed().as_secs() < 60);
+}
+
+#[test]
+fn summaries_stop_where_code_switches_its_own_bank_out() {
+    // Sel in bank 0 switches bank 2 in at $8000 and goes on there (an RTS
+    // in bank 2); the bytes after it in bank 0 would select bank 4.
+    let banks = concat!(
+        "  .bank 0\n  .org $8000\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+        "  .db $A9, $06, $8D, $00, $80, $A9, $04, $8D, $01, $80, $60\n",
+        "  .bank 2\n  .org $8000\n  .db $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA\n  rts\n",
+        "  .bank 4\n  .org $8000\n  lda #$04\n  rts\n",
+    );
+    let reset = "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jsr $8000\n";
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $04, $60"), "{}", d.text());
+    assert!(
+        d.text()
+            .contains("\t.db $A9, $06, $8D, $00, $80, $A9, $04, $8D"),
+        "{}",
+        d.text()
+    );
+    // An unknown bank written into its own window stops the trace too.
+    let banks = banks.replace("  lda #$02\n  sta $8001\n", "  lda $0300\n  sta $8001\n");
+    let d = round_trip(&switching_rom(&banks, reset), &DisasmConfig::default());
+    assert!(
+        d.text()
+            .contains("\t.db $A9, $06, $8D, $00, $80, $A9, $04, $8D"),
+        "{}",
+        d.text()
+    );
+}
+
+#[test]
+fn annotated_bank_switches_leave_the_bank_select_unknown() {
+    // Switch (annotated) leaves R7 selected: the write to $8001 after it
+    // does not switch bank 4 in at $8000.
+    let reset = concat!(
+        "  lda #$06\n  sta $8000\n  lda #$02\n  sta <$F5\n  jsr Switch\n",
+        "  lda #$04\n  sta $8001\n  jsr $8000\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &config(r#"{"entry_points": [{"address": "$E01D", "switch_banks": ["$F5", "$F6"]}]}"#),
+    );
+    assert_unresolved_8000(&d);
+}
+
+#[test]
+fn writes_through_pointers_may_switch_banks() {
+    // R6 = 2, then a write through a pointer: unknown, or $8001.
+    let reset = |pointer: &str| {
+        format!(
+            "  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n{pointer}  ldy #$00\n  lda #$04\n  sta [$10],y\n  jsr $8000\n"
+        )
+    };
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, &reset("")),
+        &DisasmConfig::default(),
+    );
+    assert_unresolved_8000(&d);
+    let d = round_trip(
+        &switching_rom(
+            SWITCHED_BANKS,
+            &reset("  lda #$01\n  sta <$10\n  lda #$80\n  sta <$11\n"),
+        ),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["sub_04_8000:", "\tjsr sub_04_8000"]);
+}
+
+#[test]
+fn indexed_writes_wrap_around_ffff() {
+    // `sta $FFFF,x` with an unknown X may write $0000-$00FE.
+    let code = concat!(
+        "Reset:\n  lda #$00\n  sta <$00\n  lda #$E1\n  sta <$01\n",
+        "  ldx $0300\n  lda #$E2\n  sta $FFFF,x\n  jmp [$0000]\nNmi:\n  rti\n",
+        "  .org $E100\n  lda #$07\n  rts\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn only_pointers_holding_the_return_address_read_the_bytes_after_a_jsr() {
+    // The return address is in $20/$21, but [$20,x] with X = 4 reads
+    // through $24/$25: no jump table after the JSR.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Args\n  .db $10, $E1\n  jmp Reset\n",
+        "Args:\n  pla\n  sta <$20\n  pla\n  sta <$21\n  ldx #$04\n  lda [$20,x]\n  sta <$10\n",
+        "  lda [$20,x]\n  sta <$11\n  jmp [$0010]\nNmi:\n  rti\n",
+        "  .org $E110\n  lda #$07\n  rts\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn stored_pointers_into_switched_banks_are_not_followed() {
+    // The jump through $10 comes later, when another bank may be at $8000.
+    let banks = "  .bank 0\n  .org $8000\n  lda #$00\n  rts\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n",
+        "  lda #$00\n  sta <$10\n  lda #$80\n  sta <$11\n  jsr Run\n  jmp Halt\n",
+        "Run:\n  jmp [$0010]\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $00, $60"), "{}", d.text());
+    // Nor reported as followed.
+    let jumps = issues(&d, IssueKind::IndirectJump);
+    assert_eq!(jumps.len(), 1);
+    assert!(!jumps[0].contains("followed"), "{jumps:?}");
+}
+
+#[test]
+fn pushed_addresses_need_a_routine_that_returns() {
+    // Wrapper jumps through a pointer to Hang: it is not known to return.
+    let code = concat!(
+        "Reset:\n  lda #LOW(Hang)\n  sta <$10\n  lda #HIGH(Hang)\n  sta <$11\n",
+        "  lda #$E1\n  pha\n  lda #$0F\n  pha\n  jmp Wrapper\n",
+        "Wrapper:\n  jmp [$0010]\nHang:\n  jmp Hang\nNmi:\n  rti\n",
+        "  .org $E110\n  lda #$07\n  rts\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn calls_to_routines_that_switch_the_callers_bank_end_the_trace() {
+    // Sel2 writes R6 = 2 itself, then jumps where it cannot be followed:
+    // the code after the JSR in bank 0 may run in another bank.
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel2\n  .db $A9, $33, $60\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Sel2:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n  jmp [$0010]\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+}
+
+#[test]
+fn zero_page_pointers_wrap_around_ff() {
+    // The pointer at $FF has its high byte at $00: [$FF],y writes $8001.
+    let reset = concat!(
+        "  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+        "  lda #$01\n  sta <$FF\n  lda #$80\n  sta <$00\n  lda #$00\n  sta $0100\n",
+        "  ldy #$00\n  lda #$04\n  sta [$FF],y\n  jsr $8000\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["sub_04_8000:", "\tjsr sub_04_8000"]);
+}
+
+#[test]
+fn jump_tables_after_a_jsr_need_the_return_address_unchanged() {
+    // Skip moves the return address past two bytes of arguments before
+    // reading the table: the table does not start right after the JSR.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Skip\n  .db $10, $E1\n  .dw Handler\nHandler:\n  jmp Handler\n",
+        "Skip:\n  pla\n  sta <$C1\n  pla\n  sta <$C2\n  inc <$C1\n  inc <$C1\n",
+        "  ldy #$01\n  lda [$C1],y\n  sta <$10\n  iny\n  lda [$C1],y\n  sta <$11\n  jmp [$0010]\n",
+        "Nmi:\n  rti\n  .org $E110\n  lda #$07\n  rts\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn switch_banks_of_unknown_ram_keep_the_bank_the_caller_runs_in() {
+    // Switch is annotated. Called from bank 0, it switches in the bank in
+    // $F5, which is not known here: like any call whose bank is not known,
+    // it is taken to keep bank 0 at $8000 (a convention).
+    let reset = "  lda #$00
+  sta <$F5
+  jsr Switch
+  jsr $8000
+";
+    let annotations =
+        config(r#"{"entry_points": [{"address": "$E013", "switch_banks": ["$F5", "$F6"]}]}"#);
+    let banks = "  .bank 0
+  .org $8000
+  lda $0300
+  sta <$F5
+  jsr Switch
+  lda #$33
+  rts
+";
+    let d = round_trip(&switching_rom(banks, reset), &annotations);
+    assert_lines(&d, &["sub_00_8000:", "	jsr sub_E013", "	lda #$33"]);
+    // A bank known to be another is not.
+    let banks = banks.replace("lda $0300", "lda #$02");
+    let d = round_trip(&switching_rom(&banks, reset), &annotations);
+    assert!(!d.text().contains("	lda #$33"), "{}", d.text());
+}
+
+#[test]
+fn calls_that_switch_the_bank_and_do_not_return_end_the_trace() {
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel2\n  .db $A9, $33, $60\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Sel2:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\nHang:\n  jmp Hang\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+}
+
+#[test]
+fn routines_with_too_many_paths_keep_the_banks_they_write() {
+    // Sel3 switches bank 2 in, then has more paths than a summary follows.
+    let mut reset = String::from(concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Sel3:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+    ));
+    for _ in 0..2100 {
+        reset.push_str("  bne *+2\n");
+    }
+    reset.push_str("  rts\n");
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel3\n  .db $A9, $33, $60\n";
+    let d = round_trip(&switching_rom(banks, &reset), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+}
+
+#[test]
+fn unresolved_stored_pointers_are_not_reported_as_followed() {
+    // Banks 1 and 3 both hold $E100; the store is in bank 2.
+    let rom = assemble(concat!(
+        "  .inesprg 2\n  .inesmap 4\n  .bank 1\n  .org $E000\n  .ds 256\n  lda #$01\n  rts\n",
+        "  .bank 2\n  .org $C000\nReset:\n  lda #$00\n  sta <$10\n  lda #$E1\n  sta <$11\n",
+        "  jsr Run\nHalt:\n  jmp Halt\nRun:\n  jmp [$0010]\nNmi:\n  rti\n",
+        "  .bank 3\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    ));
+    let d = round_trip(&rom, &config(r#"{"banks": [{"bank": 1, "org": "$E000"}]}"#));
+    let jumps = issues(&d, IssueKind::IndirectJump);
+    assert_eq!(jumps.len(), 1);
+    assert!(!jumps[0].contains("followed"), "{jumps:?}");
+}
+
+#[test]
+fn routines_keeping_the_banks_can_be_annotated() {
+    // Yield switches bank 4 in at $8000 and back (Restore4 cannot be
+    // followed): after it, bank 0's code goes on only if Yield is annotated.
+    let banks = "  .bank 0\n  .org $8000\n  jsr Yield\n  lda #$33\n  rts\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Yield:\n  lda #$06\n  sta $8000\n  lda #$04\n  sta $8001\n  jmp [$0010]\n",
+    );
+    let rom = switching_rom(banks, reset);
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E00D", "keeps_banks": true}]}"#),
+    );
+    assert_lines(&d, &["sub_00_8000:", "\tjsr sub_E00D", "\tlda #$33"]);
+    let e = disasm::disassemble(
+        &rom,
+        None,
+        &config(r#"{"entry_points": [{"address": "$E00D", "keeps_banks": true, "switch_banks": ["$F5", null]}]}"#),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .err()
+    .expect("switch_banks with keeps_banks should fail");
+    assert_eq!(
+        e[0].message,
+        "entry_points $E00D: give switch_banks or keeps_banks, not both"
+    );
+}
+
+#[test]
+fn bank_writes_reach_callers_through_routines_that_do_not_return() {
+    // Wrapper calls Sel2, which switches bank 2 in and never returns.
+    let banks = "  .bank 0\n  .org $8000\n  jsr Wrapper\n  .db $A9, $33, $60\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Wrapper:\n  jsr Sel2\n  rts\n",
+        "Sel2:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\nHang:\n  jmp Hang\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $33, $60"), "{}", d.text());
+}
+
+#[test]
+fn ram_a_routine_restores_after_forgetting_it_is_kept() {
+    // Keep saves $F5, writes through an unknown X (which may reach $F5),
+    // and restores it: $F5 still holds 2 for Switch.
+    let reset = concat!(
+        "  lda #$02\n  sta <$F5\n  jsr Keep\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Keep:\n  lda <$F5\n  pha\n  ldx $0300\n  sta <$00,x\n  pla\n  sta <$F5\n  rts\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["\tjsr sub_02_8000"]);
+}
+
+#[test]
+fn routines_going_on_into_one_keeping_the_banks_keep_them() {
+    // Wrapper2 jumps to Yield, which keeps the banks (annotated).
+    let banks = "  .bank 0\n  .org $8000\n  jsr Wrapper2\n  lda #$33\n  rts\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Wrapper2:\n  jmp Yield\n",
+        "Yield:\n  lda #$06\n  sta $8000\n  lda #$04\n  sta $8001\n  jmp [$0010]\n",
+    );
+    let d = round_trip(
+        &switching_rom(banks, reset),
+        &config(r#"{"entry_points": [{"address": "$E010", "keeps_banks": true}]}"#),
+    );
+    assert_lines(&d, &["sub_00_8000:", "\tjsr sub_E00D", "\tlda #$33"]);
+}
+
+#[test]
+fn the_last_step_a_summary_follows_counts() {
+    // Sel4 switches bank 2 in with its last instructions before the budget
+    // of a summary runs out.
+    let mut reset =
+        String::from("  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\nSel4:\n");
+    for _ in 0..4092 {
+        reset.push_str("  nop\n");
+    }
+    reset.push_str("  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n  rts\n");
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel4\n  .db $A9, $33, $60\n";
+    let d = round_trip(&switching_rom(banks, &reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $33, $60"), "{}", d.text());
+}
+
+#[test]
+fn routines_moving_their_return_address_before_an_annotated_tail_take_it() {
+    // Skip2 moves its return address past the two bytes after the JSR,
+    // then goes on into Finish (keeps_banks): the bytes are not code.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Skip2\n  .db $A9, $07\n  jmp Reset\n",
+        "Skip2:\n  pla\n  clc\n  adc #$02\n  tax\n  pla\n  adc #$00\n  pha\n  txa\n  pha\n  jmp Finish\n",
+        "Finish:\n  rts\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E016", "keeps_banks": true}]}"#),
+    );
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
 }

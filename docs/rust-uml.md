@@ -49,6 +49,7 @@ flowchart TB
             disasm_analysis["analysis.rs：バンク配置・コード追跡・命名"]
             disasm_render["render.rs：ソース生成"]
             disasm_patch["patch.rs：ROM Hackの差分範囲"]
+            disasm_flow["flow.rs：経路の値・バンク・ルーチンの要約"]
         end
     end
     cli_main --> api
@@ -66,6 +67,7 @@ flowchart TB
     output --> source
     output --> disasm_mod
     disasm_mod --> disasm_config & disasm_analysis & disasm_render & disasm_patch
+    disasm_analysis --> disasm_flow
     disasm_mod --> engine_mod
     disasm_analysis --> inspect & opcode
     inspect --> opcode
@@ -675,8 +677,11 @@ classDiagram
         -BTreeMap labels
         -Vec~Ref~ refs
         -Vec~Issue~ issues
+        -HashMap joins
+        -Summaries summaries
         -run(file, config, cancel)
-        -trace(loc, from)
+        -trace(loc, from, state)
+        -settle(cancel)
         -name_labels()
         -find_routines()
     }
@@ -689,6 +694,19 @@ classDiagram
         -locate(bank, address) Loc
         -step(loc, n) Option~Loc~
         -back(loc, n) Option~Loc~
+    }
+    class State {
+        +Sym a, x, y
+        -Vec memory
+        +Vec stack
+        +windows
+        +step(insn, rom_byte, mmc3) Effect
+        +apply(summary)
+        +meet(other) State
+    }
+    class Summaries {
+        -HashMap memo
+        +get(code, entry, windows) Summary
     }
     class Patches {
         -String path
@@ -715,6 +733,8 @@ classDiagram
     Disassembly *-- Analysis
     Disassembly *-- Rendered
     Analysis *-- Memory
+    Analysis *-- Summaries
+    Analysis ..> State : 経路ごと
     Disassembly *-- Patches
     Patches *-- Memory : ベースROM
     Disassembly ..> CoreApi : verifyでassemble_with_cancel
@@ -722,9 +742,13 @@ classDiagram
 
 `Analysis::run` は注釈を検証・適用し（誤りは `E_DISASM` としてまとめて返す）、ベクタ・
 エントリポイント・コード領域・ジャンプ表から幅優先でコードを追跡し、参照とラベル名を決めます。
+追跡は経路ごとの `State`（定数のレジスタ・RAM・スタックの値と $8000／$A000 のバンク）を持ち、
+JSRでは `Summaries` が記号実行で求めたルーチンの要約（バンク・RAMの変化、戻りアドレスの使用）を適用します。
+異なる `State` で合流した命令は `joins` に共通部分を記録し、`run` が追跡をやり直します。
+`settle` は間接JMPのポインタに書かれた定数のアドレスと、JSR直後のジャンプ表の要素を順に追加します。
 `render` は全バンクの全バイトを順に書き、各ファイルの先頭行に本文のチェックサムを付けます。
 ROM Hackでは `Patches` がベースROMとの差分から範囲を決め、`render` はメインファイルでベースROMを
-`.incbin` で読み込み、各範囲を `.bank`・`.org` で上書きします（変更のあるCHRバンクはメインファイルに書きます）。
+`.incbin` で読み込み、各範囲を `.bank`・`.org` で上書きします（CHR全体はCHRファイルからメインファイルの末尾で読み込みます）。
 `options.mapper4_fixed_prg_16k` では `Memory::pair` が最後から2番目のPRGバンクを指し、`step`／`back` が
 そのバンクと最終バンクを $C000-$FFFF の連続した範囲としてたどるため、境界をまたぐ命令のデコード・追跡・
 差分範囲の拡張ができます。`render` は2バンクを1つのファイルにまとめ、`.catbank` の後に `.include` します。

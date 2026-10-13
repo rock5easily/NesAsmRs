@@ -142,6 +142,14 @@ pub struct EntryPoint {
     /// Bytes of inline arguments after each JSR to the routine; they are emitted as data.
     #[serde(default)]
     pub inline_bytes: usize,
+    /// The routine switches in the PRG bank held in the first RAM address
+    /// at $8000 and the one in the second at $A000 (`null`: not switched),
+    /// and changes no other RAM the caller knows.
+    pub switch_banks: Option<[Option<Address>; 2]>,
+    /// The routine returns with the PRG banks it was called with (such as
+    /// a thread yield that other threads' bank switches run during).
+    #[serde(default)]
+    pub keeps_banks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -211,6 +219,11 @@ pub struct RegionDef {
     pub columns: Option<usize>,
     /// Comment placed above the region.
     pub comment: Option<String>,
+    /// For pointer and low_bytes tables: start of a table of the same
+    /// number of entries (and bank) holding the PRG bank (8 KiB) switched in
+    /// for each entry. A target that bank holds is resolved to it; others
+    /// (in the fixed banks, or the table's own bank) as usual.
+    pub bank_table: Option<Address>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
