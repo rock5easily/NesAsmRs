@@ -123,6 +123,18 @@ pub(crate) struct State {
     pub switched: [bool; 2],
 }
 
+/// Where an RTS goes from a routine being summarised.
+enum Leaving {
+    /// Back to the caller.
+    Returns,
+    /// Past arguments or a table after the JSR: the return address was kept.
+    TakesReturn,
+    /// Elsewhere: an RTS jump to pushed values.
+    Elsewhere,
+    /// To the caller's caller: the return address was pulled.
+    CallersCaller,
+}
+
 /// What an instruction did that the analysis reports.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Effect {
@@ -429,6 +441,19 @@ impl State {
         }
         if select.is_some() {
             self.select = select;
+        }
+    }
+
+    /// Where an RTS here goes.
+    fn leaving(&self) -> Leaving {
+        if self.return_used {
+            Leaving::TakesReturn
+        } else if self.stack_lost || !self.stack.is_empty() {
+            Leaving::Elsewhere
+        } else if self.popped == 0 {
+            Leaving::Returns
+        } else {
+            Leaving::CallersCaller
         }
     }
 
@@ -950,16 +975,24 @@ impl Summaries {
                     }
                 }
                 // Code that goes on into an annotated routine returns as it does.
-                if loc != entry
-                    && let Some(banks) = code.switches(loc)
-                {
-                    state.apply(&Summary::switching(banks));
-                    exits.push(state);
-                    break;
-                }
-                if loc != entry && code.keeps(loc) {
-                    state.apply(&Summary::keeping());
-                    exits.push(state);
+                // Code that goes on into an annotated routine returns as it
+                // does, when its RTS would (as for an RTS here).
+                let annotated = (loc != entry)
+                    .then(|| match code.switches(loc) {
+                        Some(banks) => Some(Summary::switching(banks)),
+                        None => code.keeps(loc).then(Summary::keeping),
+                    })
+                    .flatten();
+                if let Some(callee) = annotated {
+                    match state.leaving() {
+                        Leaving::Returns => {
+                            state.apply(&callee);
+                            exits.push(state);
+                        }
+                        Leaving::TakesReturn => summary.takes_return = true,
+                        Leaving::Elsewhere => unknown_exit = true,
+                        Leaving::CallersCaller => {}
+                    }
                     break;
                 }
                 let Some(insn) = code.insn(loc) else {
@@ -1024,15 +1057,12 @@ impl Summaries {
                         break;
                     }
                     (Mnemonic::Rts, _) => {
-                        if state.return_used {
-                            summary.takes_return = true;
-                        } else if state.stack_lost || !state.stack.is_empty() {
-                            // An RTS jump: it goes on elsewhere.
-                            unknown_exit = true;
-                        } else if state.popped == 0 {
-                            exits.push(state);
+                        match state.leaving() {
+                            Leaving::Returns => exits.push(state),
+                            Leaving::TakesReturn => summary.takes_return = true,
+                            Leaving::Elsewhere => unknown_exit = true,
+                            Leaving::CallersCaller => {}
                         }
-                        // Otherwise it returns to the caller's caller.
                         break;
                     }
                     (Mnemonic::Rti | Mnemonic::Brk, _) => {

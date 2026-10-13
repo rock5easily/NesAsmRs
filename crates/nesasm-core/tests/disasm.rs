@@ -3201,3 +3201,20 @@ fn the_last_step_a_summary_follows_counts() {
     let d = round_trip(&switching_rom(banks, &reset), &DisasmConfig::default());
     assert!(d.text().contains("\t.db $A9, $33, $60"), "{}", d.text());
 }
+
+#[test]
+fn routines_moving_their_return_address_before_an_annotated_tail_take_it() {
+    // Skip2 moves its return address past the two bytes after the JSR,
+    // then goes on into Finish (keeps_banks): the bytes are not code.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Skip2\n  .db $A9, $07\n  jmp Reset\n",
+        "Skip2:\n  pla\n  clc\n  adc #$02\n  tax\n  pla\n  adc #$00\n  pha\n  txa\n  pha\n  jmp Finish\n",
+        "Finish:\n  rts\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E016", "keeps_banks": true}]}"#),
+    );
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
