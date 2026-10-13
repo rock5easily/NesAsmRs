@@ -270,7 +270,8 @@ writes it as one change:
   `regions`, `comments`, `operands`, `references`, `patches`) with one entry
   per line, ordered by bank and address (labels at one address keep their
   order, as the first names the place), banks by bank; `symbols` keep their
-  order, as the first symbol whose range holds a value names it. `upsert`
+  order, as it decides which name a value gets (a symbol of exactly that
+  value first, else the first whose range holds it, in list order). `upsert`
   puts an entry in the place of the one it replaces. Entries name their
   bank, addresses as `"$C000"` and fields at their default values left out.
   `reformatted` tells that a file was not in that form before.
