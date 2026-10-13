@@ -75,6 +75,10 @@ nothing is inferred from it:
   byte; moved, incremented, added to. A write whose address is not known
   (indexed by an unknown register, or through a pointer) forgets the RAM it
   may reach, and one through a pointer that is not known also the banks.
+  Reads indexed by a known X/Y, and reads through a known zero-page pointer
+  with a known index, also keep the value. Zero-page indexing and pointer
+  bytes wrap at $FF; absolute and indirect indexed addresses wrap at $FFFF.
+  Unknown indices or unresolved ROM banks do not select an entry.
   Indexed writes wrap around $FFFF.
 - The PRG banks at $8000 and $A000. In a switched bank ($8000/$A000 window of
   the layout), code runs with its own bank switched in; code that writes
@@ -96,16 +100,24 @@ nothing is inferred from it:
 - What a called routine does: each of its paths is followed with symbolic
   values (up to 4096 instructions in all, calls nested 6 deep; paths that
   join or loop back are walked again knowing only what they share, until
-  they know nothing new), giving the banks and RAM it sets in terms of the caller's registers
+  they know nothing new), giving the returned A/X/Y, banks and RAM in terms of the caller's registers
   and RAM. A routine that switches the bank in A, or the banks a game keeps in
   RAM, is recognised from its code; the caller then knows the banks after the
   call. A routine with too many paths keeps the banks only if no code it
   reaches writes to $8000-$FFFF or jumps where the scan cannot follow. A path
-  through code that cannot be followed (an indirect jump, a routine that is
-  not known) makes the banks after the call unknown. If the routine would
+  through code that cannot be followed (an unresolved indirect jump, a routine that is
+  not known) makes the banks and returned registers after the call unknown.
+  A known indirect tail JMP is followed in the summary too. Returned
+  registers are kept only when every return agrees; an unknown exit also
+  makes them unknown. If the routine would
   switch in banks held in RAM were that code to change nothing,
   `bank_switch` names the routine and the `switch_banks` to give it in
   `entry_points` if it always does.
+- Stack memory is not used to recover registers across a call: JSR and
+  pushes overwrite bytes at unknown positions in $0100-$01FF. A store that
+  may reach that page (including its internal RAM mirrors), or a call whose
+  RAM effects are unknown, also invalidates saved pushed values. A balanced
+  PHA/PLA around code with known effects can still preserve a register.
 - Where paths that know different values join, the code is traced again
   knowing only what they share (up to 16 times), so a reference never uses a
   bank that only one of the paths switched in.
