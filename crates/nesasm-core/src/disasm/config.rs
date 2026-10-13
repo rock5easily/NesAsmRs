@@ -80,7 +80,7 @@ impl JsonSchema for Address {
 }
 
 /// Annotations that turn a ROM into readable, reassemblable source.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(default, deny_unknown_fields)]
 pub struct DisasmConfig {
@@ -88,36 +88,47 @@ pub struct DisasmConfig {
     pub rom: PathBuf,
     /// For a raw .bin fragment: the CPU address of its first byte. Required
     /// when the file is not a whole number of 8 KiB banks.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load_address: Option<Address>,
     /// For a ROM hack: the original ROM (same format) relative to the project
     /// root. The source then includes unchanged ranges from it with `.incbin`
     /// and disassembles only the changed ranges.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<PathBuf>,
     /// With `base`: ranges to disassemble besides the changed bytes, to widen
     /// the source (a whole routine, a table). Changed bytes are always included.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patches: Vec<PatchDef>,
     /// CPU window ($8000, $A000, $C000 or $E000) of PRG banks; others use the
     /// default layout (the last two banks at $C000/$E000, the rest alternating
     /// $8000/$A000; a single 8 KiB bank at $E000).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub banks: Vec<BankLayout>,
     /// Code entry points besides the interrupt vectors.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub entry_points: Vec<EntryPoint>,
     /// Names of ROM addresses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<LabelDef>,
     /// Names of RAM, I/O and other addresses outside ROM, emitted as `NAME = $xxxx`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<SymbolDef>,
     /// How ranges of the ROM are emitted (code, bytes, words, pointer tables, text).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<RegionDef>,
     /// Comments placed before or on the line of an address.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<CommentDef>,
     /// Operand text replacing what the disassembler would write.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub operands: Vec<OperandDef>,
     /// Banks of references to addresses that several banks can hold.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<ReferenceDef>,
     pub options: DisasmOptions,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BankLayout {
@@ -126,51 +137,59 @@ pub struct BankLayout {
     pub org: Address,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EntryPoint {
     /// Needed only when several banks hold the address.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     pub address: Address,
     /// Label name (default: an automatic name).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     /// The routine never returns to its caller, so code after a JSR to it is not followed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_return: bool,
     /// Bytes of inline arguments after each JSR to the routine; they are emitted as data.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub inline_bytes: usize,
     /// The routine switches in the PRG bank held in the first RAM address
     /// at $8000 and the one in the second at $A000 (`null`: not switched),
     /// and changes no other RAM the caller knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub switch_banks: Option<[Option<Address>; 2]>,
     /// The routine returns with the PRG banks it was called with (such as
     /// a thread yield that other threads' bank switches run during).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub keeps_banks: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct LabelDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     pub address: Address,
     pub name: String,
     /// Comment placed above the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SymbolDef {
     pub name: String,
     pub value: Address,
     /// Bytes covered (default 1); operands inside are written `name+offset`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
 
@@ -195,38 +214,47 @@ pub enum RegionType {
     Text,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RegionDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     pub start: Address,
     /// Last address (inclusive); give this or `length`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub length: Option<u32>,
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, skip_serializing_if = "is_default")]
     pub kind: RegionType,
     /// For low_bytes/high_bytes: start of the other table (same length and bank).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pair: Option<Address>,
     /// For pointer tables: the targets are code entry points (jump tables).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub code_targets: bool,
     /// For pointer tables: stored value minus target, as in `.dw label-1`
     /// for RTS jump tables (-1).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub adjust: i32,
     /// Values per line (default `options.data_per_line`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub columns: Option<usize>,
     /// Comment placed above the region.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     /// For pointer and low_bytes tables: start of a table of the same
     /// number of entries (and bank) holding the PRG bank (8 KiB) switched in
     /// for each entry. A target that bank holds is resolved to it; others
     /// (in the fixed banks, or the table's own bank) as usual.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank_table: Option<Address>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CommentPosition {
@@ -237,21 +265,23 @@ pub enum CommentPosition {
     Above,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CommentDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     pub address: Address,
     pub text: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub position: CommentPosition,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct OperandDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     /// Address of the instruction or data value.
     pub address: Address,
@@ -260,23 +290,28 @@ pub struct OperandDef {
     pub expr: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PatchDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     pub start: Address,
     /// Last address (inclusive); give this or `length`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub length: Option<u32>,
     /// Comment placed above the range.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceDef {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
     /// Address of the referring instruction or pointer.
     pub address: Address,
@@ -284,7 +319,7 @@ pub struct ReferenceDef {
     pub target_bank: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ChrMode {
@@ -295,28 +330,36 @@ pub enum ChrMode {
     Db,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(default, deny_unknown_fields)]
 pub struct DisasmOptions {
     /// Upper-case mnemonics (default lower case).
+    #[serde(skip_serializing_if = "is_false")]
     pub uppercase: bool,
     /// Values per `.db`/`.dw` line (default 8).
+    #[serde(skip_serializing_if = "is_default_data_per_line")]
     pub data_per_line: usize,
     /// Append the CPU address of each line as a comment.
+    #[serde(skip_serializing_if = "is_false")]
     pub address_comments: bool,
     /// Name RAM addresses automatically (`zp_10`, `ram_0300`).
+    #[serde(skip_serializing_if = "is_false")]
     pub auto_ram_labels: bool,
     /// Name the PPU, APU and I/O registers (PPUCTRL ... JOY2; default true).
+    #[serde(skip_serializing_if = "is_true")]
     pub nes_registers: bool,
+    #[serde(skip_serializing_if = "is_default")]
     pub chr: ChrMode,
     /// Write each bank to `<stem>_bankNN.asm`, included from the main file.
     /// By default, only when the source would exceed 512 KiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub split_banks: Option<bool>,
     /// Mapper 4 (MMC3) only: the second-to-last PRG bank is at $C000 and the
     /// last at $E000, and $C000-$FFFF is analysed as one range, so code runs
     /// across $DFFF/$E000. With `split_banks`, both are written to
     /// `<stem>_bankNN_MM.asm`.
+    #[serde(skip_serializing_if = "is_false")]
     pub mapper4_fixed_prg_16k: bool,
 }
 
@@ -333,6 +376,27 @@ impl Default for DisasmOptions {
             mapper4_fixed_prg_16k: false,
         }
     }
+}
+
+// Fields at their default values are left out when annotations are written.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+fn is_default_data_per_line(value: &usize) -> bool {
+    *value == DisasmOptions::default().data_per_line
 }
 
 /// Standard names of the NES registers.

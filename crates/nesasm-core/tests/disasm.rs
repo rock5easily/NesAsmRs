@@ -3366,3 +3366,554 @@ fn routines_moving_their_return_address_before_an_annotated_tail_take_it() {
     assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
     assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
 }
+
+#[test]
+fn sha256_matches_known_digests() {
+    for (data, digest) in [
+        (
+            &b""[..],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+    ] {
+        assert_eq!(disasm::sha256_hex(data), digest);
+    }
+    assert_eq!(
+        disasm::sha256_hex(&vec![b'a'; 1_000_000]),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+}
+
+fn operations(json: serde_json::Value) -> Vec<disasm::Operation> {
+    serde_json::from_value(json).unwrap()
+}
+
+/// Applies `ops` to `config` for `rom`, expecting success.
+fn apply(rom: &[u8], config: &DisasmConfig, ops: serde_json::Value) -> DisasmConfig {
+    disasm::apply_operations(config, rom, &operations(ops))
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .0
+}
+
+/// The errors of applying `ops` to `config` for `rom`.
+fn apply_errors(rom: &[u8], config: &DisasmConfig, ops: serde_json::Value) -> Vec<String> {
+    match disasm::apply_operations(config, rom, &operations(ops)) {
+        Ok(_) => panic!("the operations applied"),
+        Err(errors) => errors,
+    }
+}
+
+#[test]
+fn operations_replace_and_remove_entries_by_key() {
+    let rom = nrom("Reset:\n  lda #0\n  sta $2000\nLoop:\n  jmp Loop\nNmi:\n  rti\n");
+    let original = config(
+        r#"{"rom": "x.nes", "labels": [{"address": "$E005", "name": "There"}, {"address": 57344, "name": "Here"}],
+            "comments": [{"address": "$E000", "text": "one"}, {"address": "$E000", "text": "two", "position": "above"}]}"#,
+    );
+    let (changed, applied) = disasm::apply_operations(
+        &original,
+        &rom,
+        &operations(serde_json::json!([
+            {"op": "upsert", "kind": "labels", "item": {"address": "$E001", "name": "Here", "comment": "moved"}},
+            {"op": "upsert", "kind": "entry_points", "item": {"address": "0xE000", "name": "Start"}},
+            {"op": "remove", "kind": "comments", "key": {"address": "$E000", "position": "line"}},
+            {"op": "set", "kind": "options", "item": {"address_comments": true, "data_per_line": 16}},
+            {"op": "set", "kind": "options", "item": {"data_per_line": null}},
+        ])),
+    )
+    .unwrap();
+    // Entries name their bank, in the order of their addresses; values at
+    // their defaults are left out.
+    assert_eq!(
+        disasm::canonical_json(&changed),
+        concat!(
+            "{\n",
+            "  \"rom\": \"x.nes\",\n",
+            "  \"options\": {\"address_comments\":true},\n",
+            "  \"entry_points\": [\n",
+            "    {\"bank\":1,\"address\":\"$E000\",\"name\":\"Start\"}\n",
+            "  ],\n",
+            "  \"labels\": [\n",
+            "    {\"bank\":1,\"address\":\"$E001\",\"name\":\"Here\",\"comment\":\"moved\"},\n",
+            "    {\"bank\":1,\"address\":\"$E005\",\"name\":\"There\"}\n",
+            "  ],\n",
+            "  \"comments\": [\n",
+            "    {\"bank\":1,\"address\":\"$E000\",\"text\":\"two\",\"position\":\"above\"}\n",
+            "  ]\n",
+            "}\n",
+        )
+    );
+    // What each operation replaced or removed, as it was.
+    let previous: Vec<serde_json::Value> = applied
+        .iter()
+        .map(|a| serde_json::json!([a.index, a.previous]))
+        .collect();
+    assert_eq!(
+        previous,
+        [
+            serde_json::json!([0, [{"bank": 1, "address": "$E000", "name": "Here"}]]),
+            serde_json::json!([1, []]),
+            serde_json::json!([2, [{"bank": 1, "address": "$E000", "text": "one"}]]),
+            serde_json::json!([3, [{}]]),
+            serde_json::json!([4, [{"address_comments": true, "data_per_line": 16}]]),
+        ]
+    );
+    // The canonical text reads back as the same annotations.
+    let again = config(&disasm::canonical_json(&changed));
+    assert_eq!(
+        disasm::canonical_json(&again),
+        disasm::canonical_json(&changed)
+    );
+    round_trip(&rom, &changed);
+    // Removing a comment without its position removes both.
+    let changed = apply(
+        &rom,
+        &original,
+        serde_json::json!([{"op": "remove", "kind": "comments", "key": {"bank": 1, "start": "$E000"}}]),
+    );
+    assert!(changed.comments.is_empty());
+}
+
+#[test]
+fn operation_errors_name_the_operation() {
+    let rom = nrom("Reset:\n  jmp Reset\nNmi:\n  rti\n");
+    let original = config(r#"{"labels": [{"address": "$E000", "name": "Start"}]}"#);
+    for (ops, message) in [
+        (
+            serde_json::json!([{"op": "remove", "kind": "labels", "key": {"name": "Nope"}}]),
+            "operations[0] (remove labels): no entry matches the key",
+        ),
+        (
+            serde_json::json!([{"op": "remove", "kind": "labels", "key": {"address": "$E000"}}]),
+            "operations[0] (remove labels): labels are removed by name",
+        ),
+        (
+            serde_json::json!([{"op": "remove", "kind": "banks", "key": {"address": "$E000"}}]),
+            "operations[0] (remove banks): banks are removed by bank",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "references",
+                                "item": {"address": "$E000", "target_bank": 0}, "evidence": " "}]),
+            "operations[0] (upsert references): this entry overrides what the analysis finds: give evidence",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "regions", "item": {"start": "$E003"}}]),
+            "operations[0] (upsert regions): give end or length",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "regions", "item": {"start": "$E003", "length": null}}]),
+            "operations[0] (upsert regions): fill in length (null)",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "labels", "item": {"address": "$E000", "name": "X"},
+                                "key": {"name": "X"}}]),
+            "operations[0] (upsert labels): upsert takes item (the whole entry), not key",
+        ),
+        (
+            serde_json::json!([{"op": "remove", "kind": "labels", "item": {}}]),
+            "operations[0] (remove labels): remove takes key (the entries to remove), not item",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "labels", "item": "Start"}]),
+            "operations[0] (upsert labels): item must be an object",
+        ),
+        (
+            serde_json::json!([{"op": "set", "kind": "labels", "item": {}}]),
+            "operations[0] (set labels): set applies only to options",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "options", "item": {}}]),
+            "operations[0] (upsert options): options are changed with set",
+        ),
+        (
+            serde_json::json!([{"op": "set", "kind": "options", "item": {"bogus": 1}}]),
+            "operations[0] (set options): unknown field `bogus`",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "labels", "item": {"address": "$1234", "name": "Ram"}}]),
+            "operations[0] (upsert labels): No PRG bank holds $1234",
+        ),
+        (
+            serde_json::json!([{"op": "upsert", "kind": "labels", "item": {"adress": "$E000", "name": "X"}}]),
+            "operations[0] (upsert labels): unknown field `adress`",
+        ),
+    ] {
+        let errors = apply_errors(&rom, &original, ops.clone());
+        assert!(
+            errors.len() == 1 && errors[0].starts_with(message),
+            "{ops}: {errors:?}"
+        );
+    }
+    // Every failing operation is reported, and nothing is applied.
+    let errors = apply_errors(
+        &rom,
+        &original,
+        serde_json::json!([
+            {"op": "remove", "kind": "symbols", "key": {"name": "a"}},
+            {"op": "upsert", "kind": "labels", "item": {"address": "$E001", "name": "Next"}},
+            {"op": "remove", "kind": "symbols", "key": {"name": "b"}},
+        ]),
+    );
+    assert_eq!(
+        errors,
+        [
+            "operations[0] (remove symbols): no entry matches the key",
+            "operations[2] (remove symbols): no entry matches the key",
+        ]
+    );
+}
+
+#[test]
+fn duplicate_keys_are_errors_until_removed() {
+    let rom = nrom("Reset:\n  jmp Reset\nNmi:\n  rti\n");
+    let original = config(
+        r#"{"comments": [{"address": "$E000", "text": "one"}, {"bank": 1, "address": "$E000", "text": "two"}],
+            "operands": [{"address": "$E000", "expr": "RESET"}, {"address": "$E000", "expr": "Reset"}]}"#,
+    );
+    assert_eq!(
+        apply_errors(&rom, &original, serde_json::json!([])),
+        [
+            "comments: 2 entries have the key bank 1 $E000 (line); remove them and give one",
+            "operands: 2 entries have the key bank 1 $E000; remove them and give one",
+        ]
+    );
+    let changed = apply(
+        &rom,
+        &original,
+        serde_json::json!([
+            {"op": "remove", "kind": "comments", "key": {"address": "$E000"}},
+            {"op": "upsert", "kind": "operands", "item": {"address": "$E000", "expr": "RESET"}},
+        ]),
+    );
+    assert!(changed.comments.is_empty());
+    assert_eq!(changed.operands.len(), 1);
+}
+
+/// Four 8 KiB banks of a raw ROM: banks 0 and 1 both start with code at
+/// $8000; bank 3 calls $8000.
+fn two_banks_at_8000() -> Vec<u8> {
+    let t = Temp::new();
+    let r = t.run_with(
+        concat!(
+            "  .bank 0\n  .org $8000\n  rts\n",
+            "  .bank 1\n  .org $8000\n  lda #1\n  rts\n",
+            "  .bank 3\n  .org $E000\nReset:\n  jsr $8000\n  jmp Reset\n",
+            "  .org $FFFA\n  .dw Reset, Reset, Reset\n",
+        ),
+        AssembleOptions {
+            raw: true,
+            ..AssembleOptions::default()
+        },
+    );
+    assert!(r.success, "{:?}", r.diagnostics);
+    r.binary
+}
+
+#[test]
+fn banks_change_before_the_entries_that_depend_on_them() {
+    let rom = two_banks_at_8000();
+    // Bank 1 moves to $8000 first, so a label at $8000 needs its bank.
+    let ops = serde_json::json!([
+        {"op": "upsert", "kind": "labels", "item": {"address": "$8000", "name": "Here"}},
+        {"op": "upsert", "kind": "banks", "item": {"bank": 1, "org": "$8000"}},
+    ]);
+    assert_eq!(
+        apply_errors(&rom, &DisasmConfig::default(), ops),
+        ["operations[0] (upsert labels): Banks 0, 1 hold $8000; give bank"]
+    );
+    let changed = apply(
+        &rom,
+        &DisasmConfig::default(),
+        serde_json::json!([
+            {"op": "upsert", "kind": "labels", "item": {"bank": 1, "address": "$8000", "name": "Here"}},
+            {"op": "upsert", "kind": "banks", "item": {"bank": 1, "org": "$8000"}},
+        ]),
+    );
+    assert_eq!(changed.banks[0].org, Address(0x8000));
+    round_trip(&rom, &changed);
+    // Without the bank's place, bank 1 is at $A000 again: the label that
+    // names it no longer fits, which the analysis reports.
+    let changed = apply(
+        &rom,
+        &changed,
+        serde_json::json!([{"op": "remove", "kind": "banks", "key": {"bank": 1}}]),
+    );
+    let errors = disasm::disassemble(&rom, None, &changed, Path::new("out.asm"), &NEVER)
+        .err()
+        .unwrap();
+    assert!(
+        errors[0]
+            .message
+            .contains("Bank 1 ($A000-$BFFF) does not hold $8000"),
+        "{errors:?}"
+    );
+}
+
+/// The suggestions of the issues of `kind`.
+fn suggestions(d: &Disassembly, kind: IssueKind) -> serde_json::Value {
+    let all: Vec<_> = d
+        .issues()
+        .iter()
+        .filter(|i| i.kind == kind)
+        .map(|i| &i.suggestions)
+        .collect();
+    serde_json::to_value(all).unwrap()
+}
+
+/// The operations of a suggestion, with `evidence` added to each.
+fn with_evidence(suggestion: &serde_json::Value) -> serde_json::Value {
+    let mut ops = suggestion["operations"].clone();
+    for op in ops.as_array_mut().unwrap() {
+        op["evidence"] = serde_json::json!("checked in the code");
+    }
+    ops
+}
+
+#[test]
+fn issues_suggest_references_and_bank_layouts() {
+    let rom = two_banks_at_8000();
+    let banks = config(r#"{"banks": [{"bank": 1, "org": "$8000"}]}"#);
+    let d = round_trip(&rom, &banks);
+    let found = suggestions(&d, IssueKind::UnresolvedBank);
+    let reference = |bank: usize| {
+        serde_json::json!({
+            "description": format!("the reference is to bank {bank}"),
+            "operations": [{"op": "upsert", "kind": "references",
+                            "item": {"bank": 3, "address": "$E000", "target_bank": bank}}],
+            "evidence_required": true,
+        })
+    };
+    assert_eq!(found, serde_json::json!([[reference(0), reference(1)]]));
+    let changed = apply(&rom, &banks, with_evidence(&found[0][1]));
+    let d = round_trip(&rom, &changed);
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(&d, &["sub_01_8000:", "\tjsr sub_01_8000"]);
+    // A bank switched in where the layout does not place it.
+    let layout = SWITCHED_BANKS.replace(".bank 3\n  .org $A000", ".bank 3\n  .org $8000");
+    let rom = switching_rom(
+        &layout,
+        "  lda #$03\n  sta <$F5\n  jsr Switch\n  jsr $8000\n",
+    );
+    let d = round_trip(&rom, &DisasmConfig::default());
+    let found = suggestions(&d, IssueKind::UnresolvedBank);
+    assert_eq!(
+        found,
+        serde_json::json!([[{
+            "description": "bank 3 is switched in at $8000",
+            "operations": [{"op": "upsert", "kind": "banks", "item": {"bank": 3, "org": "$8000"}}],
+            "evidence_required": false,
+        }]])
+    );
+    // Without evidence, as it does not override what is found.
+    let changed = apply(
+        &rom,
+        &DisasmConfig::default(),
+        found[0][0]["operations"].clone(),
+    );
+    let d = round_trip(&rom, &changed);
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+}
+
+#[test]
+fn issues_suggest_entry_points_keeping_what_they_give() {
+    let reset = concat!(
+        "  lda #$02\n  sta <$F5\n  jsr Switch2\n  jsr $8000\n  jmp Halt\n",
+        "Switch2:\n  lda #$06\n  sta $8000\n  lda <$F5\n  sta $8001\n",
+        "  lda <$F8\n  beq Done\n  jsr Sound\nDone:\n  rts\nSound:\n  jmp [$0010]\n",
+    );
+    let rom = switching_rom(SWITCHED_BANKS, reset);
+    // The name the annotations give the routine stays.
+    let named = config(r#"{"entry_points": [{"address": "$E00D", "name": "Switch2"}]}"#);
+    let d = round_trip(&rom, &named);
+    let found = suggestions(&d, IssueKind::BankSwitch);
+    assert_eq!(
+        found,
+        serde_json::json!([[{
+            "description": "the routine always switches in the banks held in this RAM",
+            "operations": [{"op": "upsert", "kind": "entry_points",
+                            "item": {"bank": 7, "address": "$E00D", "name": "Switch2",
+                                     "switch_banks": ["$00F5", null]}}],
+            "evidence_required": true,
+        }]])
+    );
+    assert_eq!(
+        apply_errors(&rom, &named, found[0][0]["operations"].clone()),
+        [
+            "operations[0] (upsert entry_points): this entry overrides what the analysis finds: give evidence"
+        ]
+    );
+    let changed = apply(&rom, &named, with_evidence(&found[0][0]));
+    let d = round_trip(&rom, &changed);
+    assert!(issues(&d, IssueKind::BankSwitch).is_empty());
+    assert!(d.text().contains("Switch2:"), "{}", d.text());
+    // A routine that takes its return address: arguments, or no return.
+    let print = concat!(
+        "Print:\n  pla\n  sta <$02\n  pla\n  sta <$03\n  ldy #$01\n  lda [$02],y\n  sta $0300\n",
+        "  lda <$02\n  clc\n  adc #$02\n  sta <$02\n  lda <$03\n  adc #$00\n  pha\n  lda <$02\n  pha\n  rts\n",
+    );
+    let rom = nrom(&format!(
+        "Reset:\n  jsr Print\n  .db $A9, $07\n  jmp Reset\n{print}Nmi:\n  rti\n"
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    let found = suggestions(&d, IssueKind::ReturnAddress);
+    assert_eq!(
+        found,
+        serde_json::json!([[
+            {
+                "description": "the routine reads arguments after each JSR to it and returns after them",
+                "operations": [{"op": "upsert", "kind": "entry_points",
+                                "item": {"bank": 1, "address": "$E008", "inline_bytes": null}}],
+                "needs": ["inline_bytes"],
+                "evidence_required": true,
+            },
+            {
+                "description": "the routine does not return to its caller",
+                "operations": [{"op": "upsert", "kind": "entry_points",
+                                "item": {"bank": 1, "address": "$E008", "no_return": true}}],
+                "evidence_required": true,
+            },
+        ]])
+    );
+    // What the suggestion leaves to fill in must be filled in.
+    let mut ops = with_evidence(&found[0][0]);
+    assert_eq!(
+        apply_errors(&rom, &DisasmConfig::default(), ops.clone()),
+        ["operations[0] (upsert entry_points): fill in inline_bytes (null)"]
+    );
+    ops[0]["item"]["inline_bytes"] = serde_json::json!(2);
+    let d = round_trip(&rom, &apply(&rom, &DisasmConfig::default(), ops));
+    assert!(issues(&d, IssueKind::ReturnAddress).is_empty());
+    assert_lines(&d, &["\tjsr sub_E008", "\t.db $A9, $07", "\tjmp RESET"]);
+}
+
+#[test]
+fn issues_suggest_jump_tables() {
+    let rom = nrom(&format!(
+        "Reset:\n  lda $0300\n  jsr Dispatch\n  .dw First, Second\n\
+         First:\n  lda #$01\n  rts\nSecond:\n  lda #$02\n  rts\n{DISPATCH}Nmi:\n  rti\n"
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    let found = suggestions(&d, IssueKind::JumpTable);
+    assert_eq!(
+        found,
+        serde_json::json!([[{
+            "description": "the words after the JSR are a jump table",
+            "operations": [{"op": "upsert", "kind": "regions",
+                            "item": {"bank": 1, "start": "$E006", "length": 4,
+                                     "type": "pointers", "code_targets": true}}],
+            "evidence_required": true,
+        }]])
+    );
+    let d = round_trip(
+        &rom,
+        &apply(&rom, &DisasmConfig::default(), with_evidence(&found[0][0])),
+    );
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    // Tables of low and high bytes read for an RTS, whose length is not known.
+    let rom = nrom(concat!(
+        "Reset:\n  ldx $0300\n  lda Hi,x\n  pha\n  lda Lo,x\n  pha\n  rts\n",
+        "A1:\n  rts\nA2:\n  rts\nLo:\n  .db LOW(A1-1), LOW(A2-1)\nHi:\n  .db HIGH(A1-1), HIGH(A2-1)\n",
+        "Nmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    let found = suggestions(&d, IssueKind::IndirectJump);
+    assert_eq!(
+        found,
+        serde_json::json!([[{
+            "description": "the jump targets come from tables of low and high bytes",
+            "operations": [
+                {"op": "upsert", "kind": "regions",
+                 "item": {"bank": 1, "start": "$E00E", "length": null, "type": "low_bytes",
+                          "pair": "$E010", "code_targets": true, "adjust": -1}},
+                {"op": "upsert", "kind": "regions",
+                 "item": {"bank": 1, "start": "$E010", "length": null, "type": "high_bytes"}},
+            ],
+            "needs": ["length"],
+            "evidence_required": true,
+        }]])
+    );
+    let mut ops = with_evidence(&found[0][0]);
+    for op in ops.as_array_mut().unwrap() {
+        op["item"]["length"] = serde_json::json!(2);
+    }
+    let d = round_trip(&rom, &apply(&rom, &DisasmConfig::default(), ops));
+    // The jump stays an issue, saying that a region describes its targets,
+    // and suggests nothing more.
+    assert_eq!(
+        issues(&d, IssueKind::IndirectJump),
+        [
+            "$E00B RTS at $E00B jumps to an address pushed before it; the address comes from the table at $E00E indexed by X, which a region describes"
+        ]
+    );
+    assert_eq!(
+        suggestions(&d, IssueKind::IndirectJump),
+        serde_json::json!([[]])
+    );
+    assert_lines(&d, &["\t.db LOW(L_E00C-1), LOW(L_E00D-1)"]);
+}
+
+#[test]
+fn entries_without_a_bank_that_several_banks_hold_can_be_replaced() {
+    let rom = two_banks_at_8000();
+    // With bank 1 at $8000, the entry point names no single bank.
+    let original = config(
+        r#"{"banks": [{"bank": 1, "org": "$8000"}], "entry_points": [{"address": "$8000", "name": "Here"}],
+            "comments": [{"address": "$8000", "text": "one"}]}"#,
+    );
+    for key in [
+        serde_json::json!({"bank": 1, "address": "$8000"}),
+        serde_json::json!({"address": "$8000"}),
+    ] {
+        let changed = apply(
+            &rom,
+            &original,
+            serde_json::json!([
+                {"op": "remove", "kind": "entry_points", "key": key},
+                {"op": "remove", "kind": "comments", "key": key},
+            ]),
+        );
+        assert!(changed.entry_points.is_empty() && changed.comments.is_empty());
+    }
+    let changed = apply(
+        &rom,
+        &original,
+        serde_json::json!([
+            {"op": "upsert", "kind": "entry_points", "item": {"bank": 1, "address": "$8000", "name": "Here"}},
+            {"op": "upsert", "kind": "comments", "item": {"bank": 1, "address": "$8000", "text": "one"}},
+        ]),
+    );
+    assert_eq!(changed.entry_points.len(), 1);
+    assert_eq!(changed.entry_points[0].bank, Some(1));
+    assert_eq!(changed.comments[0].bank, Some(1));
+    round_trip(&rom, &changed);
+    // An entry that names its bank is not removed without it.
+    assert_eq!(
+        apply_errors(
+            &rom,
+            &changed,
+            serde_json::json!([{"op": "remove", "kind": "entry_points", "key": {"address": "$8000"}}]),
+        ),
+        ["operations[0] (remove entry_points): no entry matches the key"]
+    );
+}
+
+#[test]
+fn bytes_read_from_one_table_suggest_no_address_table() {
+    let rom = nrom(concat!(
+        "Reset:\n  ldx $0300\n  lda Table,x\n  pha\n  pha\n  rts\n",
+        "Table:\n  .db $E0, $E1\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(issues(&d, IssueKind::IndirectJump).len(), 1);
+    assert_eq!(
+        suggestions(&d, IssueKind::IndirectJump),
+        serde_json::json!([[]])
+    );
+}

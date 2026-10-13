@@ -46,6 +46,7 @@ flowchart TB
         subgraph disasm["disasm/"]
             disasm_mod["mod.rs：Disassembly・検証・問い合わせ"]
             disasm_config["config.rs：注釈（DisasmConfig）"]
+            disasm_edit["edit.rs：注釈の操作・正規の書式・修正案"]
             disasm_analysis["analysis.rs：バンク配置・コード追跡・命名"]
             disasm_render["render.rs：ソース生成"]
             disasm_patch["patch.rs：ROM Hackの差分範囲"]
@@ -529,6 +530,7 @@ classDiagram
         -inspect_rom(input)
         -disassemble(input)
         -export_disassembly(input)
+        -annotate(input)
         -get_reference(input)
         list_resources()
         read_resource(uri)
@@ -557,6 +559,8 @@ classDiagram
         write_artifacts(result, input, output, base, root, options)
         write_disassembly(disassembly, base, root, rom)
         export_disassembly(disassembly, base, root, rom)
+        write_annotations(path, root, text, expected)
+        append_annotation_log(annotations, root, line)
         srec(binary, map)
         -commit_all(staged, rename)
     }
@@ -578,7 +582,7 @@ classDiagram
 
 `ServerHandler` はrmcpのtraitです。MCPツールはRust上では非公開メソッドですが、
 マクロによってMCPの `assemble`・`check`・`inspect_rom`・`disassemble`・`export_disassembly`・
-`get_reference` として公開されます。
+`annotate`・`get_reference` として公開されます。
 `gate` の型は `Arc<tokio::sync::Mutex<()>>` で、checkとassembleの実行を直列化します。
 時間制限を超えると `assemble_with_cancel` に渡したフラグを立て、エンジンは次の行で停止します。
 `stdio_relay` はstdinとrmcpの間で行を中継し、JSONとして解析できない行に `-32700` を返します。
@@ -727,6 +731,9 @@ classDiagram
         parse_config(json)
         disassemble(rom_file, base_file, config, source, cancel)
         is_unedited_source(text)
+        apply_operations(config, rom_file, operations)
+        canonical_json(config)
+        sha256_hex(data)
     }
     DisasmModule ..> Disassembly : 生成
     DisasmModule ..> DisasmConfig : 解析
@@ -755,3 +762,6 @@ ROM Hackでは `Patches` がベースROMとの差分から範囲を決め、`ren
 `export_disassembly` は既存ファイルを
 本文先頭の行（`; Source:` か `.bank n`）で見分け、同じ役割の未編集ファイルだけを上書きします。
 `verify` は生成したファイルを `AssembleRequest.files` に渡してメモリ上でアセンブルし、元のROMと比較します。
+`Analysis` は課題に解決の形（`Fix`）を記録し、`disassemble` が `edit::suggestions` で注釈の操作
+（`Operation`）の形の修正案にします。`apply_operations` は `Memory` の配置で各項目のバンクを補完し、
+キーごとに置換・削除して、MCPの `annotate` が `canonical_json` の書式で書き込みます。

@@ -22,14 +22,14 @@ MCPサーバーが解析とソース生成を行い、LLMまたは利用者が�
 
 | 担当 | 行うこと |
 |---|---|
-| MCPサーバー | 命令のデコード、到達経路と既知の状態の追跡、参照・課題の提示、注釈の適用、ソース生成と往復検証 |
-| LLM・利用者 | 資料と実バイトの照合、呼出し規約や表の範囲の推論、根拠付き注釈の追加、結果の評価 |
+| MCPサーバー | 命令のデコード、到達経路と既知の状態の追跡、参照・課題と注釈の修正案の提示、注釈ファイルの更新・検証・根拠の記録、ソース生成と往復検証 |
+| LLM・利用者 | 資料と実バイトの照合、呼出し規約や表の範囲の推論、追加する注釈と根拠の判断、結果の評価 |
 
 ```mermaid
 flowchart TD
     A[ROMと既存注釈を保存] --> B[MCP: disassemble]
     B --> C[LLM・利用者: 実コードと資料を調査]
-    C --> D[確認できた注釈を追加]
+    C --> D[MCP: annotate で確認できた注釈を根拠付きで追加]
     D --> B
     C --> E[追加できる根拠がなくなったら未解決事項を記録]
     E --> F[MCP: export_disassembly → check → assemble]
@@ -83,9 +83,22 @@ project/
 mapper番号だけで実行中の配置が固定だとは判断しません。
 生の `.bin` はリファレンスの `load_address` とraw出力の手順を確認してください。
 
-MCPツールには注釈ファイルを編集する機能はありません。利用者が編集するか、ファイル編集が許可された環境で
-LLMが編集します。編集できない環境では、同じ注釈内容を `inline` に渡して解析できます。
-`annotations` と `inline` は同時には指定しません。
+注釈ファイルは `annotate` で作成・更新します（手順4）。新規作成は `create` で行います。
+
+```json
+{
+  "annotations": "annotations/game.disasm.json",
+  "create": {"rom": "roms/game.nes"},
+  "operations": [
+    {"op": "set", "kind": "options",
+     "item": {"address_comments": true, "auto_ram_labels": true, "split_banks": true}}
+  ]
+}
+```
+
+注釈ファイルの名前は `.disasm.json` で終わる必要があります。手で編集することもできますが、
+次の `annotate` で正規の書式に整えられます。ファイルを書き込まずに試す場合は、同じ注釈内容を
+`inline` に渡します。`annotations` と `inline` は同時には指定しません。
 
 ```json
 {
@@ -241,8 +254,39 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
 注釈はサーバーの推定より優先します。`regions.type: "code"` は範囲を強制的にデコードするため、
 広い未分類範囲を命令化する目的では使いません。範囲全体がコードである根拠が必要です。
 
-根拠は対応する `comment`／`comments.text` と、別の調査ノートへ保存します。
-注釈JSONには未対応の `confidence`・`evidence` 等の独自フィールドを追加しません。
+注釈は `annotate` の操作で追加・置換・削除します。`upsert` は項目全体を渡し、同じキー
+（`references` なら bank と address、`regions` なら bank と start、`labels` なら name）の項目を置き換えます。
+フィールド単位のマージはしないため、既存の項目を変えるときは、応答の `applied[].previous`
+（置き換え前の項目）に変更を加えて送ります。
+
+```json
+{
+  "annotations": "annotations/game.disasm.json",
+  "expected_sha256": "<前回の annotate の sha256、または sha256_before>",
+  "operations": [
+    {"op": "upsert", "kind": "references",
+     "item": {"bank": 30, "address": "$DEB1", "target_bank": 27},
+     "evidence": "直前のA=$1Bと、SetPrgBankPairの全復帰経路での復元を実コードで確認"},
+    {"op": "upsert", "kind": "comments",
+     "item": {"bank": 30, "address": "$DEB1", "text": "bank $1B の先頭を呼ぶ"}}
+  ]
+}
+```
+
+- issuesの `suggestions` は、そのまま `operations` に使える形の修正案です。案は選択肢ごとに分かれ、
+  `needs` に挙がったフィールド（表の `length` など）は null のままなので、実コードで確かめて埋めます。
+  修正案は追跡できた経路から作ったもので、根拠の代わりにはなりません。
+- 推定より優先される項目（`references`、`no_return`／`inline_bytes`／`switch_banks`／`keeps_banks` を
+  持つ `entry_points`、`code` 領域、`code_targets` 付きの表）には `evidence` が必須です。
+- `evidence` は注釈ファイルと同じ場所の `<名前>.disasm.log.jsonl` に、操作、更新前後のSHA-256、
+  命令数とコード／データ／未分類のバイト数、issues数とともに1行ずつ追記されます。
+  ソースの読者に向けた説明は、別途 `comment`／`comments.text` に書きます。
+- ファイルを書き込むのは、全操作を適用でき、注釈が有効で、往復検証が一致し（`require_match`）、
+  ファイルが `expected_sha256` から変わっていない場合だけです。`dry_run: true` で書き込まずに結果を確認できます。
+- 応答の `summary_before`／`summary_after`、`issues_resolved`／`issues_introduced` で、
+  変化した分類とissueを確認します。issueは種類・bank・アドレスで照合します。
+
+注釈JSONには未対応の `confidence` 等の独自フィールドを追加しません。
 未確認の仮説はノートに置き、確定した注釈と分けます。
 
 ```text
@@ -254,7 +298,7 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
 ```
 
 一度に一つの原因、または関連する少数の項目を追加して再解析します。
-注釈と応答を反復ごとに保存し、新しい命令が呼出し経路と整合するか、表やパディングを誤認していないか、
+応答（`annotate` の記録に入らない詳細）も反復ごとに保存し、新しい命令が呼出し経路と整合するか、表やパディングを誤認していないか、
 `overlap`・`invalid_opcode`・`code_data_conflict` や不自然な参照が増えていないかを確認します。
 新しいissueが出たことだけでは悪化とは限りません。新しく到達したコードの未解決問題か、誤った注釈かを調べます。
 矛盾があれば、直前の注釈を見直します。
@@ -368,7 +412,8 @@ nesasm MCPを利用して、対象ROMの逆アセンブルソースを整理し�
 MCPのview、xrefs、routines、ram、issuesと、必要な狭い範囲のinspect_romを使い、
 呼出し元、バンク切替の復帰状態、間接ジャンプのポインタ、表の境界を調べてください。
 実コードと資料で確認した入口・参照先・データ範囲だけを、根拠付きで注釈に追加し、
-再解析と確認を繰り返してください。注釈の編集ができなければinlineで検証し、保存用JSONを提示してください。
+再解析と確認を繰り返してください。注釈はannotateで根拠（evidence）とともに追加し、
+issuesのsuggestionsを使う場合も実コードで確かめてから適用してください。
 
 未分類領域を線形に命令化せず、未知のバンクを都合のよい値で補わないでください。
 原作と改造版の注釈を無条件に共有せず、表・パディング・インライン引数の誤認を確認してください。

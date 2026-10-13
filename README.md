@@ -55,6 +55,11 @@ MCPクライアントの設定例（実行ファイルとプロジェクトの�
   書き込みます。命令とディレクティブはタブ1個で字下げします。ROM HackではCHR全体を `.chr` に抽出し、
   メインファイルの末尾で1回読み込みます。mapper 4では注釈の `options.mapper4_fixed_prg_16k` で最終2個のPRGバンクを
   $C000-$FFFF の連続した範囲として解析し、`<stem>_bankXX_YY.asm` にまとめて出力できます。
+- `annotate`: 逆アセンブルの注釈ファイル（`*.disasm.json`）を、項目の追加・置換（`upsert`）、
+  削除（`remove`）、オプションの変更（`set`）の操作で更新します。結果を検証し、往復検証が一致して
+  ファイルが読んだ時から変わっていない場合だけ、正規の書式で書き込みます。推定より優先される項目には
+  根拠（`evidence`）が必須で、操作とともに `<名前>.disasm.log.jsonl` に記録します。
+  `disassemble` の課題は、この操作の形で修正案（`suggestions`）を返します。
 - `get_reference`: 命令・ディレクティブ・式・オプション・逆アセンブラの説明を取得します。
 
 `check`／`assemble`／`inspect_rom` は、ファイルの代わりにソースの文字列を `sources` で受け取れます
@@ -68,7 +73,8 @@ CPUアドレス・出力バイトを、ファイル・行範囲・バンク・�
 `check` / `assemble` の引数例: `{"input":"main.asm","options":{"encoding":"sjis","auto_zp":true}}`。
 `assemble` には `output`、両ツールには `include_paths` も指定できます。
 MCPの入力・依存ファイル・出力先は起動時の `--root` 内に制限されます。
-出力先は `.nes`／`.bin` のROMとその付随ファイル、および逆アセンブルの `.asm`／`.chr` に限られ、
+出力先は `.nes`／`.bin` のROMとその付随ファイル、逆アセンブルの `.asm`／`.chr`、
+注釈の `.disasm.json` とその記録 `.disasm.log.jsonl` に限られ、
 `.git` などの隠しディレクトリには書き込みません。逆アセンブルの出力は、生成後に編集されていない
 生成ファイルだけを上書きします。
 1回のアセンブルは既定30秒で打ち切られます（`--timeout <秒>` で変更）。

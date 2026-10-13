@@ -610,6 +610,28 @@ fn table_advice(low: Source, high: Source, adjust: i32) -> Option<String> {
     })
 }
 
+/// How an issue could be settled in the annotations, from which its
+/// suggestions are made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Fix {
+    /// Place `bank` at `org` (a `banks` entry).
+    Layout { bank: usize, org: u32 },
+    /// The reference at `from` goes to one of `banks` (`references`).
+    Reference { from: Loc, banks: Vec<usize> },
+    /// The routine switches in the banks held in these RAM addresses.
+    SwitchBanks {
+        routine: Loc,
+        banks: [Option<u16>; 2],
+    },
+    /// The routine takes its return address (`inline_bytes` or `no_return`).
+    ReturnAddress { routine: Loc },
+    /// A jump table after a JSR, of `entries` words found (0: none found).
+    JumpTable { start: Loc, entries: usize },
+    /// The targets of a jump come from a table of words (`low` + 1 is
+    /// `high`) or from tables of low and high bytes.
+    Table { low: Loc, high: Loc, adjust: i32 },
+}
+
 /// What a reference points at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -817,8 +839,17 @@ impl Analysis {
             bank: loc.map(|l| l.bank),
             address: Address(address),
             message,
+            suggestions: Vec::new(),
             spans: loc.map(|l| (l.offset, 1)).into_iter().collect(),
+            fix: None,
         });
+    }
+
+    /// Records how the last issue could be settled.
+    fn fix(&mut self, fix: Option<Fix>) {
+        if let Some(issue) = self.issues.last_mut() {
+            issue.fix = fix;
+        }
     }
 
     /// Applies the annotations, collecting every error.
@@ -1230,6 +1261,7 @@ impl Analysis {
                 self.memory.banks[bank].org
             );
             self.issue(IssueKind::UnresolvedBank, Some(from), at, message);
+            self.fix(Some(Fix::Layout { bank, org }));
             return Target::Ambiguous(address);
         }
         self.resolve_from(from, address)
@@ -1248,16 +1280,27 @@ impl Analysis {
         let target = self.target_of(from, address);
         if let Target::Ambiguous(_) = target {
             let at = self.memory.address(from);
-            let message = match self.references.get(&from) {
-                Some(bank) => format!(
-                    "references gives bank {bank} for ${address:04X}, which that bank does not hold"
+            let holders = self.memory.holders(address);
+            let (message, fix) = match self.references.get(&from) {
+                Some(bank) => (
+                    format!(
+                        "references gives bank {bank} for ${address:04X}, which that bank does not hold"
+                    ),
+                    None,
                 ),
-                None => format!(
-                    "${address:04X} is held by banks {}; add a references entry with target_bank",
-                    join(&self.memory.holders(address))
+                None => (
+                    format!(
+                        "${address:04X} is held by banks {}; add a references entry with target_bank",
+                        join(&holders)
+                    ),
+                    Some(Fix::Reference {
+                        from,
+                        banks: holders,
+                    }),
                 ),
             };
             self.issue(IssueKind::UnresolvedBank, Some(from), at, message);
+            self.fix(fix);
         }
         target
     }
@@ -1522,6 +1565,7 @@ impl Analysis {
                     shown(banks[1])
                 ),
             );
+            self.fix(Some(Fix::SwitchBanks { routine, banks }));
         }
         for (index, vector) in std::mem::take(&mut self.jump_issues) {
             let mut parts = Vec::new();
@@ -1547,6 +1591,7 @@ impl Analysis {
                 && let Some(advice) = self.table_advice(store, low, high, 0)
             {
                 parts.push(format!("at ${:04X}, {advice}", self.memory.address(store)));
+                self.issues[index].fix = self.table_fix(store, low, high, 0);
             } else if !parts.is_empty() {
                 parts.push("give entry_points for its other targets".into());
             }
@@ -1577,6 +1622,10 @@ impl Analysis {
                 )
             };
             self.issue(IssueKind::JumpTable, Some(table.start), start, message);
+            self.fix(Some(Fix::JumpTable {
+                start: table.start,
+                entries,
+            }));
             if let Some(issue) = self.issues.last_mut() {
                 issue.spans = vec![(table.start.offset, (2 * entries).max(1))];
             }
@@ -2020,6 +2069,7 @@ impl Analysis {
                         self.memory.address(callee)
                     ),
                 );
+                self.fix(Some(Fix::ReturnAddress { routine: callee }));
                 None
             }
             _ => Some(0),
@@ -2071,11 +2121,14 @@ impl Analysis {
         if state.stack.len() < 2 {
             return;
         }
-        let advice = match sources.stack.as_slice() {
-            [.., Some(high), Some(low)] => self.table_advice(loc, *low, *high, -1),
-            _ => None,
-        }
-        .unwrap_or_else(|| {
+        let (advice, fix) = match sources.stack.as_slice() {
+            [.., Some(high), Some(low)] => (
+                self.table_advice(loc, *low, *high, -1),
+                self.table_fix(loc, *low, *high, -1),
+            ),
+            _ => (None, None),
+        };
+        let advice = advice.unwrap_or_else(|| {
             "describe its targets with a pointers region (code_targets, \"adjust\": -1) or entry_points".into()
         });
         let address = self.memory.address(loc);
@@ -2085,6 +2138,7 @@ impl Analysis {
             address,
             format!("RTS at ${address:04X} jumps to an address pushed before it; {advice}"),
         );
+        self.fix(fix);
     }
 
     /// Code at `address`, which `from` returns or jumps to, if it can be an
@@ -2145,6 +2199,28 @@ impl Analysis {
         table_advice(low, high, adjust)
     }
 
+    /// The tables [`Self::table_advice`] describes, unless a region already
+    /// describes them: both read with the same index, in one bank.
+    fn table_fix(&self, from: Loc, low: Source, high: Source, adjust: i32) -> Option<Fix> {
+        if low.1 != high.1 {
+            return None;
+        }
+        let locate = |address: u32| match self.memory.resolve(Some(from.bank), address) {
+            Resolved::Rom(l) => Some(l),
+            _ => None,
+        };
+        let (low, high) = (locate(low.0)?, locate(high.0)?);
+        let described = self
+            .region_at(low)
+            .is_some_and(|r| r.code_targets && r.start == low.offset);
+        // Bytes read from one table are not an address table.
+        (low.bank == high.bank && low != high && !described).then_some(Fix::Table {
+            low,
+            high,
+            adjust,
+        })
+    }
+
     /// An indirect JMP whose targets are not known: how to describe them.
     fn indirect_jump(&mut self, loc: Loc, insn: Insn, sources: &Sources, state: &State) {
         let address = self.memory.address(loc);
@@ -2156,11 +2232,14 @@ impl Analysis {
                 w.wrapping_add(1)
             )
         });
-        let advice = match (sources.at(vector), sources.at(vector + 1)) {
-            (Some(low), Some(high)) => self.table_advice(loc, low, high, 0),
-            _ => None,
-        }
-        .unwrap_or_else(|| {
+        let (advice, fix) = match (sources.at(vector), sources.at(vector + 1)) {
+            (Some(low), Some(high)) => (
+                self.table_advice(loc, low, high, 0),
+                self.table_fix(loc, low, high, 0),
+            ),
+            _ => (None, None),
+        };
+        let advice = advice.unwrap_or_else(|| {
             "describe its targets with a pointers region (code_targets) or entry_points".into()
         });
         self.jump_issues.push((self.issues.len(), vector));
@@ -2170,6 +2249,7 @@ impl Analysis {
             address,
             format!("Indirect JMP [${vector:04X}] at ${address:04X}; {advice}{back}"),
         );
+        self.fix(fix);
         let end = self.memory.banks[loc.bank].end;
         if let Some(issue) = self.issues.last_mut() {
             issue.spans = vec![(loc.offset, insn.len.min(end - loc.offset))];

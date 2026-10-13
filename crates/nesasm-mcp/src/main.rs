@@ -2,8 +2,8 @@ use nesasm_core::{
     Artifact, AssembleOptions, AssembleRequest, AssembleResult, BankUsage, Diagnostic,
     DiagnosticCode, LineRecord, ReferenceTopic, Region, Severity, SourceLocation, Symbol,
     disasm::{
-        self, Address, Diff, DisasmConfig, Disassembly, Issue, IssueKind, RamUse, Routine,
-        SourceLine, Summary, Verification, Xref,
+        self, Address, Applied, Diff, DisasmConfig, Disassembly, Issue, IssueKind, Operation,
+        RamUse, Routine, SourceLine, Summary, Verification, Xref,
     },
     inspect::{Disassembled, HexRow, InesHeader, Rom, Vectors},
 };
@@ -228,6 +228,54 @@ struct ExportInput {
     output: Option<PathBuf>,
 }
 
+/// A new annotation file.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NewAnnotations {
+    /// ROM file relative to the root: .nes or a raw .bin.
+    rom: PathBuf,
+    /// For a ROM hack: the original ROM relative to the root.
+    base: Option<PathBuf>,
+    /// For a raw .bin fragment: the CPU address of its first byte.
+    load_address: Option<Address>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AnnotateInput {
+    /// Annotation file to change, within the root and outside hidden
+    /// directories; its name ends with .disasm.json. It is written in
+    /// canonical form, and the operations with their evidence are appended
+    /// to <name>.disasm.log.jsonl beside it.
+    annotations: Option<PathBuf>,
+    /// Or annotations inline: the changed annotations are returned and
+    /// nothing is written.
+    inline: Option<DisasmConfig>,
+    /// With annotations: create the file, which must not exist, for this ROM.
+    create: Option<NewAnnotations>,
+    /// SHA-256 (hex) of the annotation file as last read: the sha256 that
+    /// annotate returned. Required to change an existing file; the file is
+    /// not written if it changed since.
+    expected_sha256: Option<String>,
+    /// Changes applied in order (banks and options first). upsert adds the
+    /// whole item, replacing the entries with its key: (bank, address) for
+    /// entry_points, operands and references; (bank, start) for regions and
+    /// patches; (bank, address, position) for comments; name for labels and
+    /// symbols; bank for banks. remove takes key and removes every entry it
+    /// names. set changes fields of options (null: the default). The
+    /// suggestions of issues are operations in this form.
+    operations: Vec<Operation>,
+    /// Apply and analyse without writing anything.
+    #[serde(default)]
+    dry_run: bool,
+    /// Fail unless the source reassembles to the same ROM (default true).
+    require_match: Option<bool>,
+    /// Main source file (.asm), as for disassemble.
+    output: Option<PathBuf>,
+    /// Pages of the issues resolved and introduced (default: the first 100).
+    issues: Option<PageQuery>,
+}
+
 #[derive(Serialize, JsonSchema)]
 struct Page<T> {
     /// Items matching the query.
@@ -283,6 +331,52 @@ struct DisasmReport {
     routines: Option<Page<Routine>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ram: Option<Page<RamUse>>,
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+struct AnnotateReport {
+    success: bool,
+    /// Errors in the operations or annotations, or why nothing was written.
+    diagnostics: Vec<Diagnostic>,
+    /// Whether the annotation file was written.
+    written: bool,
+    /// SHA-256 of the annotation file as it was: the expected_sha256 to
+    /// give for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256_before: Option<String>,
+    /// SHA-256 of the annotations after the change (of the file once
+    /// written): the expected_sha256 of the next call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    /// The file was not in canonical form (order, bank of each entry,
+    /// formatting) and is written in it.
+    reformatted: bool,
+    /// For each operation applied, the entries it replaced or removed.
+    applied: Vec<Applied>,
+    /// The analysis with the annotations as they were, if they were valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_before: Option<Summary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_after: Option<Summary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<Verification>,
+    /// Issues no longer reported (matched by kind, bank and address).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issues_resolved: Option<Page<Issue>>,
+    /// Issues reported only after the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issues_introduced: Option<Page<Issue>>,
+    /// The changed annotations, for inline annotations and dry runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<serde_json::Value>,
+    /// The log the entry was appended to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log: Option<PathBuf>,
+    /// The log entry: the operations with their evidence, the digests and
+    /// totals before and after (also for inline annotations and dry runs, to
+    /// keep elsewhere).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_entry: Option<serde_json::Value>,
 }
 
 #[derive(Default, Serialize, JsonSchema)]
@@ -502,6 +596,17 @@ impl Server {
         &self,
         work: impl FnOnce(&Path, &AtomicBool) -> T + Send + 'static,
     ) -> Result<T, Diagnostic> {
+        self.guarded_late(work)
+            .await
+            .map_err(|(diagnostic, _)| diagnostic)
+    }
+
+    /// Like [`Self::guarded`]; on timeout, also the result of the work,
+    /// which ran on after the flag was set.
+    async fn guarded_late<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Path, &AtomicBool) -> T + Send + 'static,
+    ) -> Result<T, (Diagnostic, Option<T>)> {
         let guard = self.gate.clone().lock_owned().await;
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -518,15 +623,18 @@ impl Server {
             }
         };
         if timed_out {
-            return Err(error(
-                DiagnosticCode::Timeout,
-                format!(
-                    "Assembly exceeded the {} second time limit",
-                    self.timeout.as_secs()
+            return Err((
+                error(
+                    DiagnosticCode::Timeout,
+                    format!(
+                        "Assembly exceeded the {} second time limit",
+                        self.timeout.as_secs()
+                    ),
                 ),
+                joined.ok(),
             ));
         }
-        joined.map_err(|e| error(DiagnosticCode::Internal, e.to_string()))
+        joined.map_err(|e| (error(DiagnosticCode::Internal, e.to_string()), None))
     }
 
     async fn execute(
@@ -713,6 +821,14 @@ struct Loaded {
     rom: PathBuf,
 }
 
+/// The ROM files annotations name: the ROM's resolved path and bytes, and
+/// the base ROM's bytes.
+struct RomFiles {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    base: Option<Vec<u8>>,
+}
+
 impl Server {
     /// Reads the annotations and ROM and disassembles them.
     fn load_disassembly(
@@ -724,18 +840,8 @@ impl Server {
     ) -> Result<Loaded, Vec<Diagnostic>> {
         let (config, location) = match (annotations, inline) {
             (Some(path), None) => {
-                let (_, bytes) =
-                    read_limited(root, path, MAX_ANNOTATIONS_FILE).map_err(|d| vec![d])?;
-                let location = SourceLocation::file(path);
-                let config =
-                    disasm::parse_config(&String::from_utf8_lossy(&bytes)).map_err(|e| {
-                        vec![Diagnostic::error(
-                            DiagnosticCode::Disasm,
-                            e,
-                            location.clone(),
-                        )]
-                    })?;
-                (config, location)
+                let (config, _) = Self::read_annotations(root, path)?;
+                (config, SourceLocation::file(path))
             }
             (None, Some(config)) => (config.clone(), SourceLocation::default()),
             _ => {
@@ -745,14 +851,44 @@ impl Server {
                 )]);
             }
         };
+        let rom = Self::read_rom(root, &config, &location)?;
+        let disassembly = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        Ok(Loaded {
+            disassembly,
+            rom: rom.path,
+        })
+    }
+
+    /// Reads and parses an annotation file, with its bytes.
+    fn read_annotations(
+        root: &Path,
+        path: &Path,
+    ) -> Result<(DisasmConfig, Vec<u8>), Vec<Diagnostic>> {
+        let (_, bytes) = read_limited(root, path, MAX_ANNOTATIONS_FILE).map_err(|d| vec![d])?;
+        let config = disasm::parse_config(&String::from_utf8_lossy(&bytes)).map_err(|e| {
+            vec![Diagnostic::error(
+                DiagnosticCode::Disasm,
+                e,
+                SourceLocation::file(path),
+            )]
+        })?;
+        Ok((config, bytes))
+    }
+
+    /// Reads the ROM (and base ROM) the annotations name.
+    fn read_rom(
+        root: &Path,
+        config: &DisasmConfig,
+        location: &SourceLocation,
+    ) -> Result<RomFiles, Vec<Diagnostic>> {
         if config.rom.as_os_str().is_empty() {
             return Err(vec![Diagnostic::error(
                 DiagnosticCode::Disasm,
                 "The annotations must name the ROM file (rom)",
-                location,
+                location.clone(),
             )]);
         }
-        let (rom, bytes) = read_limited(root, &config.rom, MAX_ROM_FILE).map_err(|d| vec![d])?;
+        let (path, bytes) = read_limited(root, &config.rom, MAX_ROM_FILE).map_err(|d| vec![d])?;
         let base = match &config.base {
             Some(path) => Some(
                 read_limited(root, path, MAX_ROM_FILE)
@@ -761,6 +897,18 @@ impl Server {
             ),
             None => None,
         };
+        Ok(RomFiles { path, bytes, base })
+    }
+
+    /// Disassembles the ROM as `config` annotates it, for the source `output`.
+    fn disassemble_with(
+        root: &Path,
+        config: &DisasmConfig,
+        rom: &RomFiles,
+        output: Option<&Path>,
+        location: &SourceLocation,
+        cancel: &AtomicBool,
+    ) -> Result<Disassembly, Vec<Diagnostic>> {
         let output = output.map_or_else(|| disasm::default_output(&config.rom), Path::to_owned);
         if !output
             .extension()
@@ -775,8 +923,8 @@ impl Server {
         let source = nesasm_core::resolve_path(&output, root, Some(root))
             .map_err(|e| vec![error(DiagnosticCode::Output, e)])?;
         let source = Self::relative(root, &source);
-        let disassembly = disasm::disassemble(&bytes, base.as_deref(), &config, &source, cancel)
-            .map_err(|errors| {
+        disasm::disassemble(&rom.bytes, rom.base.as_deref(), config, &source, cancel).map_err(
+            |errors| {
                 errors
                     .into_iter()
                     .map(|d| Diagnostic {
@@ -784,8 +932,8 @@ impl Server {
                         ..d
                     })
                     .collect::<Vec<_>>()
-            })?;
-        Ok(Loaded { disassembly, rom })
+            },
+        )
     }
 
     fn disasm_report(root: &Path, input: &DisasmInput, cancel: &AtomicBool) -> DisasmReport {
@@ -951,6 +1099,257 @@ impl Server {
         report
     }
 
+    fn annotate_report(root: &Path, input: &AnnotateInput, cancel: &AtomicBool) -> AnnotateReport {
+        let mut report = AnnotateReport::default();
+        match Self::apply_annotations(root, input, cancel, &mut report) {
+            Ok(()) => report.success = true,
+            Err(diagnostics) => report.diagnostics.extend(diagnostics),
+        }
+        report
+    }
+
+    fn apply_annotations(
+        root: &Path,
+        input: &AnnotateInput,
+        cancel: &AtomicBool,
+        report: &mut AnnotateReport,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let fail = |message: &str| vec![error(DiagnosticCode::Disasm, message)];
+        let path = input.annotations.as_deref();
+        if path.is_some_and(|p| nesasm_core::annotation_log_path(p).is_none()) {
+            return Err(fail("The annotation file name must end with .disasm.json"));
+        }
+        // The annotations as they are, and the file's contents.
+        let (original, existing) = match (path, &input.inline, &input.create) {
+            (Some(path), None, None) => {
+                let (config, bytes) = Self::read_annotations(root, path)?;
+                (config, Some(bytes))
+            }
+            (Some(_), None, Some(new)) => (
+                DisasmConfig {
+                    rom: new.rom.clone(),
+                    base: new.base.clone(),
+                    load_address: new.load_address,
+                    ..DisasmConfig::default()
+                },
+                None,
+            ),
+            (None, Some(config), None) => (config.clone(), None),
+            _ => {
+                return Err(fail(
+                    "Give annotations (a .disasm.json file, with create for a new one) or inline annotations",
+                ));
+            }
+        };
+        let sha256_before = existing.as_deref().map(disasm::sha256_hex);
+        report.sha256_before.clone_from(&sha256_before);
+        match (&sha256_before, &input.expected_sha256) {
+            (Some(actual), Some(expected)) if !actual.eq_ignore_ascii_case(expected) => {
+                return Err(fail(
+                    "The annotation file changed since it was read (its SHA-256 is not expected_sha256); read it again",
+                ));
+            }
+            (Some(_), None) if !input.dry_run => {
+                return Err(fail(
+                    "Give expected_sha256 (the SHA-256 of the annotation file as read) to change it",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(fail(
+                    "expected_sha256 applies only to an existing annotation file",
+                ));
+            }
+            _ => {}
+        }
+        let location = path.map_or_else(SourceLocation::default, SourceLocation::file);
+        let with_location = |errors: Vec<String>| {
+            errors
+                .into_iter()
+                .map(|e| Diagnostic::error(DiagnosticCode::Disasm, e, location.clone()))
+                .collect::<Vec<_>>()
+        };
+        let rom = Self::read_rom(root, &original, &location)?;
+        let output = input.output.as_deref();
+        // A new file has nothing before; inline annotations do.
+        let before = input
+            .create
+            .is_none()
+            .then(|| Self::disassemble_with(root, &original, &rom, output, &location, cancel).ok())
+            .flatten();
+        if let Some(bytes) = &existing {
+            report.reformatted = disasm::apply_operations(&original, &rom.bytes, &[])
+                .map_or(true, |(config, _)| {
+                    disasm::canonical_json(&config).as_bytes() != bytes
+                });
+        }
+        let (config, applied) = disasm::apply_operations(&original, &rom.bytes, &input.operations)
+            .map_err(with_location)?;
+        report.applied = applied;
+        let after = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        let verification = after.verify(root, Some(root), cancel);
+        let matched = verification.matched;
+        report.verification = Some(verification);
+        report.summary_before = before.as_ref().map(Disassembly::summary);
+        report.summary_after = Some(after.summary());
+        let key = |i: &Issue| (i.kind, i.bank, i.address);
+        let changed = |from: &[Issue], to: &[Issue]| -> Vec<Issue> {
+            from.iter()
+                .filter(|i| !to.iter().any(|j| key(j) == key(i)))
+                .cloned()
+                .collect()
+        };
+        let issues_before = before.as_ref().map_or(&[][..], Disassembly::issues);
+        let page = input.issues.clone().unwrap_or_default();
+        let page_of = |issues: &[Issue]| {
+            Page::of(
+                issues,
+                page.offset,
+                page.limit,
+                DEFAULT_ITEM_LIMIT,
+                MAX_ITEM_LIMIT,
+            )
+        };
+        report.issues_resolved = Some(page_of(&changed(issues_before, after.issues())));
+        report.issues_introduced = Some(page_of(&changed(after.issues(), issues_before)));
+        let text = disasm::canonical_json(&config);
+        let sha256 = disasm::sha256_hex(text.as_bytes());
+        report.sha256 = Some(sha256.clone());
+        if path.is_none() || input.dry_run {
+            report.annotations = serde_json::from_str(&text).ok();
+        }
+        let totals = |summary: &Summary| {
+            let prg = summary.banks.iter().filter(|b| !b.chr);
+            serde_json::json!({
+                "instructions": summary.instructions,
+                "code_bytes": prg.clone().map(|b| b.code_bytes).sum::<usize>(),
+                "data_bytes": prg.clone().map(|b| b.data_bytes).sum::<usize>(),
+                "unknown_bytes": prg.map(|b| b.unknown_bytes).sum::<usize>(),
+                "issues": summary.issues.values().sum::<usize>(),
+            })
+        };
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        report.log_entry = Some(serde_json::json!({
+            "time": time,
+            "annotations": path,
+            "sha256_before": sha256_before,
+            "sha256_after": sha256,
+            "operations": input.operations,
+            "before": report.summary_before.as_ref().map(totals),
+            "after": report.summary_after.as_ref().map(totals),
+        }));
+        if !matched && input.require_match.unwrap_or(true) {
+            return Err(fail(
+                "The source would not reassemble to the ROM; nothing was written (see verification)",
+            ));
+        }
+        let Some(path) = path.filter(|_| !input.dry_run) else {
+            return Ok(());
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return Err(vec![error(
+                DiagnosticCode::Cancelled,
+                "The time limit passed before writing; nothing was written",
+            )]);
+        }
+        nesasm_core::write_annotations(path, root, &text, sha256_before.as_deref()).map_err(
+            |e| {
+                vec![Diagnostic::error(
+                    DiagnosticCode::Output,
+                    e,
+                    location.clone(),
+                )]
+            },
+        )?;
+        report.written = true;
+        let line = report
+            .log_entry
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default();
+        match nesasm_core::append_annotation_log(path, root, &line) {
+            Ok(log) => report.log = Some(log),
+            Err(e) => report.diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                ..error(
+                    DiagnosticCode::Output,
+                    format!("The annotations were written, but not the log entry: {e}"),
+                )
+            }),
+        }
+        Ok(())
+    }
+
+    fn annotate_summary(report: &AnnotateReport) -> String {
+        let mut text = Vec::new();
+        text.push(format!(
+            "{} operations applied; {}",
+            report.applied.len(),
+            if report.written {
+                format!(
+                    "annotations written{} (sha256 {})",
+                    if report.reformatted {
+                        " in canonical form"
+                    } else {
+                        ""
+                    },
+                    report.sha256.as_deref().unwrap_or_default()
+                )
+            } else {
+                "nothing written".into()
+            }
+        ));
+        let totals = |s: &Summary| {
+            let prg = s.banks.iter().filter(|b| !b.chr);
+            format!(
+                "{} instructions, code {}, data {}, unknown {} bytes, {} issues",
+                s.instructions,
+                prg.clone().map(|b| b.code_bytes).sum::<usize>(),
+                prg.clone().map(|b| b.data_bytes).sum::<usize>(),
+                prg.map(|b| b.unknown_bytes).sum::<usize>(),
+                s.issues.values().sum::<usize>()
+            )
+        };
+        if let Some(before) = &report.summary_before {
+            text.push(format!("Before: {}", totals(before)));
+        }
+        if let Some(after) = &report.summary_after {
+            text.push(format!("After: {}", totals(after)));
+        }
+        if let Some(v) = &report.verification {
+            text.push(if v.matched {
+                "Round trip: the source reassembles to the same ROM".into()
+            } else {
+                format!("Round trip FAILED: {} bytes differ", v.mismatch_count)
+            });
+        }
+        for (name, page) in [
+            ("Resolved", &report.issues_resolved),
+            ("Introduced", &report.issues_introduced),
+        ] {
+            if let Some(page) = page.as_ref().filter(|p| p.total > 0) {
+                text.push(format!("{name} issues: {}", page.total));
+                for issue in &page.items {
+                    let bank = issue.bank.map_or(String::new(), |b| format!("bank {b} "));
+                    text.push(format!(
+                        "  {} {bank}{}: {}",
+                        json_name(&issue.kind),
+                        issue.address,
+                        issue.message
+                    ));
+                }
+            }
+        }
+        if let Some(log) = &report.log {
+            text.push(format!("Logged to {}", log.display()));
+        }
+        if !report.diagnostics.is_empty() {
+            text.push(diagnostics_summary(&report.diagnostics));
+        }
+        text.join("\n")
+    }
+
     fn disasm_summary(report: &DisasmReport) -> String {
         let mut text = Vec::new();
         if let Some(summary) = &report.summary {
@@ -1039,8 +1438,12 @@ impl Server {
             text.push(heading("Issues", page.total, page.offset, page.items.len()));
             for issue in &page.items {
                 let bank = issue.bank.map_or(String::new(), |b| format!("bank {b} "));
+                let suggestions = match issue.suggestions.len() {
+                    0 => String::new(),
+                    n => format!(" [{n} suggestions]"),
+                };
                 text.push(format!(
-                    "  {} {bank}{}: {}",
+                    "  {} {bank}{}: {}{suggestions}",
                     json_name(&issue.kind),
                     issue.address,
                     issue.message
@@ -1224,6 +1627,33 @@ impl Server {
         let summary = Self::disasm_summary(&report);
         tool_result(&report, report.success, summary)
     }
+    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations: upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after, and the issues resolved and introduced. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    async fn annotate(&self, Parameters(input): Parameters<AnnotateInput>) -> CallToolResult {
+        let report = match self
+            .guarded_late(move |root, cancel| Self::annotate_report(root, &input, cancel))
+            .await
+        {
+            Ok(report) => report,
+            // The file was written once writing had started: say so.
+            Err((diagnostic, Some(mut report))) if report.written => {
+                report.diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: format!(
+                        "{}; it passed while writing, and the annotations were written",
+                        diagnostic.message
+                    ),
+                    ..diagnostic
+                });
+                report
+            }
+            Err((diagnostic, _)) => AnnotateReport {
+                diagnostics: vec![diagnostic],
+                ..AnnotateReport::default()
+            },
+        };
+        let summary = Self::annotate_summary(&report);
+        tool_result(&report, report.success, summary)
+    }
     #[tool(description="Read assembler syntax documentation. Topics: index, instructions, directives, expressions, options, disassembler.",output_schema=schema::<ReferenceReport>(),annotations(read_only_hint=true))]
     fn get_reference(&self, Parameters(input): Parameters<ReferenceInput>) -> CallToolResult {
         // Unknown topics are rejected when the arguments are parsed.
@@ -1255,7 +1685,8 @@ impl ServerHandler for Server {
                 "NESASM assembler. Read the syntax reference first (get_reference, or the ",
                 "nesasm://reference/* resources); use check to inspect diagnostics before ",
                 "assemble. To turn a ROM into source, read the disassembler reference and use ",
-                "disassemble, then export_disassembly. All paths are relative to the configured ",
+                "disassemble, record what is confirmed with annotate, then export_disassembly. ",
+                "All paths are relative to the configured ",
                 "project root."
             )
             .into(),

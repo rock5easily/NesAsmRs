@@ -689,3 +689,303 @@ fn mapper4_fixed_prg_16k_writes_the_last_two_banks_together() {
         std::fs::read(c.root.join("roms/game.nes")).unwrap()
     );
 }
+
+/// Builds `old/loose.nes`: 16 KiB NROM whose bytes at $E006-$E00A no code
+/// reaches.
+fn loose_rom(c: &mut Client) {
+    let source = concat!(
+        "  .inesprg 1\n  .ineschr 0\n  .bank 1\n  .org $E000\n",
+        "Reset:\n  lda #0\n  sta $2000\nLoop:\n  jmp Loop\n  .db 1, 2, 3, 4, 5\nNmi:\n  rti\n",
+        "  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"src/loose.asm","sources":{"src/loose.asm":source},"output":"old/loose.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+}
+
+#[test]
+fn annotate_writes_canonical_files_and_logs_evidence() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let original = r#"{"rom": "old/loose.nes", "labels": [{"address": "$E005", "name": "Loop"}]}"#;
+    c.write("loose.disasm.json", original);
+    let digest = nesasm_core::disasm::sha256_hex(original.as_bytes());
+    let table = json!([{"op": "upsert", "kind": "regions",
+                        "item": {"start": "$E008", "length": 5, "comment": "unused"}}]);
+    // Changing the file needs the digest of the file as read, which the
+    // report gives.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","operations":table}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(Client::messages(&r).contains("Give expected_sha256"), "{r}");
+    assert_eq!(r["structuredContent"]["sha256_before"], digest.as_str());
+    // A dry run reports the change and writes nothing.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","operations":table,"dry_run":true}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["written"], false);
+    assert_eq!(report["reformatted"], true);
+    assert_eq!(report["verification"]["matched"], true);
+    assert_eq!(
+        report["annotations"]["regions"],
+        json!([{"bank": 1, "start": "$E008", "length": 5, "comment": "unused"}])
+    );
+    assert_eq!(report["issues_resolved"]["total"], 1, "{r}");
+    assert_eq!(
+        report["issues_resolved"]["items"][0]["kind"],
+        "unknown_range"
+    );
+    assert_eq!(report["issues_introduced"]["total"], 0);
+    // The five bytes are data now (with the vectors; unknown bytes include
+    // the padding).
+    let bytes = |summary: &str, field: &str| report[summary]["banks"][1][field].as_u64().unwrap();
+    let data = bytes("summary_before", "data_bytes");
+    assert_eq!(bytes("summary_after", "data_bytes"), data + 5);
+    let unknown = bytes("summary_before", "unknown_bytes");
+    assert_eq!(bytes("summary_after", "unknown_bytes"), unknown - 5);
+    assert_eq!(report["log_entry"]["sha256_before"], digest.as_str());
+    assert_eq!(
+        std::fs::read_to_string(c.root.join("loose.disasm.json")).unwrap(),
+        original
+    );
+    assert!(!c.root.join("loose.disasm.log.jsonl").exists());
+    // With the digest, the file is written in canonical form and the
+    // operations with their evidence are logged.
+    let evidence = "the bytes after JMP Loop are never read";
+    let mut ops = table.clone();
+    ops[0]["evidence"] = json!(evidence);
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","operations":ops,"expected_sha256":digest}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["written"], true);
+    let written = std::fs::read_to_string(c.root.join("loose.disasm.json")).unwrap();
+    assert_eq!(
+        written,
+        concat!(
+            "{\n",
+            "  \"rom\": \"old/loose.nes\",\n",
+            "  \"labels\": [\n",
+            "    {\"bank\":1,\"address\":\"$E005\",\"name\":\"Loop\"}\n",
+            "  ],\n",
+            "  \"regions\": [\n",
+            "    {\"bank\":1,\"start\":\"$E008\",\"length\":5,\"comment\":\"unused\"}\n",
+            "  ]\n",
+            "}\n",
+        )
+    );
+    let new_digest = nesasm_core::disasm::sha256_hex(written.as_bytes());
+    assert_eq!(report["sha256"], new_digest.as_str());
+    assert!(report.get("annotations").is_none(), "{r}");
+    let log = std::fs::read_to_string(c.root.join("loose.disasm.log.jsonl")).unwrap();
+    let entries: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["operations"][0]["evidence"], evidence);
+    assert_eq!(entries[0]["sha256_after"], new_digest.as_str());
+    // Totals of the PRG banks.
+    let total = |when: &str, field: &str| entries[0][when][field].as_u64().unwrap();
+    assert_eq!(
+        total("before", "unknown_bytes"),
+        total("after", "unknown_bytes") + 5
+    );
+    assert_eq!(
+        total("after", "data_bytes"),
+        total("before", "data_bytes") + 5
+    );
+    assert_eq!(
+        (total("before", "issues"), total("after", "issues")),
+        (1, 0)
+    );
+    let text = Client::text(&r);
+    for line in [
+        &format!(
+            "Before: 4 instructions, code 9, data {data}, unknown {} bytes, 1 issues",
+            total("before", "unknown_bytes")
+        ),
+        &format!(
+            "After: 4 instructions, code 9, data {}, unknown {} bytes, 0 issues",
+            data + 5,
+            total("after", "unknown_bytes")
+        ),
+        "Resolved issues: 1",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    // The old digest no longer matches: nothing is written.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","operations":[],"expected_sha256":digest}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains("changed since it was read"),
+        "{r}"
+    );
+    assert_eq!(r["structuredContent"]["sha256_before"], new_digest.as_str());
+    // An unchanged canonical file is not reformatted.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","operations":[],"expected_sha256":new_digest}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["reformatted"], false);
+    assert_eq!(r["structuredContent"]["sha256"], new_digest.as_str());
+}
+
+#[test]
+fn annotate_writes_nothing_that_fails() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    // A changed operand that changes the bytes fails the round trip.
+    let operand = json!([{"op": "upsert", "kind": "operands",
+                          "item": {"address": "$E000", "expr": "#$01"}}]);
+    let create = json!({"rom": "old/loose.nes"});
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"new.disasm.json","create":create,"operations":operand}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(Client::messages(&r).contains("would not reassemble"), "{r}");
+    assert_eq!(r["structuredContent"]["verification"]["matched"], false);
+    assert!(!c.root.join("new.disasm.json").exists());
+    // Unless the round trip is not required.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"new.disasm.json","create":create,"operations":operand,
+               "require_match":false}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["written"], true);
+    assert!(
+        r["structuredContent"].get("summary_before").is_none(),
+        "{r}"
+    );
+    assert!(c.root.join("new.disasm.log.jsonl").exists());
+    for (arguments, message) in [
+        (
+            json!({"annotations":"new.disasm.json","create":create,"operations":[]}),
+            "exists",
+        ),
+        (
+            json!({"annotations":"new.json","create":create,"operations":[]}),
+            "must end with .disasm.json",
+        ),
+        (
+            json!({"annotations":".hidden/x.disasm.json","create":create,"operations":[]}),
+            "hidden",
+        ),
+        (
+            json!({"annotations":"x.disasm.json","create":{"rom":"../outside.nes"},"operations":[]}),
+            "outside.nes",
+        ),
+        (
+            json!({"inline":{"rom":"old/loose.nes"},"create":create,"operations":[]}),
+            "Give annotations",
+        ),
+        (
+            json!({"inline":{"rom":"old/loose.nes"},"expected_sha256":"00","operations":[]}),
+            "expected_sha256 applies only to an existing annotation file",
+        ),
+        (
+            json!({"inline":{"rom":"old/loose.nes"},
+                   "operations":[{"op":"remove","kind":"labels","key":{"name":"Nope"}}]}),
+            "operations[0] (remove labels): no entry matches the key",
+        ),
+        (
+            json!({"inline":{"rom":"old/loose.nes"},
+                   "operations":[{"op":"upsert","kind":"entry_points",
+                                  "item":{"address":"$E008","no_return":true}}]}),
+            "give evidence",
+        ),
+    ] {
+        let r = c.call("annotate", arguments.clone());
+        assert_eq!(r["isError"], true, "{arguments}: {r}");
+        assert!(Client::messages(&r).contains(message), "{arguments}: {r}");
+    }
+    assert!(!c.root.join("x.disasm.json").exists());
+    assert!(!c.root.join(".hidden").exists());
+}
+
+#[test]
+fn annotate_inline_returns_the_annotations_and_suggestions_apply() {
+    let mut c = Client::start();
+    let source = concat!(
+        "  .inesprg 1\n  .ineschr 0\n  .bank 1\n  .org $E000\n",
+        "Reset:\n  ldx $0300\n  lda Hi,x\n  pha\n  lda Lo,x\n  pha\n  rts\n",
+        "A1:\n  rts\nA2:\n  rts\nLo:\n  .db LOW(A1-1), LOW(A2-1)\nHi:\n  .db HIGH(A1-1), HIGH(A2-1)\n",
+        "Nmi:\n  rti\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"rts.asm","sources":{"rts.asm":source},"output":"rts.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let r = c.call(
+        "disassemble",
+        json!({"inline":{"rom":"rts.nes"},"issues":{"kind":"indirect_jump"}}),
+    );
+    let issue = &r["structuredContent"]["issues"]["items"][0];
+    let suggestion = &issue["suggestions"][0];
+    assert_eq!(suggestion["needs"], json!(["length"]), "{r}");
+    assert!(
+        Client::text(&r).contains("and a high_bytes region [1 suggestions]"),
+        "{r}"
+    );
+    let mut ops = suggestion["operations"].clone();
+    for op in ops.as_array_mut().unwrap() {
+        op["item"]["length"] = json!(2);
+        op["evidence"] = json!("Reset reads Lo,x and Hi,x for X 0 and 1");
+    }
+    let r = c.call(
+        "annotate",
+        json!({"inline":{"rom":"rts.nes"},"operations":ops}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["written"], false);
+    assert!(report.get("sha256_before").is_none(), "{r}");
+    assert_eq!(report["annotations"]["regions"][0]["type"], "low_bytes");
+    assert_eq!(
+        report["log_entry"]["operations"][0]["evidence"],
+        "Reset reads Lo,x and Hi,x for X 0 and 1"
+    );
+    assert!(report["log_entry"]["annotations"].is_null());
+    // The jump's targets are code now, and the issue no longer suggests.
+    let r = c.call(
+        "disassemble",
+        json!({"inline":report["annotations"],"issues":{"kind":"indirect_jump"}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let issue = &r["structuredContent"]["issues"]["items"][0];
+    assert!(issue.get("suggestions").is_none(), "{r}");
+}
+
+#[test]
+fn annotate_compares_inline_annotations_with_themselves_before() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let r = c.call(
+        "annotate",
+        json!({"inline":{"rom":"old/loose.nes"},"operations":[]}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["summary_before"], report["summary_after"]);
+    assert_eq!(report["issues_resolved"]["total"], 0);
+    assert_eq!(report["issues_introduced"]["total"], 0);
+}

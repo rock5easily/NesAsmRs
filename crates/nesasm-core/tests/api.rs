@@ -1247,3 +1247,91 @@ fn export_disassembly_replaces_old_chr_and_pair_bank_files() {
     );
     assert_eq!(fs::read(t.0.join("game.asm")).unwrap(), main);
 }
+
+#[test]
+fn annotation_files_are_written_only_over_what_was_read() {
+    let t = Temp::new();
+    let root = &t.0;
+    let path = Path::new("notes/game.disasm.json");
+    let first = "{\n  \"rom\": \"game.nes\"\n}\n";
+    let artifact = nesasm_core::write_annotations(path, root, first, None).unwrap();
+    assert_eq!(artifact.kind, ArtifactKind::Annotations);
+    assert_eq!(artifact.size, first.len());
+    assert_eq!(
+        serde_json::to_value(ArtifactKind::Annotations).unwrap(),
+        "annotations"
+    );
+    assert_eq!(fs::read_to_string(root.join(path)).unwrap(), first);
+    // Creating it again, or replacing it after it changed, fails.
+    let second = "{\n  \"rom\": \"other.nes\"\n}\n";
+    let digest = nesasm_core::disasm::sha256_hex(first.as_bytes());
+    for (expected, message) in [
+        (None, "notes/game.disasm.json exists"),
+        (
+            Some("00"),
+            "notes/game.disasm.json changed since it was read",
+        ),
+    ] {
+        let e = nesasm_core::write_annotations(path, root, second, expected).unwrap_err();
+        assert!(
+            e.replace('\\', "/").starts_with(message),
+            "{expected:?}: {e}"
+        );
+    }
+    assert_eq!(fs::read_to_string(root.join(path)).unwrap(), first);
+    nesasm_core::write_annotations(path, root, second, Some(&digest.to_uppercase())).unwrap();
+    assert_eq!(fs::read_to_string(root.join(path)).unwrap(), second);
+    // Only annotation files, inside the root and outside hidden directories.
+    for (name, message) in [
+        ("game.json", "The file name must end with .disasm.json"),
+        (".disasm.json", "The file name must end with .disasm.json"),
+        (".git/game.disasm.json", "hidden"),
+        ("../game.disasm.json", "outside"),
+    ] {
+        let e = nesasm_core::write_annotations(Path::new(name), root, first, None).unwrap_err();
+        assert!(e.contains(message), "{name}: {e}");
+    }
+    t.write("dir.disasm.json/x", "");
+    let e = nesasm_core::write_annotations(Path::new("dir.disasm.json"), root, first, None)
+        .unwrap_err();
+    assert!(e.contains("is a directory"), "{e}");
+    // The log beside the file collects one line per entry.
+    assert_eq!(
+        nesasm_core::annotation_log_path(path),
+        Some(Path::new("notes/game.disasm.log.jsonl").to_owned())
+    );
+    assert_eq!(
+        nesasm_core::annotation_log_path(Path::new("game.json")),
+        None
+    );
+    for line in ["{\"n\":1}", "{\"n\":2}"] {
+        let log = nesasm_core::append_annotation_log(path, root, line).unwrap();
+        assert_eq!(log, Path::new("notes/game.disasm.log.jsonl"));
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("notes/game.disasm.log.jsonl")).unwrap(),
+        "{\"n\":1}\n{\"n\":2}\n"
+    );
+    let e = nesasm_core::append_annotation_log(Path::new(".x/game.disasm.json"), root, "{}")
+        .unwrap_err();
+    assert!(e.contains("hidden"), "{e}");
+}
+
+#[cfg(unix)]
+#[test]
+fn annotation_files_do_not_follow_links_to_missing_files() {
+    let t = Temp::new();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("stolen.disasm.log.jsonl");
+    std::os::unix::fs::symlink(&target, t.0.join("game.disasm.log.jsonl")).unwrap();
+    let e =
+        nesasm_core::append_annotation_log(Path::new("game.disasm.json"), &t.0, "{}").unwrap_err();
+    assert!(e.contains("is a link to a file that does not exist"), "{e}");
+    assert!(!target.exists());
+    // Nor directories that do not exist.
+    std::os::unix::fs::symlink(outside.path().join("missing"), t.0.join("notes")).unwrap();
+    let e = nesasm_core::write_annotations(Path::new("notes/game.disasm.json"), &t.0, "{}", None)
+        .unwrap_err();
+    assert!(e.contains("is a link to a file that does not exist"), "{e}");
+    assert!(!outside.path().join("missing").exists());
+}

@@ -17,10 +17,11 @@ fn stdio_lifecycle_validation_build_and_recovery() {
         "get_reference",
         "disassemble",
         "export_disassembly",
+        "annotate",
     ] {
         assert!(names.contains(&name), "{names:?}");
     }
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     for tool in tools {
         assert!(tool["inputSchema"].is_object());
         assert!(tool["outputSchema"].is_object());
@@ -325,6 +326,15 @@ fn structured_content_matches_output_schema() {
         ),
         ("export_disassembly", json!({"inline":{"rom":"game.bin"}})),
         ("disassemble", json!({"inline":{"rom":"missing.bin"}})),
+        (
+            "annotate",
+            json!({"inline":{"rom":"game.bin"},"operations":[{"op":"upsert","kind":"labels",
+                   "item":{"address":"$E000","name":"Start"}}]}),
+        ),
+        (
+            "annotate",
+            json!({"inline":{"rom":"game.bin"},"operations":[{"op":"set","kind":"labels"}]}),
+        ),
     ] {
         let result = c.call(name, arguments.clone());
         let content = result["structuredContent"].as_object().unwrap();
