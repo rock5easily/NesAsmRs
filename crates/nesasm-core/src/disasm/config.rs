@@ -86,6 +86,10 @@ impl JsonSchema for Address {
 pub struct DisasmConfig {
     /// ROM file relative to the project root: .nes with an iNES header, or a raw .bin.
     pub rom: PathBuf,
+    /// The version of the annotation format: 2 when entries give `evidence`
+    /// or `status` (which older versions of nesasm cannot read); absent for 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u32>,
     /// For a raw .bin fragment: the CPU address of its first byte. Required
     /// when the file is not a whole number of 8 KiB banks.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,6 +132,186 @@ pub struct DisasmConfig {
     pub options: DisasmOptions,
 }
 
+/// Whether an annotation is confirmed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// Applied by every analysis.
+    #[default]
+    Confirmed,
+    /// Kept with the annotations but not applied, unless an analysis asks for
+    /// hypotheses (never by `export_disassembly`).
+    Hypothesis,
+}
+
+/// The newest annotation format this version reads.
+pub const FORMAT_VERSION: u32 = 2;
+/// Evidence strings per entry, and characters per string.
+pub const MAX_EVIDENCE: usize = 64;
+pub const MAX_EVIDENCE_TEXT: usize = 2000;
+
+/// Runs `$body` for each annotation list of `$config`, with `$name` its
+/// name and `$list` the list.
+macro_rules! each_list {
+    ($config:ident, $name:ident, $list:ident, [$($r:tt)+] => $body:expr) => {{
+        {
+            let ($name, $list) = ("banks", $($r)+ $config.banks);
+            $body
+        }
+        {
+            let ($name, $list) = ("entry_points", $($r)+ $config.entry_points);
+            $body
+        }
+        {
+            let ($name, $list) = ("labels", $($r)+ $config.labels);
+            $body
+        }
+        {
+            let ($name, $list) = ("symbols", $($r)+ $config.symbols);
+            $body
+        }
+        {
+            let ($name, $list) = ("regions", $($r)+ $config.regions);
+            $body
+        }
+        {
+            let ($name, $list) = ("comments", $($r)+ $config.comments);
+            $body
+        }
+        {
+            let ($name, $list) = ("operands", $($r)+ $config.operands);
+            $body
+        }
+        {
+            let ($name, $list) = ("references", $($r)+ $config.references);
+            $body
+        }
+        {
+            let ($name, $list) = ("patches", $($r)+ $config.patches);
+            $body
+        }
+    }};
+}
+
+/// The `evidence` and `status` every annotation entry has.
+pub(crate) trait Provenance {
+    fn evidence(&self) -> &[String];
+    fn evidence_mut(&mut self) -> &mut Vec<String>;
+    fn status(&self) -> Status;
+    fn status_mut(&mut self) -> &mut Status;
+}
+
+macro_rules! provenance {
+    ($($t:ty),*) => {$(
+        impl Provenance for $t {
+            fn evidence(&self) -> &[String] {
+                &self.evidence
+            }
+            fn evidence_mut(&mut self) -> &mut Vec<String> {
+                &mut self.evidence
+            }
+            fn status(&self) -> Status {
+                self.status
+            }
+            fn status_mut(&mut self) -> &mut Status {
+                &mut self.status
+            }
+        }
+    )*};
+}
+
+provenance!(
+    BankLayout,
+    EntryPoint,
+    LabelDef,
+    SymbolDef,
+    RegionDef,
+    CommentDef,
+    OperandDef,
+    PatchDef,
+    ReferenceDef
+);
+
+impl DisasmConfig {
+    /// The number of entries that are hypotheses.
+    pub fn hypotheses(&self) -> usize {
+        let config = self;
+        let mut count = 0;
+        each_list!(config, _name, list, [&] => {
+            count += list.iter().filter(|e| e.status() == Status::Hypothesis).count();
+        });
+        count
+    }
+
+    /// Whether an entry is a hypothesis.
+    pub fn has_hypotheses(&self) -> bool {
+        self.hypotheses() > 0
+    }
+
+    /// The annotations an analysis applies: without the hypotheses.
+    pub fn confirmed(&self) -> Self {
+        let mut config = self.clone();
+        each_list!(config, _name, list, [&mut] => list.retain(|e| e.status() != Status::Hypothesis));
+        config
+    }
+
+    /// The annotations with the hypotheses taken as confirmed, to see what
+    /// they would change.
+    pub fn with_hypotheses(&self) -> Self {
+        let mut config = self.clone();
+        each_list!(config, _name, list, [&mut] => {
+            for entry in list.iter_mut() {
+                *entry.status_mut() = Status::Confirmed;
+            }
+        });
+        config
+    }
+
+    /// Whether an entry gives `evidence` or `status`, which needs format 2.
+    pub(crate) fn needs_format_2(&self) -> bool {
+        let config = self;
+        let mut found = false;
+        each_list!(config, _name, list, [&] => {
+            found |= list
+                .iter()
+                .any(|e| !e.evidence().is_empty() || e.status() != Status::Confirmed);
+        });
+        found
+    }
+
+    /// Errors in the format version and the evidence of the entries.
+    pub(crate) fn check_format(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(version) = self.format_version
+            && !(1..=FORMAT_VERSION).contains(&version)
+        {
+            errors.push(format!(
+                "format_version {version} is not supported: this version of nesasm reads annotations up to format_version {FORMAT_VERSION}; use a newer nesasm-mcp"
+            ));
+        }
+        let config = self;
+        each_list!(config, name, list, [&] => {
+            for (i, entry) in list.iter().enumerate() {
+                let evidence = entry.evidence();
+                if evidence.len() > MAX_EVIDENCE {
+                    errors.push(format!(
+                        "{name}[{i}]: evidence has {} items; at most {MAX_EVIDENCE}",
+                        evidence.len()
+                    ));
+                }
+                if let Some(text) = evidence.iter().find(|t| t.chars().count() > MAX_EVIDENCE_TEXT) {
+                    errors.push(format!(
+                        "{name}[{i}]: evidence of {} characters; at most {MAX_EVIDENCE_TEXT}",
+                        text.chars().count()
+                    ));
+                }
+            }
+        });
+        errors
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -135,6 +319,13 @@ pub struct BankLayout {
     pub bank: usize,
     /// CPU address of the bank's first byte, a multiple of $2000.
     pub org: Address,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -165,6 +356,13 @@ pub struct EntryPoint {
     /// a thread yield that other threads' bank switches run during).
     #[serde(default, skip_serializing_if = "is_false")]
     pub keeps_banks: bool,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -178,6 +376,13 @@ pub struct LabelDef {
     /// Comment placed above the label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -191,6 +396,13 @@ pub struct SymbolDef {
     pub size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -250,6 +462,13 @@ pub struct RegionDef {
     /// (in the fixed banks, or the table's own bank) as usual.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bank_table: Option<Address>,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(
@@ -275,6 +494,13 @@ pub struct CommentDef {
     pub text: String,
     #[serde(default, skip_serializing_if = "is_default")]
     pub position: CommentPosition,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -288,6 +514,13 @@ pub struct OperandDef {
     /// The operand as written after the mnemonic (`#LOW(Table)`, `<ptr+1`,
     /// `[ptr],y`) or the data value (`Table-1`). The round-trip check verifies it.
     pub expr: String,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -305,6 +538,13 @@ pub struct PatchDef {
     /// Comment placed above the range.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -317,6 +557,13 @@ pub struct ReferenceDef {
     pub address: Address,
     /// Bank holding the referenced address.
     pub target_bank: usize,
+    /// What was observed that supports the entry (callers, the code that
+    /// reads a table, documentation), one observation per string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub status: Status,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]

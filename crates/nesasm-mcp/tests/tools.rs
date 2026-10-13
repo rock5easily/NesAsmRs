@@ -774,11 +774,12 @@ fn annotate_writes_canonical_files_and_logs_evidence() {
         concat!(
             "{\n",
             "  \"rom\": \"old/loose.nes\",\n",
+            "  \"format_version\": 2,\n",
             "  \"labels\": [\n",
             "    {\"bank\":1,\"address\":\"$E005\",\"name\":\"Loop\"}\n",
             "  ],\n",
             "  \"regions\": [\n",
-            "    {\"bank\":1,\"start\":\"$E008\",\"length\":5,\"comment\":\"unused\"}\n",
+            "    {\"bank\":1,\"start\":\"$E008\",\"length\":5,\"comment\":\"unused\",\"evidence\":[\"the bytes after JMP Loop are never read\"]}\n",
             "  ]\n",
             "}\n",
         )
@@ -1176,4 +1177,60 @@ fn inline_digests_tell_the_order_of_names_for_one_place() {
         digests.push(r["structuredContent"]["inputs"]["annotations_sha256"].clone());
     }
     assert_ne!(digests[0], digests[1]);
+}
+
+#[test]
+fn hypotheses_are_kept_but_applied_only_on_request() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    c.write(
+        "loose.disasm.json",
+        r#"{"rom": "old/loose.nes", "format_version": 2, "labels": [
+            {"address": "$E005", "name": "Spin", "status": "hypothesis", "evidence": ["jumps to itself"]}]}"#,
+    );
+    let view = json!({"from": "$E000", "to": "$E00F"});
+    let r = c.call(
+        "disassemble",
+        json!({"annotations":"loose.disasm.json","view":view}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["hypotheses"], json!({"count": 1, "applied": false}));
+    assert!(!report["view"].to_string().contains("Spin"), "{r}");
+    assert!(
+        Client::text(&r)
+            .lines()
+            .any(|l| l == "Hypotheses: 1 entries, not applied (hypotheses: true applies them)"),
+        "{r}"
+    );
+    let r = c.call(
+        "disassemble",
+        json!({"annotations":"loose.disasm.json","view":view,"hypotheses":true}),
+    );
+    assert_eq!(r["structuredContent"]["hypotheses"]["applied"], true);
+    assert!(
+        r["structuredContent"]["view"].to_string().contains("Spin:"),
+        "{r}"
+    );
+    // Never in the source.
+    let r = c.call(
+        "export_disassembly",
+        json!({"annotations":"loose.disasm.json","output":"out/loose.asm"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let source = std::fs::read_to_string(c.root.join("out/loose.asm")).unwrap();
+    assert!(!source.contains("Spin"), "{source}");
+    // annotate checks hypotheses it does not apply.
+    let r = c.call(
+        "annotate",
+        json!({"inline":{"rom":"old/loose.nes"},"operations":[{"op":"upsert","kind":"labels",
+               "item":{"address":"$E000","name":"9x","status":"hypothesis"},"evidence":"a guess"}]}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains(
+            "In the changed annotations (with the hypotheses applied): labels[0] $E000 (9x): Invalid name '9x'"
+        ),
+        "{r}"
+    );
 }

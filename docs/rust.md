@@ -338,6 +338,17 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
   SHA-256は依存クレートを増やさないよう `disasm::sha256_hex` で計算します。
   書き込みは一時ファイルからのrenameで、失敗時は何も変えません。`dry_run` と `inline` は書き込みません。
 - 応答は更新前後の要約、往復検証、解消・新規・メッセージが変化したissue（`id` で照合）を返します。
+- 注釈の各項目は `evidence`（根拠、文字列の配列）と `status`（`confirmed`／`hypothesis`）を持てます。
+  操作の `evidence` は項目の `evidence` に追加し（重複なし）、根拠の必須の判定は両方を合わせて行います。
+  推測（`hypothesis`）にも根拠を求めます。`evidence` はソースに出力しません。
+- 推測の項目は `disassemble`（コアの関数）が常に除いて解析します（`DisasmConfig::confirmed`）。
+  試行の解析では、呼び出し側が `DisasmConfig::with_hypotheses` で確定とみなした注釈を渡します
+  （MCPの `hypotheses: true`）。`export_disassembly` は推測を適用しません。`annotate` は推測を適用しない
+  場合も、推測を適用した注釈が有効かを解析で確かめてから書き込みます。各項目のバンクの補完は、
+  適用される（確定した）配置で行います。
+- 互換性のため、`evidence` か `status` を使う注釈にだけ `format_version: 2` を書きます。旧版は
+  未知の欄として拒否し、新しい版は自分が読めるより新しい版を原因がわかるエラーで拒否します。
+  `evidence` は1項目64件・1件2000文字までです。
 
 課題は `id`（`種類:bank:アドレス`、bankがなければ `-`、例 `unresolved_bank:30:$DEB1`）を持ちます。
 ヘッダの課題はどれも $0000 なので主題（`nes2`／`trainer`／`size`／`partial_bank`）を加えます。

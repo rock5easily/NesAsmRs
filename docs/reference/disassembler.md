@@ -258,7 +258,14 @@ writes it as one change:
 - `evidence` is required for entries that override what the analysis finds:
   `references`, `entry_points` with `no_return`, `inline_bytes`,
   `switch_banks` or `keeps_banks`, and `regions` of type `code` or with
-  `code_targets`.
+  `code_targets`, and for every `hypothesis`. The operation's `evidence`, or
+  the `evidence` of the item, will do. The operation's `evidence` is added to
+  the `evidence` of the item (once), so the entry keeps what was observed; to
+  drop a string, give the item's `evidence` without it.
+- Entries whose `status` is `hypothesis` are kept but not applied, unless
+  `hypotheses: true` asks for an analysis with them taken as confirmed. They
+  are still checked: the file is not written if the annotations with them
+  applied are not valid.
 - The file is written only if the operations apply, the annotations are
   valid, the source reassembles to the same ROM (`require_match`, default
   true) and the file's SHA-256 is still `expected_sha256` (the `sha256` of
@@ -293,6 +300,17 @@ directory that does not exist is refused), with their log.
 ## Annotation file
 
 - `rom`: the ROM file relative to the root: `.nes` (iNES) or a raw `.bin`.
+- `format_version`: 2 when entries give `evidence` or `status` (`annotate`
+  writes it then, and leaves it out otherwise); absent for 1. Versions of
+  nesasm before format 2 cannot read such files; a version newer than this one
+  reads is an error.
+- Every entry of the lists below may also give `evidence`, the observations
+  that support it (an array of strings, not written into the source), and
+  `status`: `confirmed` (default) or `hypothesis`. A hypothesis is kept with
+  the annotations but no analysis applies it unless asked (`hypotheses: true`
+  of `disassemble` and `annotate`), and `export_disassembly` never does. One
+  key holds one entry, so two hypotheses for the same place cannot be kept
+  side by side.
 - `load_address`: for a raw fragment, the CPU address of its first byte.
   Required unless the file is a whole number of 8 KiB banks.
 - `base`: for a ROM hack, the original ROM relative to the root (see above).
@@ -468,7 +486,8 @@ followed; confirm them before applying them.
 
 Annotation values must stay within the ROM: ranges within one bank,
 `inline_bytes` at most 8192, symbols ending at or below $FFFF. Table values
-whose adjusted target would wrap around $FFFF are written as numbers.
+whose adjusted target would wrap around $FFFF are written as numbers. An entry
+gives at most 64 `evidence` strings of at most 2000 characters each.
 
 ROMs of up to 128 banks of 8 KiB; over MCP, ROM and annotation files of up
 to 8 MiB each (also the base ROM). A disassembly is subject to the server's time limit.
@@ -494,6 +513,10 @@ and write counts and every routine that accesses them.
 the ROM, of the base ROM and of the annotation file (for inline annotations,
 of their canonical text, as `annotate` would write them), and the server
 version, to record with the results.
+
+`hypotheses: true` analyses the entries whose `status` is `hypothesis` as if
+they were confirmed (the baseline too); the report's `hypotheses` gives their
+`count` and whether they were `applied`.
 
 `baseline` (`annotations` or `inline`, with `offset` and `limit`) analyses
 other annotations of the ROM, such as a copy of an earlier version, and

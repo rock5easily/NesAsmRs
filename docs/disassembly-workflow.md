@@ -279,9 +279,13 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
   `needs` に挙がったフィールド（表の `length` など）は null のままなので、実コードで確かめて埋めます。
   修正案は追跡できた経路から作ったもので、根拠の代わりにはなりません。
 - 推定より優先される項目（`references`、`no_return`／`inline_bytes`／`switch_banks`／`keeps_banks` を
-  持つ `entry_points`、`code` 領域、`code_targets` 付きの表）には `evidence` が必須です。
-- `evidence` は注釈ファイルと同じ場所の `<名前>.disasm.log.jsonl` に、操作、更新前後のSHA-256、
-  命令数とコード／データ／未分類のバイト数、issues数とともに1行ずつ追記されます。
+  持つ `entry_points`、`code` 領域、`code_targets` 付きの表）と推測（`hypothesis`）の項目には根拠が必須です。
+  操作の `evidence` か、項目の `evidence` のどちらかに書きます。
+- 操作の `evidence` は項目の `evidence`（文字列の配列）に追加され、注釈ファイルの中で項目と一緒に残ります。
+  同じ文は二重に入りません。間違った根拠を消すときは、その文を除いた `evidence` を項目に付けて送ります。
+  根拠を使うファイルには `"format_version": 2` が書かれ、旧版のnesasmでは読めなくなります。
+- 根拠は、注釈ファイルと同じ場所の `<名前>.disasm.log.jsonl` にも、操作、更新前後のSHA-256、
+  命令数とコード／データ／未分類のバイト数、issues数とともに1行ずつ追記されます（履歴）。
   ソースの読者に向けた説明は、別途 `comment`／`comments.text` に書きます。
 - ファイルを書き込むのは、全操作を適用でき、注釈が有効で、往復検証が一致し（`require_match`）、
   ファイルが `expected_sha256` から変わっていない場合だけです。`dry_run: true` で書き込まずに結果を確認できます。
@@ -290,8 +294,13 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
   照合し、同じissueのメッセージだけが変わったもの（表を領域で記述した間接ジャンプなど）は
   `issues_changed` に変更前のメッセージとともに入ります。
 
-注釈JSONには未対応の `confidence` 等の独自フィールドを追加しません。
-未確認の仮説はノートに置き、確定した注釈と分けます。
+注釈JSONには未対応の `confidence` 等の独自フィールドを追加しません（読み込みでエラーになります）。
+未確認の仮説は `"status": "hypothesis"` の項目として、推測した理由を `evidence` に付けて置きます。
+推測の項目は通常の解析には適用されず、`export_disassembly` のソースにも入りません。
+`disassemble`／`annotate` に `hypotheses: true` を指定すると、推測を確定とみなした試行の解析になります。
+確かめられたら、`status` を外して（`confirmed` にして）根拠を足した項目で `upsert` します。
+1つのキーには1項目しか置けないため、同じ場所について複数の推測を並べることはできません。
+並べたい推測はノートに置きます。
 
 ```text
 対象: ROM名・SHA-256、bank、CPUアドレス（必要ならファイルoffsetも）

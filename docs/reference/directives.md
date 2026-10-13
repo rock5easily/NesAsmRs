@@ -59,3 +59,5 @@ undefined label values are 0. DEFINED does not produce a forward-reference warni
 - INCCHR: PCX images from 16x16 to 1024x768, files up to about 6 MiB.
 - Expressions: up to 256 tokens; FUNC calls nest up to 32 levels and are limited
   to 1,000,000 calls per assembly.
+- Disassembler annotations: up to 64 `evidence` strings per entry, each up to
+  2000 characters (see [Disassembler](disassembler.md#limits)).

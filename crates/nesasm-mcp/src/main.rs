@@ -229,6 +229,10 @@ struct DisasmInput {
     /// Other annotations to compare with: their summary, and the issues
     /// resolved, introduced and changed since (matched by id).
     baseline: Option<BaselineQuery>,
+    /// Apply the entries whose status is hypothesis, as if confirmed, to see
+    /// what they would change (also for the baseline). Default false.
+    #[serde(default)]
+    hypotheses: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -292,6 +296,10 @@ struct AnnotateInput {
     output: Option<PathBuf>,
     /// Pages of the issues resolved and introduced (default: the first 100).
     issues: Option<PageQuery>,
+    /// Analyse with the hypotheses applied, as if confirmed. Without it,
+    /// hypotheses are still checked, but not applied.
+    #[serde(default)]
+    hypotheses: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -355,6 +363,9 @@ struct DisasmReport {
     /// the results.
     #[serde(skip_serializing_if = "Option::is_none")]
     inputs: Option<Inputs>,
+    /// Entries that are hypotheses, and whether they were applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hypotheses: Option<Hypotheses>,
 }
 
 /// The analysis with the baseline annotations, compared with this one.
@@ -449,6 +460,10 @@ struct AnnotateReport {
     reformatted: bool,
     /// For each operation applied, the entries it replaced or removed.
     applied: Vec<Applied>,
+    /// Entries of the changed annotations that are hypotheses, and whether
+    /// the analyses applied them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hypotheses: Option<Hypotheses>,
     /// The analysis with the annotations as they were, if they were valid.
     #[serde(skip_serializing_if = "Option::is_none")]
     summary_before: Option<Summary>,
@@ -919,6 +934,22 @@ struct Loaded {
     disassembly: Disassembly,
     rom: PathBuf,
     inputs: Inputs,
+    hypotheses: Option<Hypotheses>,
+}
+
+/// The entries of the annotations that are hypotheses.
+#[derive(Clone, Serialize, JsonSchema)]
+struct Hypotheses {
+    count: usize,
+    /// Whether the analysis applied them (`hypotheses: true`).
+    applied: bool,
+}
+
+impl Hypotheses {
+    fn of(config: &DisasmConfig, applied: bool) -> Option<Self> {
+        let count = config.hypotheses();
+        (count > 0).then_some(Self { count, applied })
+    }
 }
 
 /// What an analysis read, to record with its results.
@@ -951,6 +982,7 @@ impl Server {
         annotations: Option<&Path>,
         inline: Option<&DisasmConfig>,
         output: Option<&Path>,
+        hypotheses: bool,
         cancel: &AtomicBool,
     ) -> Result<Loaded, Vec<Diagnostic>> {
         let (config, location, text) = match (annotations, inline) {
@@ -967,7 +999,12 @@ impl Server {
             }
         };
         let rom = Self::read_rom(root, &config, &location)?;
-        let disassembly = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        let analysed = if hypotheses {
+            config.with_hypotheses()
+        } else {
+            config.clone()
+        };
+        let disassembly = Self::disassemble_with(root, &analysed, &rom, output, &location, cancel)?;
         // Inline annotations as annotate would write them: canonical, each
         // entry with its bank.
         let text = if annotations.is_some() {
@@ -987,6 +1024,7 @@ impl Server {
             disassembly,
             rom: rom.path,
             inputs,
+            hypotheses: Hypotheses::of(&config, hypotheses),
         })
     }
 
@@ -1073,6 +1111,7 @@ impl Server {
             input.annotations.as_deref(),
             input.inline.as_ref(),
             input.output.as_deref(),
+            input.hypotheses,
             cancel,
         ) {
             Ok(loaded) => loaded,
@@ -1089,6 +1128,7 @@ impl Server {
             summary: Some(d.summary()),
             verification: Some(d.verify(root, Some(root), cancel)),
             inputs: Some(loaded.inputs.clone()),
+            hypotheses: loaded.hypotheses.clone(),
             files: d.files().iter().map(|(p, _)| p.clone()).collect(),
             ..DisasmReport::default()
         };
@@ -1172,6 +1212,7 @@ impl Server {
                 query.annotations.as_deref(),
                 query.inline.as_ref(),
                 input.output.as_deref(),
+                input.hypotheses,
                 cancel,
             ) {
                 Ok(baseline) => {
@@ -1217,6 +1258,8 @@ impl Server {
             input.annotations.as_deref(),
             input.inline.as_ref(),
             input.output.as_deref(),
+            // Hypotheses never become source.
+            false,
             cancel,
         ) {
             Ok(loaded) => loaded,
@@ -1231,6 +1274,7 @@ impl Server {
         let verification = d.verify(root, Some(root), cancel);
         let mut report = DisasmReport {
             inputs: Some(loaded.inputs.clone()),
+            hypotheses: loaded.hypotheses.clone(),
             summary: Some(d.summary()),
             files: d.files().iter().map(|(p, _)| p.clone()).collect(),
             ..DisasmReport::default()
@@ -1346,10 +1390,20 @@ impl Server {
         let rom = Self::read_rom(root, &original, &location)?;
         let output = input.output.as_deref();
         // A new file has nothing before; inline annotations do.
+        let analysed = |config: &DisasmConfig| {
+            if input.hypotheses {
+                config.with_hypotheses()
+            } else {
+                config.clone()
+            }
+        };
         let before = input
             .create
             .is_none()
-            .then(|| Self::disassemble_with(root, &original, &rom, output, &location, cancel).ok())
+            .then(|| {
+                Self::disassemble_with(root, &analysed(&original), &rom, output, &location, cancel)
+                    .ok()
+            })
             .flatten();
         if let Some(bytes) = &existing {
             report.reformatted = disasm::apply_operations(&original, &rom.bytes, &[])
@@ -1360,21 +1414,43 @@ impl Server {
         let (config, applied) = disasm::apply_operations(&original, &rom.bytes, &input.operations)
             .map_err(with_location)?;
         report.applied = applied;
-        let after = match Self::disassemble_with(root, &config, &rom, output, &location, cancel) {
-            Ok(after) => after,
-            Err(diagnostics) => {
-                // The errors name entries by their index in the changed
-                // annotations, which are in canonical order: return them.
-                report.annotations = serde_json::from_str(&disasm::canonical_json(&config)).ok();
-                return Err(diagnostics
-                    .into_iter()
-                    .map(|d| Diagnostic {
-                        message: format!("In the changed annotations: {}", d.message),
-                        ..d
-                    })
-                    .collect());
-            }
+        report.hypotheses = Hypotheses::of(&config, input.hypotheses);
+        // The errors name entries by their index in the changed annotations,
+        // which are in canonical order: return them.
+        let failed = |report: &mut AnnotateReport, diagnostics: Vec<Diagnostic>, what: &str| {
+            report.annotations = serde_json::from_str(&disasm::canonical_json(&config)).ok();
+            diagnostics
+                .into_iter()
+                .map(|d| Diagnostic {
+                    message: format!("In the changed annotations{what}: {}", d.message),
+                    ..d
+                })
+                .collect::<Vec<_>>()
         };
+        let after =
+            match Self::disassemble_with(root, &analysed(&config), &rom, output, &location, cancel)
+            {
+                Ok(after) => after,
+                Err(diagnostics) => return Err(failed(report, diagnostics, "")),
+            };
+        // Hypotheses that are not applied must still be valid annotations.
+        if !input.hypotheses
+            && config.has_hypotheses()
+            && let Err(diagnostics) = Self::disassemble_with(
+                root,
+                &config.with_hypotheses(),
+                &rom,
+                output,
+                &location,
+                cancel,
+            )
+        {
+            return Err(failed(
+                report,
+                diagnostics,
+                " (with the hypotheses applied)",
+            ));
+        }
         let verification = after.verify(root, Some(root), cancel);
         let matched = verification.matched;
         report.verification = Some(verification);
@@ -1517,6 +1593,17 @@ impl Server {
 
     fn disasm_summary(report: &DisasmReport) -> String {
         let mut text = Vec::new();
+        if let Some(h) = &report.hypotheses {
+            text.push(format!(
+                "Hypotheses: {} entries, {}",
+                h.count,
+                if h.applied {
+                    "applied as if confirmed"
+                } else {
+                    "not applied (hypotheses: true applies them)"
+                }
+            ));
+        }
         if let Some(inputs) = &report.inputs {
             text.push(format!(
                 "Inputs: ROM sha256 {}{}, annotations sha256 {}, nesasm-mcp {}",
