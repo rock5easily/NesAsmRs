@@ -2031,7 +2031,9 @@ fn mapper4_fixed_prg_16k_random_code_round_trips() {
                               {"bank": 3, "start": "$E000", "length": 8192, "type": "code"}]"#;
     let mut crossing = 0;
     for _ in 0..4 {
-        let mut rom = vec![b'N', b'E', b'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut rom = vec![
+            b'N', b'E', b'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         rom.extend((0..32768).map(|_| rng.next()));
         for split in [false, true] {
             let json =
