@@ -434,8 +434,10 @@ for an entry point or vector). The id does not depend on the message or on
 annotations elsewhere, so an issue keeps it while other annotations change;
 in a ROM hack it is the id of the whole ROM's analysis. An `unknown_range` is
 named by its first address: when annotations describe part of it, the rest
-starts elsewhere, and comparisons treat unknown ranges of a bank that overlap
-as the same issue, changed (with its `previous_id`).
+starts elsewhere. Comparisons therefore resolve or introduce an unknown range
+only when no unknown range of the other analysis shares bytes with it; one
+that continues others is changed, with the ids of all of them in
+`previous_ids`.
 
 Issues whose settlement the analysis can shape have `suggestions`, each one
 alternative: `description`, the `operations` to give `annotate` together,

@@ -135,10 +135,12 @@ pub struct ChangedIssue {
     #[serde(flatten)]
     pub issue: Issue,
     pub previous_message: String,
-    /// The id the issue had, when it changed: an unknown range that
-    /// annotations narrowed starts elsewhere.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_id: Option<String>,
+    /// For an unknown range that continues others (annotations described a
+    /// part, or no longer describe the bytes between ranges): the ids of all
+    /// the unknown ranges before it shares bytes with. `previous_message` is
+    /// that of the range with its own id, or of the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_ids: Vec<String>,
 }
 
 /// How the issues of two analyses differ, matched by id.
@@ -149,9 +151,10 @@ pub struct IssueComparison {
     pub resolved: Vec<Issue>,
     /// Issues only the second analysis reports.
     pub introduced: Vec<Issue>,
-    /// Issues both report, with different messages (as in the second).
-    /// Unknown ranges of a bank that overlap are the same issue, which
-    /// annotations narrowed or split.
+    /// Issues both report, with different messages (as in the second), and
+    /// unknown ranges that continue others. Unknown ranges are resolved or
+    /// introduced only when no range of the other analysis shares bytes
+    /// with them.
     pub changed: Vec<ChangedIssue>,
 }
 
@@ -165,50 +168,53 @@ pub fn compare_issues(before: &[Issue], after: &[Issue]) -> IssueComparison {
             .collect()
     };
     let (old, new) = (ids(before), ids(after));
-    // An unknown range without its id that overlaps one without its id in
-    // the other analysis.
-    fn overlapping<'a>(
-        issue: &Issue,
-        others: &'a [Issue],
-        ids: &BTreeMap<String, usize>,
-    ) -> Option<&'a Issue> {
-        if issue.kind != IssueKind::UnknownRange {
-            return None;
-        }
-        others.iter().find(|other| {
-            other.kind == IssueKind::UnknownRange
-                && other.bank == issue.bank
-                && !ids.contains_key(&other.id)
-                && issue.spans.iter().any(|(start, length)| {
-                    other
-                        .spans
-                        .iter()
-                        .any(|(s, l)| *start < s + l && *s < start + length)
-                })
-        })
-    }
+    // Unknown ranges are named by their first address, which annotations of
+    // a part move: ranges of a bank that share bytes continue one another.
+    let unknown = |issue: &Issue| issue.kind == IssueKind::UnknownRange;
+    let overlap = |a: &Issue, b: &Issue| {
+        unknown(a)
+            && unknown(b)
+            && a.bank == b.bank
+            && a.spans.iter().any(|(start, length)| {
+                b.spans
+                    .iter()
+                    .any(|(s, l)| *start < s + l && *s < start + length)
+            })
+    };
     IssueComparison {
         resolved: before
             .iter()
-            .filter(|i| !new.contains_key(&i.id) && overlapping(i, after, &old).is_none())
+            .filter(|i| !new.contains_key(&i.id) && !after.iter().any(|j| overlap(i, j)))
             .cloned()
             .collect(),
         introduced: after
             .iter()
-            .filter(|i| !old.contains_key(&i.id) && overlapping(i, before, &new).is_none())
+            .filter(|i| !old.contains_key(&i.id) && !before.iter().any(|j| overlap(i, j)))
             .cloned()
             .collect(),
         changed: after
             .iter()
             .filter_map(|issue| {
-                let previous = match old.get(&issue.id) {
-                    Some(index) => &before[*index],
-                    None => overlapping(issue, before, &new)?,
+                let same = old.get(&issue.id).map(|i| &before[*i]);
+                let others: Vec<&Issue> = before
+                    .iter()
+                    .filter(|b| b.id != issue.id && overlap(issue, b))
+                    .collect();
+                let previous = same.or_else(|| others.first().copied())?;
+                let previous_ids: Vec<String> = if others.is_empty() {
+                    Vec::new()
+                } else {
+                    same.into_iter()
+                        .chain(others)
+                        .map(|i| i.id.clone())
+                        .collect()
                 };
-                (previous.message != issue.message).then(|| ChangedIssue {
-                    issue: issue.clone(),
-                    previous_message: previous.message.clone(),
-                    previous_id: (previous.id != issue.id).then(|| previous.id.clone()),
+                (previous.message != issue.message || !previous_ids.is_empty()).then(|| {
+                    ChangedIssue {
+                        issue: issue.clone(),
+                        previous_message: previous.message.clone(),
+                        previous_ids,
+                    }
                 })
             })
             .collect(),

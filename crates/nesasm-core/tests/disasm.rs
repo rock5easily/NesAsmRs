@@ -4030,16 +4030,47 @@ fn narrowed_unknown_ranges_are_changed_issues() {
     assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
     assert_eq!(c.changed.len(), 1);
     assert_eq!(c.changed[0].issue.id, "unknown_range:1:$E004");
-    assert_eq!(
-        c.changed[0].previous_id.as_deref(),
-        Some("unknown_range:1:$E003")
-    );
+    assert_eq!(c.changed[0].previous_ids, ["unknown_range:1:$E003"]);
     assert_eq!(
         c.changed[0].previous_message,
         "$E003-$E007 (5 bytes) is not reached by code nor described by a region"
     );
     let json = serde_json::to_value(&c.changed[0]).unwrap();
-    assert_eq!(json["previous_id"], "unknown_range:1:$E003");
+    assert_eq!(
+        json["previous_ids"],
+        serde_json::json!(["unknown_range:1:$E003"])
+    );
+    // A part in the middle: the first part keeps the id with another message,
+    // and the second continues it; nothing is new.
+    let split = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E004", "length": 1}]}"#),
+    );
+    let c = disasm::compare_issues(before.issues(), split.issues());
+    assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
+    let changed: Vec<(&str, &[String])> = c
+        .changed
+        .iter()
+        .map(|i| (i.issue.id.as_str(), i.previous_ids.as_slice()))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            ("unknown_range:1:$E003", &[][..]),
+            (
+                "unknown_range:1:$E005",
+                &["unknown_range:1:$E003".to_owned()][..]
+            ),
+        ]
+    );
+    // Without the part again, the range continues both.
+    let c = disasm::compare_issues(split.issues(), before.issues());
+    assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
+    assert_eq!(c.changed.len(), 1);
+    assert_eq!(
+        c.changed[0].previous_ids,
+        ["unknown_range:1:$E003", "unknown_range:1:$E005"]
+    );
     // Described whole, it is resolved.
     let all = round_trip(
         &rom,
