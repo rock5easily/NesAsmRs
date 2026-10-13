@@ -283,8 +283,10 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
   ソースの読者に向けた説明は、別途 `comment`／`comments.text` に書きます。
 - ファイルを書き込むのは、全操作を適用でき、注釈が有効で、往復検証が一致し（`require_match`）、
   ファイルが `expected_sha256` から変わっていない場合だけです。`dry_run: true` で書き込まずに結果を確認できます。
-- 応答の `summary_before`／`summary_after`、`issues_resolved`／`issues_introduced` で、
-  変化した分類とissueを確認します。issueは種類・bank・アドレスで照合します。
+- 応答の `summary_before`／`summary_after`、`issues_resolved`／`issues_introduced`／`issues_changed` で、
+  変化した分類とissueを確認します。issueは `id`（種類・bank・アドレス、例 `unresolved_bank:30:$DEB1`）で
+  照合し、同じissueのメッセージだけが変わったもの（表を領域で記述した間接ジャンプなど）は
+  `issues_changed` に変更前のメッセージとともに入ります。
 
 注釈JSONには未対応の `confidence` 等の独自フィールドを追加しません。
 未確認の仮説はノートに置き、確定した注釈と分けます。
@@ -302,6 +304,16 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
 `overlap`・`invalid_opcode`・`code_data_conflict` や不自然な参照が増えていないかを確認します。
 新しいissueが出たことだけでは悪化とは限りません。新しく到達したコードの未解決問題か、誤った注釈かを調べます。
 矛盾があれば、直前の注釈を見直します。
+
+保存した以前の注釈と比べるときは、`disassemble` の `baseline` に以前の注釈ファイルを指定します。
+以前の注釈での要約と、解消・新規・変化したissueを `id` で照合して返します。
+
+```json
+{
+  "annotations": "annotations/game.disasm.json",
+  "baseline": {"annotations": "annotations/iteration-01/game.disasm.json"}
+}
+```
 
 サーバーの版も変える場合は、**同じ注釈で変更前後を比較してから**、追加注釈ありの結果を比較します。
 解析回数・命令数・コード量の増加だけを改善の根拠にしません。

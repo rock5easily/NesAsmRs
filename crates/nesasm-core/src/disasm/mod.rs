@@ -91,6 +91,12 @@ pub enum IssueKind {
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Issue {
+    /// Identifies the issue across analyses of the ROM: its kind, bank and
+    /// address (`"unresolved_bank:30:$DEB1"`, `"-"` without a bank), a
+    /// topic for header issues (`"header:-:$0000:trainer"`), and `#2`, `#3`
+    /// for further issues of the kind at the same place, in report order.
+    /// It does not depend on the message.
+    pub id: String,
     pub kind: IssueKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
@@ -109,6 +115,87 @@ pub struct Issue {
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub(crate) fix: Option<Fix>,
+    /// What a header issue is about, for its id.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) topic: Option<&'static str>,
+}
+
+/// An issue reported in both analyses with another message.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct ChangedIssue {
+    #[serde(flatten)]
+    pub issue: Issue,
+    pub previous_message: String,
+}
+
+/// How the issues of two analyses differ, matched by id.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct IssueComparison {
+    /// Issues only the first analysis reports.
+    pub resolved: Vec<Issue>,
+    /// Issues only the second analysis reports.
+    pub introduced: Vec<Issue>,
+    /// Issues both report, with different messages (as in the second).
+    pub changed: Vec<ChangedIssue>,
+}
+
+/// Compares the issues of two analyses of a ROM by id.
+pub fn compare_issues(before: &[Issue], after: &[Issue]) -> IssueComparison {
+    let ids = |issues: &[Issue]| -> BTreeMap<String, usize> {
+        issues
+            .iter()
+            .enumerate()
+            .map(|(i, issue)| (issue.id.clone(), i))
+            .collect()
+    };
+    let (old, new) = (ids(before), ids(after));
+    IssueComparison {
+        resolved: before
+            .iter()
+            .filter(|i| !new.contains_key(&i.id))
+            .cloned()
+            .collect(),
+        introduced: after
+            .iter()
+            .filter(|i| !old.contains_key(&i.id))
+            .cloned()
+            .collect(),
+        changed: after
+            .iter()
+            .filter_map(|issue| {
+                let previous = &before[*old.get(&issue.id)?];
+                (previous.message != issue.message).then(|| ChangedIssue {
+                    issue: issue.clone(),
+                    previous_message: previous.message.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Gives each issue its id (see [`Issue::id`]).
+fn assign_ids(issues: &mut [Issue]) {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for issue in issues {
+        let kind = serde_json::to_value(issue.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let bank = issue.bank.map_or("-".to_owned(), |b| b.to_string());
+        let mut id = format!("{kind}:{bank}:{}", issue.address);
+        if let Some(topic) = issue.topic {
+            id = format!("{id}:{topic}");
+        }
+        let count = seen.entry(id.clone()).or_default();
+        *count += 1;
+        if *count > 1 {
+            id = format!("{id}#{count}");
+        }
+        issue.id = id;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -373,6 +460,8 @@ pub fn disassemble(
         (None, Some(_)) => return Err(vec![error("The base ROM was not given")]),
         (Some(_), None) => return Err(vec![error("A base ROM was given without base")]),
     };
+    // Before the issues of a ROM hack are narrowed, so ids do not depend on it.
+    assign_ids(&mut analysis.issues);
     if let Some(patches) = &patches {
         // Only the changed ranges matter.
         analysis.issues.retain(|issue| match issue.bank {

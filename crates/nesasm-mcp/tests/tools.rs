@@ -959,6 +959,21 @@ fn annotate_inline_returns_the_annotations_and_suggestions_apply() {
     let report = &r["structuredContent"];
     assert_eq!(report["written"], false);
     assert!(report.get("sha256_before").is_none(), "{r}");
+    // The jump is still reported, saying that the region describes it.
+    assert_eq!(report["issues_changed"]["total"], 1, "{r}");
+    let changed = &report["issues_changed"]["items"][0];
+    assert_eq!(changed["id"], "indirect_jump:1:$E00B");
+    assert!(
+        changed["previous_message"]
+            .as_str()
+            .unwrap()
+            .contains("describe them with a low_bytes region"),
+        "{r}"
+    );
+    assert!(
+        Client::text(&r).lines().any(|l| l == "Changed issues: 1"),
+        "{r}"
+    );
     assert_eq!(report["annotations"]["regions"][0]["type"], "low_bytes");
     assert_eq!(
         report["log_entry"]["operations"][0]["evidence"],
@@ -988,4 +1003,48 @@ fn annotate_compares_inline_annotations_with_themselves_before() {
     assert_eq!(report["summary_before"], report["summary_after"]);
     assert_eq!(report["issues_resolved"]["total"], 0);
     assert_eq!(report["issues_introduced"]["total"], 0);
+}
+
+#[test]
+fn disassemble_compares_with_baseline_annotations() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    c.write("before.disasm.json", r#"{"rom": "old/loose.nes"}"#);
+    let current = json!({"rom": "old/loose.nes",
+                         "regions": [{"start": "$E008", "length": 5}]});
+    let r = c.call(
+        "disassemble",
+        json!({"inline":current,"baseline":{"annotations":"before.disasm.json"}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let baseline = &r["structuredContent"]["baseline"];
+    assert_eq!(baseline["issues_resolved"]["total"], 1, "{r}");
+    assert_eq!(
+        baseline["issues_resolved"]["items"][0]["id"],
+        "unknown_range:1:$E008"
+    );
+    assert_eq!(baseline["issues_introduced"]["total"], 0);
+    assert_eq!(baseline["issues_changed"]["total"], 0);
+    assert_eq!(baseline["summary"]["banks"][1]["org"], "$E000");
+    let text = Client::text(&r);
+    for line in [
+        "Compared with the baseline: 1 resolved, 0 introduced, 0 changed issues",
+        "Resolved issues: 1",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    // A baseline that cannot be analysed fails the request.
+    let r = c.call(
+        "disassemble",
+        json!({"inline":current,"baseline":{"annotations":"missing.disasm.json"}}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    let message = r["structuredContent"]["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap();
+    assert!(message.starts_with("Baseline: "), "{r}");
+    assert!(r["structuredContent"].get("baseline").is_none(), "{r}");
 }

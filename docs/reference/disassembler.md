@@ -274,8 +274,9 @@ writes it as one change:
   `inline` annotations (then nothing is written and the changed
   `annotations` are returned).
 - The result also gives the summaries before and after, `verification`, and
-  the issues resolved and introduced, matched by kind, bank and address (an
-  issue whose message changed at the same place is neither).
+  the issues resolved, introduced and changed (`issues_changed`: reported
+  before and after with another message, with its `previous_message`),
+  matched by `id`.
 
 Only files named `*.disasm.json` inside the root and outside hidden
 directories are written (also after following links; a link to a file or
@@ -423,6 +424,15 @@ for a bank switched in where the layout does not place it), `outside_rom`
 are explained), and `unknown_range` (bytes not described; padding runs are
 not reported). 65C02-only encodings are treated as data.
 
+Each issue has an `id` that identifies it across analyses of the ROM: its
+kind, bank (`-` without one) and address, such as `unresolved_bank:30:$DEB1`;
+header issues, which all name $0000, add a topic (`header:-:$0000:trainer`,
+also `nes2`, `size` and `partial_bank`). Further issues of the same kind at
+the same place, which come from different paths, add `#2`, `#3` in the order
+they are reported. The id does not depend on the message, the path that
+reached the place or the annotations, so an issue keeps it while other
+annotations change; in a ROM hack it is the id of the whole ROM's analysis.
+
 Issues whose settlement the analysis can shape have `suggestions`, each one
 alternative: `description`, the `operations` to give `annotate` together,
 `needs` (fields left null that the analysis cannot determine, such as a
@@ -460,3 +470,9 @@ following calls (also into the next bank), with callers, calls and the RAM
 it reads and writes; a routine is followed for up to 16384 instructions and
 marked `truncated` beyond. `ram` lists addresses outside the ROM with read
 and write counts and every routine that accesses them.
+
+`baseline` (`annotations` or `inline`, with `offset` and `limit`) analyses
+other annotations of the ROM, such as a copy of an earlier version, and
+returns their `summary` and the issues resolved, introduced and changed
+since, matched by `id`. A baseline that cannot be analysed fails the request;
+one that names another ROM is a warning.

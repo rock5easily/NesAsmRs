@@ -840,9 +840,19 @@ impl Analysis {
             address: Address(address),
             message,
             suggestions: Vec::new(),
+            id: String::new(),
             spans: loc.map(|l| (l.offset, 1)).into_iter().collect(),
             fix: None,
+            topic: None,
         });
+    }
+
+    /// A header issue: they all name $0000, so `topic` tells them apart.
+    fn header_issue(&mut self, topic: &'static str, message: String) {
+        self.issue(IssueKind::Header, None, 0, message);
+        if let Some(issue) = self.issues.last_mut() {
+            issue.topic = Some(topic);
+        }
     }
 
     /// Records how the last issue could be settled.
@@ -1165,27 +1175,21 @@ impl Analysis {
         let header = self.memory.header.clone();
         if header.len() == HEADER_SIZE {
             if header[7] & 0x0f != 0 || header[8..].iter().any(|&b| b != 0) {
-                self.issue(
-                    IssueKind::Header,
-                    None,
-                    0,
+                self.header_issue(
+                    "nes2",
                     "Header bytes 7 (low nibble) and 8-15 are not zero (NES 2.0 or extra fields); NESASM writes them as zero".into(),
                 );
             }
             if self.memory.trainer {
-                self.issue(
-                    IssueKind::Header,
-                    None,
-                    0,
+                self.header_issue(
+                    "trainer",
                     "The ROM has a 512-byte trainer, which NESASM cannot produce".into(),
                 );
             }
             let declared = usize::from(header[4]) * PRG_UNIT + usize::from(header[5]) * BANK_SIZE;
             if declared != self.memory.payload_len {
-                self.issue(
-                    IssueKind::Header,
-                    None,
-                    0,
+                self.header_issue(
+                    "size",
                     format!(
                         "The header declares {declared} bytes of PRG+CHR ROM, the file has {}",
                         self.memory.payload_len
@@ -1196,10 +1200,8 @@ impl Analysis {
         if !self.memory.payload_len.is_multiple_of(BANK_SIZE)
             && self.memory.format != RomFormat::Fragment
         {
-            self.issue(
-                IssueKind::Header,
-                None,
-                0,
+            self.header_issue(
+                "partial_bank",
                 "The ROM data is not a whole number of 8 KiB banks; NESASM pads the last bank"
                     .into(),
             );

@@ -2,8 +2,8 @@ use nesasm_core::{
     Artifact, AssembleOptions, AssembleRequest, AssembleResult, BankUsage, Diagnostic,
     DiagnosticCode, LineRecord, ReferenceTopic, Region, Severity, SourceLocation, Symbol,
     disasm::{
-        self, Address, Applied, Diff, DisasmConfig, Disassembly, Issue, IssueKind, Operation,
-        RamUse, Routine, SourceLine, Summary, Verification, Xref,
+        self, Address, Applied, ChangedIssue, Diff, DisasmConfig, Disassembly, Issue, IssueKind,
+        Operation, RamUse, Routine, SourceLine, Summary, Verification, Xref,
     },
     inspect::{Disassembled, HexRow, InesHeader, Rom, Vectors},
 };
@@ -185,6 +185,21 @@ struct PageQuery {
     limit: Option<usize>,
 }
 
+/// Annotations to compare with.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BaselineQuery {
+    /// Annotation file (JSON) within the root, such as a copy of an earlier
+    /// version.
+    annotations: Option<PathBuf>,
+    /// Or the annotations inline.
+    inline: Option<DisasmConfig>,
+    #[serde(default)]
+    offset: usize,
+    /// Maximum issues returned per list (default 100, at most 1000).
+    limit: Option<usize>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DisasmInput {
@@ -211,6 +226,9 @@ struct DisasmInput {
     routines: Option<PageQuery>,
     /// Addresses outside the ROM (RAM, I/O) and the routines accessing them.
     ram: Option<PageQuery>,
+    /// Other annotations to compare with: their summary, and the issues
+    /// resolved, introduced and changed since (matched by id).
+    baseline: Option<BaselineQuery>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -331,6 +349,79 @@ struct DisasmReport {
     routines: Option<Page<Routine>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ram: Option<Page<RamUse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline: Option<BaselineReport>,
+}
+
+/// The analysis with the baseline annotations, compared with this one.
+#[derive(Serialize, JsonSchema)]
+struct BaselineReport {
+    summary: Summary,
+    /// Issues the baseline reports and these annotations do not.
+    issues_resolved: Page<Issue>,
+    /// Issues these annotations report and the baseline does not.
+    issues_introduced: Page<Issue>,
+    /// Issues both report, with another message now.
+    issues_changed: Page<ChangedIssue>,
+}
+
+/// Pages of the issues resolved, introduced and changed from `before` to `after`.
+fn issue_pages(
+    before: &[Issue],
+    after: &[Issue],
+    offset: usize,
+    limit: Option<usize>,
+) -> (Page<Issue>, Page<Issue>, Page<ChangedIssue>) {
+    let c = disasm::compare_issues(before, after);
+    (
+        Page::of(
+            &c.resolved,
+            offset,
+            limit,
+            DEFAULT_ITEM_LIMIT,
+            MAX_ITEM_LIMIT,
+        ),
+        Page::of(
+            &c.introduced,
+            offset,
+            limit,
+            DEFAULT_ITEM_LIMIT,
+            MAX_ITEM_LIMIT,
+        ),
+        Page::of(
+            &c.changed,
+            offset,
+            limit,
+            DEFAULT_ITEM_LIMIT,
+            MAX_ITEM_LIMIT,
+        ),
+    )
+}
+
+/// Lines for the text summary of the issues resolved, introduced and changed.
+fn issue_change_lines(
+    text: &mut Vec<String>,
+    resolved: Option<&Page<Issue>>,
+    introduced: Option<&Page<Issue>>,
+    changed: Option<&Page<ChangedIssue>>,
+) {
+    for (name, page) in [("Resolved", resolved), ("Introduced", introduced)] {
+        if let Some(page) = page.filter(|p| p.total > 0) {
+            text.push(format!("{name} issues: {}", page.total));
+            for issue in &page.items {
+                text.push(format!("  {}: {}", issue.id, issue.message));
+            }
+        }
+    }
+    if let Some(page) = changed.filter(|p| p.total > 0) {
+        text.push(format!("Changed issues: {}", page.total));
+        for c in &page.items {
+            text.push(format!(
+                "  {}: {} (was: {})",
+                c.issue.id, c.issue.message, c.previous_message
+            ));
+        }
+    }
 }
 
 #[derive(Default, Serialize, JsonSchema)]
@@ -360,12 +451,15 @@ struct AnnotateReport {
     summary_after: Option<Summary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<Verification>,
-    /// Issues no longer reported (matched by kind, bank and address).
+    /// Issues no longer reported (matched by id).
     #[serde(skip_serializing_if = "Option::is_none")]
     issues_resolved: Option<Page<Issue>>,
     /// Issues reported only after the change.
     #[serde(skip_serializing_if = "Option::is_none")]
     issues_introduced: Option<Page<Issue>>,
+    /// Issues reported before and after, with another message after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issues_changed: Option<Page<ChangedIssue>>,
     /// The changed annotations, for inline annotations and dry runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     annotations: Option<serde_json::Value>,
@@ -1034,6 +1128,45 @@ impl Server {
                 MAX_ITEM_LIMIT,
             ));
         }
+        if let Some(query) = &input.baseline {
+            match Self::load_disassembly(
+                root,
+                query.annotations.as_deref(),
+                query.inline.as_ref(),
+                input.output.as_deref(),
+                cancel,
+            ) {
+                Ok(baseline) => {
+                    if baseline.rom != loaded.rom {
+                        report.diagnostics.push(Diagnostic {
+                            severity: Severity::Warning,
+                            ..error(
+                                DiagnosticCode::Disasm,
+                                "The baseline annotations name another ROM; issues are compared by kind and place only",
+                            )
+                        });
+                    }
+                    let base = &baseline.disassembly;
+                    let (issues_resolved, issues_introduced, issues_changed) =
+                        issue_pages(base.issues(), d.issues(), query.offset, query.limit);
+                    report.baseline = Some(BaselineReport {
+                        summary: base.summary(),
+                        issues_resolved,
+                        issues_introduced,
+                        issues_changed,
+                    });
+                }
+                Err(diagnostics) => {
+                    report.success = false;
+                    report
+                        .diagnostics
+                        .extend(diagnostics.into_iter().map(|d| Diagnostic {
+                            message: format!("Baseline: {}", d.message),
+                            ..d
+                        }));
+                }
+            }
+        }
         report
     }
 
@@ -1191,26 +1324,13 @@ impl Server {
         report.verification = Some(verification);
         report.summary_before = before.as_ref().map(Disassembly::summary);
         report.summary_after = Some(after.summary());
-        let key = |i: &Issue| (i.kind, i.bank, i.address);
-        let changed = |from: &[Issue], to: &[Issue]| -> Vec<Issue> {
-            from.iter()
-                .filter(|i| !to.iter().any(|j| key(j) == key(i)))
-                .cloned()
-                .collect()
-        };
         let issues_before = before.as_ref().map_or(&[][..], Disassembly::issues);
         let page = input.issues.clone().unwrap_or_default();
-        let page_of = |issues: &[Issue]| {
-            Page::of(
-                issues,
-                page.offset,
-                page.limit,
-                DEFAULT_ITEM_LIMIT,
-                MAX_ITEM_LIMIT,
-            )
-        };
-        report.issues_resolved = Some(page_of(&changed(issues_before, after.issues())));
-        report.issues_introduced = Some(page_of(&changed(after.issues(), issues_before)));
+        let (resolved, introduced, changed) =
+            issue_pages(issues_before, after.issues(), page.offset, page.limit);
+        report.issues_resolved = Some(resolved);
+        report.issues_introduced = Some(introduced);
+        report.issues_changed = Some(changed);
         let text = disasm::canonical_json(&config);
         let sha256 = disasm::sha256_hex(text.as_bytes());
         report.sha256 = Some(sha256.clone());
@@ -1324,23 +1444,12 @@ impl Server {
                 format!("Round trip FAILED: {} bytes differ", v.mismatch_count)
             });
         }
-        for (name, page) in [
-            ("Resolved", &report.issues_resolved),
-            ("Introduced", &report.issues_introduced),
-        ] {
-            if let Some(page) = page.as_ref().filter(|p| p.total > 0) {
-                text.push(format!("{name} issues: {}", page.total));
-                for issue in &page.items {
-                    let bank = issue.bank.map_or(String::new(), |b| format!("bank {b} "));
-                    text.push(format!(
-                        "  {} {bank}{}: {}",
-                        json_name(&issue.kind),
-                        issue.address,
-                        issue.message
-                    ));
-                }
-            }
-        }
+        issue_change_lines(
+            &mut text,
+            report.issues_resolved.as_ref(),
+            report.issues_introduced.as_ref(),
+            report.issues_changed.as_ref(),
+        );
         if let Some(log) = &report.log {
             text.push(format!("Logged to {}", log.display()));
         }
@@ -1434,6 +1543,18 @@ impl Server {
                 format!("{name}: {total}")
             }
         };
+        if let Some(b) = &report.baseline {
+            text.push(format!(
+                "Compared with the baseline: {} resolved, {} introduced, {} changed issues",
+                b.issues_resolved.total, b.issues_introduced.total, b.issues_changed.total
+            ));
+            issue_change_lines(
+                &mut text,
+                Some(&b.issues_resolved),
+                Some(&b.issues_introduced),
+                Some(&b.issues_changed),
+            );
+        }
         if let Some(page) = report.issues.as_ref().filter(|p| p.total > 0) {
             text.push(heading("Issues", page.total, page.offset, page.items.len()));
             for issue in &page.items {
