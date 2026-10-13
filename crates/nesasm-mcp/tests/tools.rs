@@ -1164,4 +1164,16 @@ fn inline_digests_tell_the_order_of_names_for_one_place() {
     let one = digest(&mut c, "Zulu", "Alpha");
     let other = digest(&mut c, "Alpha", "Zulu");
     assert_ne!(one, other);
+    // And of symbols whose ranges overlap.
+    let higher = json!({"name": "Higher", "value": "$30", "size": 32});
+    let lower = json!({"name": "Lower", "value": "$20", "size": 64});
+    let mut digests = Vec::new();
+    for symbols in [json!([higher, lower]), json!([lower, higher])] {
+        let r = c.call(
+            "disassemble",
+            json!({"inline":{"rom":"old/loose.nes","symbols":symbols}}),
+        );
+        digests.push(r["structuredContent"]["inputs"]["annotations_sha256"].clone());
+    }
+    assert_ne!(digests[0], digests[1]);
 }

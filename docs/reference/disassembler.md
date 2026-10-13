@@ -253,6 +253,8 @@ writes it as one change:
   they come from one. Errors of the analysis of the changed annotations
   start with `In the changed annotations:` and name entries by their index in
   them, in canonical order; the result then returns them as `annotations`.
+  Errors of the bank layout (`banks`, `options`) come before there are changed
+  annotations to return: they name `banks` entries in order of their bank.
 - `evidence` is required for entries that override what the analysis finds:
   `references`, `entry_points` with `no_return`, `inline_bytes`,
   `switch_banks` or `keeps_banks`, and `regions` of type `code` or with
@@ -266,9 +268,10 @@ writes it as one change:
 - The file is written in canonical form: `rom`, `load_address`, `base`,
   `options`, then the lists (`banks`, `entry_points`, `labels`, `symbols`,
   `regions`, `comments`, `operands`, `references`, `patches`) with one entry
-  per line, ordered by bank and address (symbols by value; labels at one
-  address and symbols of one value keep their order, as the first one names
-  the place), banks by bank, each naming its
+  per line, ordered by bank and address (labels at one address keep their
+  order, as the first names the place), banks by bank; `symbols` keep their
+  order, as the first symbol whose range holds a value names it. `upsert`
+  puts an entry in the place of the one it replaces. Entries name their
   bank, addresses as `"$C000"` and fields at their default values left out.
   `reformatted` tells that a file was not in that form before.
 - Each write appends a line to `<name>.disasm.log.jsonl` beside the file: the

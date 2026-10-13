@@ -206,6 +206,8 @@ trait Entry: Clone + Serialize + DeserializeOwned {
     /// Where the entry goes in the written file; entries with the same place
     /// keep their order (the sort is stable).
     fn order(&self) -> (Option<usize>, u32, String);
+    /// Whether the list is put in the order of `order`.
+    const SORTED: bool = true;
     fn check(&self) -> Result<(), String> {
         Ok(())
     }
@@ -241,6 +243,9 @@ impl Entry for LabelDef {
 }
 
 impl Entry for SymbolDef {
+    // The first symbol whose range holds a value names it, also when the
+    // ranges of symbols of other values overlap: their order is kept.
+    const SORTED: bool = false;
     fn location(&mut self) -> Option<(&mut Option<usize>, Address)> {
         None
     }
@@ -248,7 +253,6 @@ impl Entry for SymbolDef {
         Key::Name(self.name.clone())
     }
     fn order(&self) -> (Option<usize>, u32, String) {
-        // Symbols of one value keep their order: the first names the value.
         (None, self.value.0, String::new())
     }
 }
@@ -372,6 +376,8 @@ fn upsert<T: Entry>(
     item.check()?;
     normalize(&mut item, memory)?;
     let key = item.key();
+    // In the place of the first entry it replaces, as order can matter.
+    let place = list.iter().position(|entry| key.names(&entry.key()));
     let mut previous = Vec::new();
     list.retain(|entry| {
         let same = key.names(&entry.key());
@@ -380,7 +386,7 @@ fn upsert<T: Entry>(
         }
         !same
     });
-    list.push(item);
+    list.insert(place.unwrap_or(list.len()), item);
     Ok(previous)
 }
 
@@ -457,8 +463,11 @@ fn duplicates<T: Entry>(kind: AnnotationKind, list: &[T], errors: &mut Vec<Strin
     }
 }
 
+/// Puts `list` in canonical order, unless the order of its entries matters.
 fn sort<T: Entry>(list: &mut [T]) {
-    list.sort_by_key(|entry| entry.order());
+    if T::SORTED {
+        list.sort_by_key(|entry| entry.order());
+    }
 }
 
 /// Runs `$body` with `$list` bound to the list of `$kind` in `$config`

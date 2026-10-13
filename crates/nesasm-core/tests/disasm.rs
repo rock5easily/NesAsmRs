@@ -4178,6 +4178,24 @@ fn canonical_order_keeps_the_order_of_names_for_one_place() {
         assert_eq!(labels, [first, second]);
         assert_eq!(symbols, [format!("{first}_v"), format!("{second}_v")]);
     }
+    // Symbols keep their order also across values, as their ranges may
+    // overlap; one replaced stays in its place.
+    let original = config(
+        r#"{"symbols": [{"name": "Higher", "value": "$30", "size": 32}, {"name": "Lower", "value": "$20", "size": 64}]}"#,
+    );
+    let changed = apply(
+        &rom,
+        &original,
+        serde_json::json!([
+            {"op": "upsert", "kind": "symbols", "item": {"name": "Higher", "value": "$30", "size": 32, "comment": "first"}},
+        ]),
+    );
+    let symbols: Vec<(&str, Option<&str>)> = changed
+        .symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.comment.as_deref()))
+        .collect();
+    assert_eq!(symbols, [("Higher", Some("first")), ("Lower", None)]);
 }
 
 #[test]
