@@ -4020,9 +4020,7 @@ fn issue_ids_name_the_path_to_the_place() {
 
 #[test]
 fn narrowed_unknown_ranges_are_changed_issues() {
-    let rom = nrom(concat!(
-        "Reset:\n  jmp Reset\nLoose:\n  .db 1, 2, 3, 4, 5\nNmi:\n  rti\n",
-    ));
+    let rom = nrom("Reset:\n  jmp Reset\nLoose:\n  .db 1, 2, 3, 4, 5\nNmi:\n  rti\n");
     let before = round_trip(&rom, &DisasmConfig::default());
     let after = round_trip(
         &rom,
