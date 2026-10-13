@@ -3142,3 +3142,62 @@ fn routines_keeping_the_banks_can_be_annotated() {
         "entry_points $E00D: give switch_banks or keeps_banks, not both"
     );
 }
+
+#[test]
+fn bank_writes_reach_callers_through_routines_that_do_not_return() {
+    // Wrapper calls Sel2, which switches bank 2 in and never returns.
+    let banks = "  .bank 0\n  .org $8000\n  jsr Wrapper\n  .db $A9, $33, $60\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Wrapper:\n  jsr Sel2\n  rts\n",
+        "Sel2:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\nHang:\n  jmp Hang\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $33, $60"), "{}", d.text());
+}
+
+#[test]
+fn ram_a_routine_restores_after_forgetting_it_is_kept() {
+    // Keep saves $F5, writes through an unknown X (which may reach $F5),
+    // and restores it: $F5 still holds 2 for Switch.
+    let reset = concat!(
+        "  lda #$02\n  sta <$F5\n  jsr Keep\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Keep:\n  lda <$F5\n  pha\n  ldx $0300\n  sta <$00,x\n  pla\n  sta <$F5\n  rts\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["\tjsr sub_02_8000"]);
+}
+
+#[test]
+fn routines_going_on_into_one_keeping_the_banks_keep_them() {
+    // Wrapper2 jumps to Yield, which keeps the banks (annotated).
+    let banks = "  .bank 0\n  .org $8000\n  jsr Wrapper2\n  lda #$33\n  rts\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Wrapper2:\n  jmp Yield\n",
+        "Yield:\n  lda #$06\n  sta $8000\n  lda #$04\n  sta $8001\n  jmp [$0010]\n",
+    );
+    let d = round_trip(
+        &switching_rom(banks, reset),
+        &config(r#"{"entry_points": [{"address": "$E010", "keeps_banks": true}]}"#),
+    );
+    assert_lines(&d, &["sub_00_8000:", "\tjsr sub_E00D", "\tlda #$33"]);
+}
+
+#[test]
+fn the_last_step_a_summary_follows_counts() {
+    // Sel4 switches bank 2 in with its last instructions before the budget
+    // of a summary runs out.
+    let mut reset =
+        String::from("  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\nSel4:\n");
+    for _ in 0..4092 {
+        reset.push_str("  nop\n");
+    }
+    reset.push_str("  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n  rts\n");
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel4\n  .db $A9, $33, $60\n";
+    let d = round_trip(&switching_rom(banks, &reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $33, $60"), "{}", d.text());
+}

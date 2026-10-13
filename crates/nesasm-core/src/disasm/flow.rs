@@ -925,7 +925,7 @@ impl Summaries {
                 steps += 1;
                 if steps > MAX_SUMMARY_STEPS {
                     // Too many paths: the banks written so far still count.
-                    return Err(switched);
+                    return Err([0, 1].map(|w| switched[w] || state.switched[w]));
                 }
                 if let Some(before) = seen.get(&loc) {
                     let met = state.meet(before);
@@ -957,6 +957,11 @@ impl Summaries {
                     exits.push(state);
                     break;
                 }
+                if loc != entry && code.keeps(loc) {
+                    state.apply(&Summary::keeping());
+                    exits.push(state);
+                    break;
+                }
                 let Some(insn) = code.insn(loc) else {
                     unknown_exit = true;
                     break;
@@ -977,6 +982,10 @@ impl Summaries {
                                     // returns past them.
                                     state.forget();
                                 } else if callee.takes_return || !callee.returns {
+                                    // The path ends there, with what it wrote.
+                                    for (any, w) in switched.iter_mut().zip(callee.switched) {
+                                        *any |= w;
+                                    }
                                     break;
                                 } else if hopeful {
                                     state.apply_hopeful(&callee);
@@ -1088,8 +1097,12 @@ impl Summaries {
             let value = first.read(u32::from(address));
             let same = exits.iter().all(|e| e.read(u32::from(address)) == value);
             match value {
-                // Left as it was.
-                Sym::Input(Input::Mem(a), 0) if same && a == address => {}
+                // Left as it was, and not among what the routine forgets.
+                Sym::Input(Input::Mem(a), 0)
+                    if same
+                        && a == address
+                        && !summary.forgets_memory
+                        && !summary.lost.iter().any(|(l, h)| (*l..=*h).contains(&a)) => {}
                 Sym::Unknown => summary.changed.push(address),
                 v if same => summary.memory.push((address, v)),
                 _ => summary.changed.push(address),
