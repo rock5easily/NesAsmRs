@@ -130,6 +130,11 @@ pub struct DisasmConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<ReferenceDef>,
     pub options: DisasmOptions,
+    /// Apply the hypotheses as if confirmed (see `with_hypotheses`); not
+    /// part of the annotation file.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub apply_hypotheses: bool,
 }
 
 /// Whether an annotation is confirmed.
@@ -199,7 +204,6 @@ pub(crate) trait Provenance {
     fn evidence(&self) -> &[String];
     fn evidence_mut(&mut self) -> &mut Vec<String>;
     fn status(&self) -> Status;
-    fn status_mut(&mut self) -> &mut Status;
 }
 
 macro_rules! provenance {
@@ -213,9 +217,6 @@ macro_rules! provenance {
             }
             fn status(&self) -> Status {
                 self.status
-            }
-            fn status_mut(&mut self) -> &mut Status {
-                &mut self.status
             }
         }
     )*};
@@ -249,23 +250,19 @@ impl DisasmConfig {
         self.hypotheses() > 0
     }
 
-    /// The annotations an analysis applies: without the hypotheses.
-    pub fn confirmed(&self) -> Self {
-        let mut config = self.clone();
-        each_list!(config, _name, list, [&mut] => list.retain(|e| e.status() != Status::Hypothesis));
-        config
+    /// The annotations with the hypotheses applied as if confirmed, to see
+    /// what they would change. The entries keep their status (and indices).
+    pub fn with_hypotheses(&self) -> Self {
+        Self {
+            apply_hypotheses: true,
+            ..self.clone()
+        }
     }
 
-    /// The annotations with the hypotheses taken as confirmed, to see what
-    /// they would change.
-    pub fn with_hypotheses(&self) -> Self {
-        let mut config = self.clone();
-        each_list!(config, _name, list, [&mut] => {
-            for entry in list.iter_mut() {
-                *entry.status_mut() = Status::Confirmed;
-            }
-        });
-        config
+    /// Whether an analysis applies `entry`: a confirmed one, or any with
+    /// `apply_hypotheses`.
+    pub(crate) fn applies<T: Provenance>(&self, entry: &T) -> bool {
+        self.apply_hypotheses || entry.status() == Status::Confirmed
     }
 
     /// Whether an entry gives `evidence` or `status`, which needs format 2.

@@ -4295,12 +4295,12 @@ fn hypotheses_are_applied_only_when_asked() {
     );
     assert_eq!(c.hypotheses(), 1);
     assert!(c.has_hypotheses());
-    assert_eq!(c.confirmed().labels.len(), 1);
     let d = round_trip(&rom, &c);
     assert!(d.text().contains("Sure:"), "{}", d.text());
     assert!(!d.text().contains("Guess"), "{}", d.text());
     let with = c.with_hypotheses();
-    assert!(!with.has_hypotheses());
+    assert!(with.apply_hypotheses && with.has_hypotheses());
+    assert_eq!(with.labels[1].status, disasm::Status::Hypothesis);
     let d = round_trip(&rom, &with);
     assert!(d.text().contains("Guess:"), "{}", d.text());
 }
@@ -4361,4 +4361,53 @@ fn operation_evidence_is_added_to_the_entry() {
     let c = apply(&rom, &banks, guess);
     assert_eq!(c.labels[0].status, disasm::Status::Hypothesis);
     assert_eq!(c.labels[0].evidence, ["looks like a loop"]);
+}
+
+#[test]
+fn hypotheses_keep_their_place_and_status() {
+    let rom = nrom("Reset:\n  jmp Reset\nNmi:\n  rti\n");
+    // Errors name the entry by its index in the annotations as given.
+    let c = config(
+        r#"{"labels": [{"address": "$E000", "name": "Guess", "status": "hypothesis"}, {"address": "$E003", "name": "9z"}]}"#,
+    );
+    let e = disasm::disassemble(&rom, None, &c, Path::new("out.asm"), &NEVER)
+        .err()
+        .unwrap();
+    assert!(
+        e[0].message
+            .starts_with("labels[1] $E003 (9z): Invalid name '9z'"),
+        "{e:?}"
+    );
+    // Suggestions made with hypotheses applied keep their status.
+    let print = concat!(
+        "Print:\n  pla\n  sta <$02\n  pla\n  sta <$03\n  ldy #$01\n  lda [$02],y\n  sta $0300\n",
+        "  lda <$02\n  clc\n  adc #$02\n  sta <$02\n  lda <$03\n  adc #$00\n  pha\n  lda <$02\n  pha\n  rts\n",
+    );
+    let rom = nrom(&format!(
+        "Reset:\n  jsr Print\n  .db $A9, $07\n  jmp Reset\n{print}Nmi:\n  rti\n"
+    ));
+    let c = config(
+        r#"{"entry_points": [{"address": "$E008", "name": "Print", "status": "hypothesis", "evidence": ["called from RESET"]}]}"#,
+    );
+    let d = round_trip(&rom, &c.with_hypotheses());
+    let found = suggestions(&d, IssueKind::ReturnAddress);
+    assert_eq!(
+        found[0][1]["operations"][0]["item"],
+        serde_json::json!({"bank": 1, "address": "$E008", "name": "Print", "no_return": true,
+                           "status": "hypothesis", "evidence": ["called from RESET"]})
+    );
+}
+
+#[test]
+fn evidence_added_by_operations_is_within_the_limits() {
+    let rom = two_banks_at_8000();
+    let banks = config(r#"{"banks": [{"bank": 1, "org": "$8000"}]}"#);
+    let evidence: Vec<String> = (0..64).map(|i| format!("e{i}")).collect();
+    let ops = serde_json::json!([{"op": "upsert", "kind": "references",
+        "item": {"bank": 3, "address": "$E000", "target_bank": 1, "evidence": evidence},
+        "evidence": "one more"}]);
+    assert_eq!(
+        apply_errors(&rom, &banks, ops),
+        ["In the changed annotations: references[0]: evidence has 65 items; at most 64"]
+    );
 }

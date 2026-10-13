@@ -141,7 +141,12 @@ impl Patches {
             }
         }
         let mut errors = Vec::new();
-        for (i, def) in config.patches.iter().enumerate() {
+        for (i, def) in config
+            .patches
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             match memory.span(def.bank, def.start, def.end, def.length) {
                 Ok((loc, end)) => ranges[loc.bank].push(PatchRange {
                     start: loc.offset,

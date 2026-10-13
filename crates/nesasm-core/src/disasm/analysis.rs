@@ -129,7 +129,7 @@ impl Memory {
         };
         let mut banks = Vec::new();
         if let Some(load) = config.load_address {
-            if !config.banks.is_empty() {
+            if config.banks.iter().any(|b| config.applies(b)) {
                 return Err("banks cannot be combined with load_address".into());
             }
             let load = load.0;
@@ -177,7 +177,12 @@ impl Memory {
                     end: chunk.len(),
                 });
             }
-            for (i, layout) in config.banks.iter().enumerate() {
+            for (i, layout) in config
+                .banks
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| config.applies(*e))
+            {
                 let org = layout.org.0;
                 if org % BANK_SIZE as u32 != 0 || org > 0xe000 {
                     return Err(format!(
@@ -420,7 +425,12 @@ fn fixed_pair(
             banks[first + 1].end
         ));
     }
-    for (i, layout) in config.banks.iter().enumerate() {
+    for (i, layout) in config
+        .banks
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| config.applies(*e))
+    {
         let fixed = match layout.bank {
             b if b == first => 0xc000,
             b if b == first + 1 => 0xe000,
@@ -902,7 +912,12 @@ impl Analysis {
                 errors.push(format!("Name '{name}' is used by {other} and {what}"));
             }
         };
-        for (i, entry) in config.entry_points.iter().enumerate() {
+        for (i, entry) in config
+            .entry_points
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             let what = format!("entry_points[{i}] {}", entry.address);
             if entry.inline_bytes > BANK_SIZE {
                 errors.push(format!("{what}: inline_bytes must be at most {BANK_SIZE}"));
@@ -947,7 +962,12 @@ impl Analysis {
                 Err(e) => errors.push(format!("{what}: {e}")),
             }
         }
-        for (i, label) in config.labels.iter().enumerate() {
+        for (i, label) in config
+            .labels
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             let what = format!("labels[{i}] {} ({})", label.address, label.name);
             match self.memory.locate(label.bank, label.address) {
                 Ok(loc) => {
@@ -957,7 +977,12 @@ impl Analysis {
                 Err(e) => errors.push(format!("{what}: {e}")),
             }
         }
-        for (i, symbol) in config.symbols.iter().enumerate() {
+        for (i, symbol) in config
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             let what = format!("symbols[{i}] {} ({})", symbol.value, symbol.name);
             claim(&symbol.name, what.clone(), &mut errors);
             if symbol.value.0 > 0xffff {
@@ -1001,13 +1026,23 @@ impl Analysis {
             }
         }
         self.user_names = names;
-        for (i, comment) in config.comments.iter().enumerate() {
+        for (i, comment) in config
+            .comments
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             match self.memory.locate(comment.bank, comment.address) {
                 Ok(loc) => self.comment(loc, &comment.text, comment.position),
                 Err(e) => errors.push(format!("comments[{i}] {}: {e}", comment.address)),
             }
         }
-        for (i, operand) in config.operands.iter().enumerate() {
+        for (i, operand) in config
+            .operands
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             match self.memory.locate(operand.bank, operand.address) {
                 Ok(_) if operand.expr.trim().is_empty() || operand.expr.contains(['\n', ';']) => {
                     errors.push(format!(
@@ -1021,7 +1056,12 @@ impl Analysis {
                 Err(e) => errors.push(format!("operands[{i}] {}: {e}", operand.address)),
             }
         }
-        for (i, reference) in config.references.iter().enumerate() {
+        for (i, reference) in config
+            .references
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             match self.memory.locate(reference.bank, reference.address) {
                 Ok(loc)
                     if self
@@ -1048,7 +1088,12 @@ impl Analysis {
     }
 
     fn apply_regions(&mut self, config: &DisasmConfig, errors: &mut Vec<String>) {
-        for (i, def) in config.regions.iter().enumerate() {
+        for (i, def) in config
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| config.applies(*e))
+        {
             let what = format!("regions[{i}] {}", def.start);
             let (loc, end) = match self.memory.span(def.bank, def.start, def.end, def.length) {
                 Ok(span) => span,

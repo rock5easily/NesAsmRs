@@ -1234,3 +1234,24 @@ fn hypotheses_are_kept_but_applied_only_on_request() {
         "{r}"
     );
 }
+
+#[test]
+fn annotate_checks_the_annotations_without_the_hypotheses_too() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    // Bank 0 holds $8000 only if the hypothetical layout is applied.
+    let inline = json!({"rom": "old/loose.nes", "format_version": 2,
+        "banks": [{"bank": 0, "org": "$8000", "status": "hypothesis", "evidence": ["a guess"]}],
+        "labels": [{"bank": 0, "address": "$8000", "name": "Start8000"}]});
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations":[],"hypotheses":true}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains(
+            "In the changed annotations (without the hypotheses): labels[0] $8000 (Start8000): Bank 0 ($C000-$DFFF) does not hold $8000"
+        ),
+        "{r}"
+    );
+}

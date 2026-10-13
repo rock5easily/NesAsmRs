@@ -623,9 +623,9 @@ pub fn apply_operations(
         apply(&mut config, index, None);
     }
     // Layout errors name banks entries by their index in canonical order.
-    // Entries take the banks of the layout that is applied: the confirmed one.
+    // Entries take the banks of the layout that is applied.
     sort(&mut config.banks);
-    let memory = match Memory::new(rom_file, &config.confirmed()) {
+    let memory = match Memory::new(rom_file, &config) {
         Ok(memory) => memory,
         Err(e) => {
             errors.push(format!("In the changed annotations: {e}"));
@@ -648,6 +648,10 @@ pub fn apply_operations(
             duplicates(kind, list, &mut errors);
             sort(list);
         });
+    }
+    // Evidence added by the operations is within the limits too.
+    for error in config.check_format() {
+        errors.push(format!("In the changed annotations: {error}"));
     }
     if !errors.is_empty() {
         return Err(errors);

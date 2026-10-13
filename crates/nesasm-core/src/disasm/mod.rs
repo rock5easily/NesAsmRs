@@ -516,14 +516,8 @@ pub fn disassemble(
     if !errors_of_format.is_empty() {
         return Err(errors(errors_of_format));
     }
-    // Hypotheses are applied only when the caller takes them as confirmed.
-    let confirmed;
-    let config = if config.has_hypotheses() {
-        confirmed = config.confirmed();
-        &confirmed
-    } else {
-        config
-    };
+    // Hypotheses are skipped where the annotations are applied, unless the
+    // caller asks for them (`DisasmConfig::with_hypotheses`).
     // A ROM hack includes its CHR ROM from the CHR file, which
     // CHR editors change; `.db` lines would be edited rarely.
     if config.base.is_some() && config.options.chr == ChrMode::Db {

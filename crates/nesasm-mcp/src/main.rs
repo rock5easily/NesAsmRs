@@ -1433,23 +1433,41 @@ impl Server {
                 Ok(after) => after,
                 Err(diagnostics) => return Err(failed(report, diagnostics, "")),
             };
-        // Hypotheses that are not applied must still be valid annotations.
-        if !input.hypotheses
-            && config.has_hypotheses()
-            && let Err(diagnostics) = Self::disassemble_with(
-                root,
-                &config.with_hypotheses(),
-                &rom,
-                output,
-                &location,
-                cancel,
-            )
-        {
-            return Err(failed(
-                report,
-                diagnostics,
-                " (with the hypotheses applied)",
-            ));
+        // The annotations must be valid both with and without the
+        // hypotheses: the other way is checked here.
+        if config.has_hypotheses() {
+            if !input.hypotheses {
+                if let Err(diagnostics) = Self::disassemble_with(
+                    root,
+                    &config.with_hypotheses(),
+                    &rom,
+                    output,
+                    &location,
+                    cancel,
+                ) {
+                    return Err(failed(
+                        report,
+                        diagnostics,
+                        " (with the hypotheses applied)",
+                    ));
+                }
+            } else {
+                // What export_disassembly writes must reassemble.
+                match Self::disassemble_with(root, &config, &rom, output, &location, cancel) {
+                    Err(diagnostics) => {
+                        return Err(failed(report, diagnostics, " (without the hypotheses)"));
+                    }
+                    Ok(confirmed)
+                        if input.require_match.unwrap_or(true)
+                            && !confirmed.verify(root, Some(root), cancel).matched =>
+                    {
+                        return Err(fail(
+                            "Without the hypotheses, the source would not reassemble to the ROM; nothing was written",
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+            }
         }
         let verification = after.verify(root, Some(root), cancel);
         let matched = verification.matched;

@@ -341,11 +341,13 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
 - 注釈の各項目は `evidence`（根拠、文字列の配列）と `status`（`confirmed`／`hypothesis`）を持てます。
   操作の `evidence` は項目の `evidence` に追加し（重複なし）、根拠の必須の判定は両方を合わせて行います。
   推測（`hypothesis`）にも根拠を求めます。`evidence` はソースに出力しません。
-- 推測の項目は `disassemble`（コアの関数）が常に除いて解析します（`DisasmConfig::confirmed`）。
-  試行の解析では、呼び出し側が `DisasmConfig::with_hypotheses` で確定とみなした注釈を渡します
-  （MCPの `hypotheses: true`）。`export_disassembly` は推測を適用しません。`annotate` は推測を適用しない
-  場合も、推測を適用した注釈が有効かを解析で確かめてから書き込みます。各項目のバンクの補完は、
-  適用される（確定した）配置で行います。
+- 推測の項目は、注釈を適用する各所（バンク配置、各一覧の適用、`patches`）で読み飛ばします。
+  一覧から取り除かないので、エラーの位置（`labels[1]` など）はファイルのままです。試行の解析では、
+  呼び出し側が `DisasmConfig::with_hypotheses`（ファイルに書かない `apply_hypotheses` を立てる）を渡します
+  （MCPの `hypotheses: true`）。項目の `status` は変えないので、試行の解析で作った修正案も推測のままです。
+  `export_disassembly` は推測を適用しません。`annotate` は、推測を適用した注釈と適用しない注釈の両方が
+  有効であることを確かめ、試行の解析で書き込む場合は推測なしの往復検証も一致することを求めます。
+  操作で足した根拠も上限の検査をします。
 - 互換性のため、`evidence` か `status` を使う注釈にだけ `format_version: 2` を書きます。旧版は
   未知の欄として拒否し、新しい版は自分が読めるより新しい版を原因がわかるエラーで拒否します。
   `evidence` は1項目64件・1件2000文字までです。
