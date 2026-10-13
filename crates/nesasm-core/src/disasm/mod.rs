@@ -8,6 +8,7 @@
 
 mod analysis;
 pub mod config;
+mod flow;
 mod patch;
 mod render;
 
@@ -59,8 +60,14 @@ pub enum IssueKind {
     Overlap,
     /// Code reaches a range a region describes as data.
     CodeDataConflict,
-    /// `JMP [addr]` whose targets are unknown.
+    /// `JMP [addr]` (or an RTS after pushes) whose targets are unknown.
     IndirectJump,
+    /// A jump table found after the JSRs to a routine that jumps through
+    /// its return address; its length is to be confirmed.
+    JumpTable,
+    /// A routine takes its return address (arguments after each JSR?), so
+    /// the code after a JSR to it is not followed.
+    ReturnAddress,
     /// A reference to an address that several banks hold.
     UnresolvedBank,
     /// Code outside the ROM (RAM, SRAM) is called or jumped to.
@@ -330,11 +337,11 @@ pub fn disassemble(
             ))]);
         }
     }
-    // A ROM hack includes its changed CHR banks from the CHR file, which
+    // A ROM hack includes its CHR ROM from the CHR file, which
     // CHR editors change; `.db` lines would be edited rarely.
     if config.base.is_some() && config.options.chr == ChrMode::Db {
         return Err(vec![error(
-            "options.chr \"db\" does not apply with base: changed CHR banks are included from the CHR file",
+            "options.chr \"db\" does not apply with base: the CHR ROM is included from the CHR file",
         )]);
     }
     let mut analysis = Analysis::run(rom_file, config, cancel).map_err(errors)?;

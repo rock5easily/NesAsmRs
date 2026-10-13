@@ -5,7 +5,7 @@ use super::analysis::{Analysis, Class, FILL_RUN, Insn, Label, Loc, Region, Targe
 use super::config::{ChrMode, RegionType};
 use super::patch::Patches;
 use super::{Address, RomFormat, SourceLine};
-use crate::opcode::Mode;
+use crate::opcode::{Mnemonic, Mode};
 use crate::state::BANK_SIZE;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -206,8 +206,8 @@ pub(crate) fn render(
     let mut body = std::mem::take(&mut w.lines);
     let chr_path = super::chr_path(source);
     let chr = w.chr_banks(&quoted_path(&chr_path));
-    // A ROM hack writes its changed CHR banks in the main file, over the
-    // base ROM; there are no bank files of CHR banks.
+    // A ROM hack includes its CHR ROM at the end of the main file; there
+    // are no bank files of CHR banks.
     let mut chr_lines = std::mem::take(&mut w.lines);
     if patches.is_none() {
         body.append(&mut chr_lines);
@@ -514,18 +514,18 @@ impl Writer<'_> {
         }
     }
 
-    /// For a ROM hack, the `.incbin` of the base ROM that the changed ranges
-    /// are written over: one per run of banks the base holds in the same
-    /// order (one for a hack of the same size; an expanded ROM's CHR banks
-    /// follow its new PRG banks). The base's header is left out. Bytes the
-    /// base lacks are changed bytes, so the ranges write them.
+    /// For a ROM hack, the `.incbin` of the base ROM's PRG banks that the
+    /// changed ranges are written over: one per run of banks the base holds
+    /// in the same order (one unless banks were inserted). The base's header
+    /// and CHR banks are left out: the CHR file holds the whole CHR ROM.
+    /// Bytes the base lacks are changed bytes, so the ranges write them.
     fn include_base(&mut self) {
         let Some(patches) = self.patches else {
             return;
         };
         // (first bank, offset in the bank, offset in the base file, size)
         let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
-        for bank in &self.a.memory.banks {
+        for bank in self.a.memory.prg_banks() {
             let Some(other) = patches.base_bank[bank.index].map(|b| &patches.base.banks[b]) else {
                 continue;
             };
@@ -551,12 +551,7 @@ impl Writer<'_> {
             self.push(index, None, 0, format!("{INDENT}.bank {index}"));
             self.push(index, None, 0, format!("{INDENT}.org {}", hex4(org)));
             let text = format!("{INDENT}.incbin \"{}\", {file}, {size}", patches.path);
-            let address = if self.a.memory.banks[index].chr {
-                offset as u32
-            } else {
-                org
-            };
-            self.push(index, Some(address), size, text);
+            self.push(index, Some(org), size, text);
         }
     }
 
@@ -711,7 +706,26 @@ impl Writer<'_> {
                 }
             }
             _ => {
-                let expr = self.target(loc, value);
+                // A write to $8000-$FFFF goes to the mapper, not to the ROM
+                // byte a label would name.
+                let mapper = value >= 0x8000
+                    && matches!(
+                        insn.mnemonic,
+                        Mnemonic::Sta
+                            | Mnemonic::Stx
+                            | Mnemonic::Sty
+                            | Mnemonic::Inc
+                            | Mnemonic::Dec
+                            | Mnemonic::Asl
+                            | Mnemonic::Lsr
+                            | Mnemonic::Rol
+                            | Mnemonic::Ror
+                    );
+                let expr = if mapper {
+                    hex4(value)
+                } else {
+                    self.target(loc, value)
+                };
                 match insn.mode {
                     Mode::Ax => format!("{expr},{x}"),
                     Mode::Ay => format!("{expr},{y}"),
@@ -954,29 +968,30 @@ impl Writer<'_> {
             .filter(|b| b.chr)
             .map(|b| b.index)
             .collect();
-        if banks.is_empty() {
-            return None;
-        }
+        let first = *banks.first()?;
         let mut file = Vec::new();
+        if self.patches.is_some() {
+            // A ROM hack includes its whole CHR ROM, changed or not, from one
+            // file in the original order (CHR editors read it whole), after
+            // the base ROM's PRG banks.
+            for &index in &banks {
+                let bank = &self.a.memory.banks[index];
+                file.extend_from_slice(&bank.data[bank.start..bank.end]);
+            }
+            self.push(first, None, 0, String::new());
+            self.push(first, None, 0, format!("{INDENT}.bank {first}"));
+            self.push(first, None, 0, format!("{INDENT}.org $0000"));
+            let text = format!("{INDENT}.incbin \"{chr_name}\"");
+            self.push(first, Some(0), file.len(), text);
+            return Some(file);
+        }
         for index in banks {
             let bank = &self.a.memory.banks[index];
             let data = bank.data[bank.start..bank.end].to_vec();
-            let loc = Loc {
-                bank: index,
-                offset: bank.start,
-            };
-            // A ROM hack's unchanged CHR banks come with the base ROM.
-            if self.patches.is_some_and(|p| p.range_at(loc).is_none()) {
-                continue;
-            }
             self.push(index, None, 0, String::new());
             self.push(index, None, 0, format!("{INDENT}.bank {index}"));
             match self.a.options.chr {
                 ChrMode::Incbin => {
-                    // After the base ROM, `.bank` may resume where it ended.
-                    if self.patches.is_some() {
-                        self.push(index, None, 0, format!("{INDENT}.org $0000"));
-                    }
                     let text = format!(
                         "{INDENT}.incbin \"{chr_name}\", {}, {}",
                         file.len(),

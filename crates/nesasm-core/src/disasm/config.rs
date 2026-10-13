@@ -211,6 +211,11 @@ pub struct RegionDef {
     pub columns: Option<usize>,
     /// Comment placed above the region.
     pub comment: Option<String>,
+    /// For pointer and low_bytes tables: start of a table of the same
+    /// number of entries (and bank) holding the PRG bank (8 KiB) switched in
+    /// for each entry. A target that bank holds is resolved to it; others
+    /// (in the fixed banks, or the table's own bank) as usual.
+    pub bank_table: Option<Address>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
