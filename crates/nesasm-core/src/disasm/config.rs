@@ -300,6 +300,11 @@ pub struct DisasmOptions {
     /// Write each bank to `<stem>_bankNN.asm`, included from the main file.
     /// By default, only when the source would exceed 512 KiB.
     pub split_banks: Option<bool>,
+    /// Mapper 4 (MMC3) only: the second-to-last PRG bank is at $C000 and the
+    /// last at $E000, and $C000-$FFFF is analysed as one range, so code runs
+    /// across $DFFF/$E000. With `split_banks`, both are written to
+    /// `<stem>_bankNN_MM.asm`.
+    pub mapper4_fixed_prg_16k: bool,
 }
 
 impl Default for DisasmOptions {
@@ -312,6 +317,7 @@ impl Default for DisasmOptions {
             nes_registers: true,
             chr: ChrMode::Incbin,
             split_banks: None,
+            mapper4_fixed_prg_16k: false,
         }
     }
 }

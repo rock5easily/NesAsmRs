@@ -684,8 +684,11 @@ classDiagram
         -RomFormat format
         -Vec header
         -Vec~BankImage~ banks
+        -Option pair
         -resolve(from, address) Resolved
         -locate(bank, address) Loc
+        -step(loc, n) Option~Loc~
+        -back(loc, n) Option~Loc~
     }
     class Patches {
         -String path
@@ -721,6 +724,10 @@ classDiagram
 エントリポイント・コード領域・ジャンプ表から幅優先でコードを追跡し、参照とラベル名を決めます。
 `render` は全バンクの全バイトを順に書き、各ファイルの先頭行に本文のチェックサムを付けます。
 ROM Hackでは `Patches` がベースROMとの差分から範囲を決め、`render` はメインファイルでベースROMを
-`.incbin` で読み込み、各範囲を `.bank`・`.org` で上書きします。`export_disassembly` は既存ファイルを
+`.incbin` で読み込み、各範囲を `.bank`・`.org` で上書きします（変更のあるCHRバンクはメインファイルに書きます）。
+`options.mapper4_fixed_prg_16k` では `Memory::pair` が最後から2番目のPRGバンクを指し、`step`／`back` が
+そのバンクと最終バンクを $C000-$FFFF の連続した範囲としてたどるため、境界をまたぐ命令のデコード・追跡・
+差分範囲の拡張ができます。`render` は2バンクを1つのファイルにまとめ、`.catbank` の後に `.include` します。
+`export_disassembly` は既存ファイルを
 本文先頭の行（`; Source:` か `.bank n`）で見分け、同じ役割の未編集ファイルだけを上書きします。
 `verify` は生成したファイルを `AssembleRequest.files` に渡してメモリ上でアセンブルし、元のROMと比較します。

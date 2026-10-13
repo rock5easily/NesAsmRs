@@ -154,11 +154,7 @@ impl Patches {
         if !errors.is_empty() {
             return Err(errors);
         }
-        for (bank, list) in ranges.iter_mut().enumerate() {
-            if !memory.banks[bank].chr {
-                widen(a, bank, list);
-            }
-        }
+        widen(a, &mut ranges);
         Ok(Self {
             path,
             base,
@@ -177,55 +173,87 @@ impl Patches {
     }
 }
 
-/// Widens ranges to whole instructions and table entries, then merges
-/// overlapping and adjacent ones, until nothing changes.
-fn widen(a: &Analysis, bank: usize, ranges: &mut Vec<PatchRange>) {
+/// Widens the ranges of the PRG banks to whole instructions and table
+/// entries, then merges overlapping and adjacent ones, until nothing
+/// changes. An instruction across the banks of the fixed pair widens a
+/// range of each bank to the bank boundary.
+fn widen(a: &Analysis, ranges: &mut [Vec<PatchRange>]) {
     loop {
-        let before = ranges.clone();
-        for range in ranges.iter_mut() {
-            let loc = Loc {
-                bank,
-                offset: range.start,
-            };
-            if a.class[bank][range.start] == Class::Operand
-                && let Some(start) = a.containing(loc)
-            {
-                range.start = start.offset;
+        let before = ranges.to_vec();
+        // Ranges of the other bank of the fixed pair.
+        let mut added: Vec<(usize, usize, usize)> = Vec::new();
+        for (bank, list) in ranges.iter_mut().enumerate() {
+            if a.memory.banks[bank].chr {
+                continue;
             }
-            let last = loc.at(range.end - 1);
-            let insn = match a.class[bank][last.offset] {
-                Class::Insn => Some(last),
-                Class::Operand => a.containing(last),
-                _ => None,
-            };
-            if let Some(start) = insn {
-                range.end = range.end.max(start.offset + a.insns[&start].len);
-            }
-            for edge in [range.start, range.end - 1] {
-                if let Some(region) = a.region_at(loc.at(edge))
-                    && matches!(region.kind, RegionType::Words | RegionType::Pointers)
+            let end_of_bank = a.memory.banks[bank].end;
+            for range in list.iter_mut() {
+                let loc = Loc {
+                    bank,
+                    offset: range.start,
+                };
+                if a.class[bank][range.start] == Class::Operand
+                    && let Some(start) = a.containing(loc)
                 {
-                    let pair = region.start + (edge - region.start) / 2 * 2;
-                    range.start = range.start.min(pair);
-                    range.end = range.end.max((pair + 2).min(region.end));
-                }
-            }
-        }
-        ranges.sort_by_key(|r| r.start);
-        let mut merged: Vec<PatchRange> = Vec::new();
-        for range in ranges.drain(..) {
-            match merged.last_mut() {
-                Some(last) if range.start <= last.end => {
-                    last.end = last.end.max(range.end);
-                    if last.comment.is_none() {
-                        last.comment = range.comment;
+                    if start.bank == bank {
+                        range.start = start.offset;
+                    } else {
+                        range.start = 0;
+                        let other = a.memory.banks[start.bank].end;
+                        added.push((start.bank, start.offset, other));
                     }
                 }
-                _ => merged.push(range),
+                let last = loc.at(range.end - 1);
+                let insn = match a.class[bank][last.offset] {
+                    Class::Insn => Some(last),
+                    Class::Operand => a.containing(last),
+                    _ => None,
+                };
+                if let Some(start) = insn
+                    && let Some(end) = a.memory.step(start, a.insns[&start].len - 1)
+                {
+                    if end.bank == bank {
+                        range.end = range.end.max(end.offset + 1);
+                    } else {
+                        range.end = end_of_bank;
+                        added.push((end.bank, 0, end.offset + 1));
+                    }
+                }
+                for edge in [range.start, range.end - 1] {
+                    if let Some(region) = a.region_at(loc.at(edge))
+                        && matches!(region.kind, RegionType::Words | RegionType::Pointers)
+                    {
+                        let pair = region.start + (edge - region.start) / 2 * 2;
+                        range.start = range.start.min(pair);
+                        range.end = range.end.max((pair + 2).min(region.end));
+                    }
+                }
             }
         }
-        *ranges = merged;
-        if *ranges == before {
+        for (bank, start, end) in added {
+            ranges[bank].push(PatchRange {
+                start,
+                end,
+                comment: None,
+            });
+        }
+        for list in ranges.iter_mut() {
+            list.sort_by_key(|r| r.start);
+            let mut merged: Vec<PatchRange> = Vec::new();
+            for range in list.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if range.start <= last.end => {
+                        last.end = last.end.max(range.end);
+                        if last.comment.is_none() {
+                            last.comment = range.comment;
+                        }
+                    }
+                    _ => merged.push(range),
+                }
+            }
+            *list = merged;
+        }
+        if *ranges == *before {
             return;
         }
     }

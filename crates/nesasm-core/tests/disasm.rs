@@ -1,7 +1,7 @@
 mod common;
 
 use common::Temp;
-use nesasm_core::disasm::{self, Address, DisasmConfig, Disassembly, IssueKind};
+use nesasm_core::disasm::{self, Address, DisasmConfig, Disassembly, IssueKind, XrefKind};
 use nesasm_core::{AssembleOptions, AssembleRequest, AssembleResult};
 use std::{
     fs,
@@ -916,15 +916,14 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
         "patches": [{"start": "$E00B", "end": "$E00C", "comment": "Init"}]}"#;
     let d = patch_round_trip(&hack, &base, json);
     let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
-    // Bank 0 is unchanged and has no file.
+    // Bank 0 is unchanged and has no file; the CHR bank 4 has none either.
     assert_eq!(
         names,
         [
             "out.asm",
             "out_bank01.asm",
             "out_bank02.asm",
-            "out_bank03.asm",
-            "out_bank04.asm"
+            "out_bank03.asm"
         ]
         .map(PathBuf::from)
     );
@@ -943,12 +942,25 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
             "\t.incbin \"base.nes\", 16400, 8192",
             "",
             "\t.include \"out_bank01.asm\"",
+            "\t.include \"out_bank03.asm\"",
+            // The changed CHR bank is written over the base in the main file.
+            "",
+            "\t.bank 4",
+            "\t.org $0000",
+            "\t.incbin \"out.chr\", 0, 8192",
         ],
     );
-    assert_eq!(d.text().matches(".incbin").count(), 2);
+    assert!(
+        d.text()
+            .ends_with("\t.include \"out_bank03.asm\"\n\n\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\", 0, 8192\n"),
+        "{}",
+        d.text()
+    );
+    assert_eq!(d.text().matches("\"base.nes\"").count(), 2);
     assert!(!d.text().contains("L_E00B          ="), "{}", d.text());
     for (path, text) in &d.files()[1..] {
         assert!(!text.contains("base.nes"), "{}: {text}", path.display());
+        assert!(!text.contains("out.chr"), "{}: {text}", path.display());
     }
     let bank1 = &d.files()[1].1;
     let lines: Vec<&str> = bank1.lines().skip(1).collect();
@@ -975,11 +987,6 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
     );
     // New banks are written whole; the changed CHR bank comes from the CHR file.
     assert!(d.files()[2].1.contains("\t.bank 2\n\t.org $8000\n"));
-    assert!(
-        d.files()[4]
-            .1
-            .ends_with("\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\", 0, 8192\n")
-    );
     assert_eq!(
         d.chr_file(),
         Some((Path::new("out.chr"), new_chr.as_slice()))
@@ -989,22 +996,43 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
             .iter()
             .all(|(_, text)| disasm::is_unedited_source(text))
     );
-    // As one file, and with CHR data as `.db`.
+    // As one file, the CHR bank is included from the CHR file too.
     let d = patch_round_trip(
         &hack,
         &base,
-        &json.replace(r#""split_banks": true"#, r#""chr": "db""#),
+        &json.replace(r#""split_banks": true"#, r#""split_banks": false"#),
     );
     assert_eq!(d.files().len(), 1);
     assert_tab_indented(&d);
-    assert_lines(
-        &d,
-        &[
-            "\t.bank 4",
-            "\t.org $0000",
-            "\t.db $00, $01, $02, $03, $04, $05, $06, $07",
-        ],
+    assert!(
+        d.text()
+            .ends_with("\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\", 0, 8192\n"),
+        "{}",
+        d.text()
     );
+    assert_eq!(
+        d.chr_file(),
+        Some((Path::new("out.chr"), new_chr.as_slice()))
+    );
+    // A ROM hack always includes its changed CHR banks from the CHR file
+    // (edited with CHR tools), never as `.db` lines.
+    for split in ["true", "false"] {
+        let mut c = config(&json.replace(
+            r#""split_banks": true"#,
+            &format!(r#""split_banks": {split}, "chr": "db""#),
+        ));
+        c.base = Some(PathBuf::from("base.nes"));
+        let e = disasm::disassemble(&hack, Some(&base), &c, Path::new("out.asm"), &NEVER)
+            .err()
+            .expect("chr db with base should fail");
+        let messages: Vec<&str> = e.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "options.chr \"db\" does not apply with base: changed CHR banks are included from the CHR file"
+            ]
+        );
+    }
 }
 
 #[test]
@@ -1658,4 +1686,459 @@ fn vector_references_are_reported_once() {
             );
         }
     }
+}
+
+/// A mapper 4 ROM of four PRG banks. With `straddle`, the code of bank 2
+/// ends with `lda $0390,x` at $DFFE, whose last byte is the first of bank 3
+/// ($E000); otherwise it ends with `nop` at $DFFF.
+fn mmc3_rom(straddle: bool) -> Vec<u8> {
+    let (tail, next) = if straddle {
+        ("  .db $BD, $90\n", "  .db $03\n")
+    } else {
+        ("  inx\n  nop\n", "")
+    };
+    assemble(
+        &[
+            "  .inesprg 2\n  .inesmap 4\n  .bank 2\n  .org $DFF0\n",
+            "Reset:\n  sei\n  ldx #$00\n  jsr Init\n  lda $0300\n  sta $0301\n  inx\n  iny\n",
+            tail,
+            "  .bank 3\n  .org $E000\n",
+            next,
+            "  beq Reset\n  jsr Init\nLoop:\n  jmp Loop\n",
+            "  .org $E010\nInit:\n  lda $0300\n  rts\nNmi:\n  rti\n",
+            "  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+        ]
+        .concat(),
+    )
+}
+
+const FIXED_PAIR: &str = r#""mapper4_fixed_prg_16k": true"#;
+
+#[test]
+fn mapper4_fixed_prg_16k_decodes_across_the_last_two_banks() {
+    let rom = mmc3_rom(true);
+    // By default, the instruction would overlap the end of bank 2.
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::Overlap),
+        [
+            "$DFFE The instruction at $DFFE (from $DFFD) would overlap other code, data or the end of the bank"
+        ]
+    );
+    assert!(!d.text().contains("lda $0390,x"), "{}", d.text());
+    assert!(!d.text().contains(".catbank"), "{}", d.text());
+    let d = round_trip(
+        &rom,
+        &config(&format!(r#"{{"options": {{{FIXED_PAIR}}}}}"#)),
+    );
+    assert!(
+        d.issues().iter().all(|i| i.kind != IssueKind::Overlap),
+        "{:?}",
+        d.issues()
+    );
+    assert_tab_indented(&d);
+    assert_lines(
+        &d,
+        &[
+            "\t.catbank $02",
+            "\t.bank 2",
+            "\t.org $C000",
+            "RESET:",
+            "\tjsr sub_E010",
+            "\tiny",
+            "\tlda $0390,x",
+            "; Bank 3 starts at $E000, inside the instruction above",
+            // The code goes on in bank 3, and branches back to bank 2.
+            "\tbeq RESET",
+            "\tjsr sub_E010",
+            "L_E006:",
+            "\tjmp L_E006",
+        ],
+    );
+    // No `.bank` or `.org` splits the instruction.
+    assert!(!d.text().contains("\t.bank 3"), "{}", d.text());
+    assert!(!d.text().contains(".org $E000"), "{}", d.text());
+    let line = d.view(Some(2), 0xdffe, 0xdffe)[0];
+    assert_eq!(
+        (line.size, line.bytes.as_str(), line.text.as_str()),
+        (3, "BD 90 03", "\tlda $0390,x")
+    );
+    let texts: Vec<&str> = d
+        .view(Some(3), 0xe000, 0xe002)
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "; Bank 3 starts at $E000, inside the instruction above",
+            "\tbeq RESET"
+        ]
+    );
+    let banks = d.summary().banks;
+    assert_eq!((banks[2].code_bytes, banks[3].code_bytes), (16, 14));
+    // The routine runs across the boundary, and the branch back refers to bank 2.
+    let routines = d.routines();
+    let reset = routines.iter().find(|r| r.name == "RESET").unwrap();
+    assert_eq!(
+        (
+            reset.bank,
+            reset.address,
+            reset.size,
+            reset.calls.as_slice()
+        ),
+        (2, Address(0xdff0), 25, ["sub_E010".to_owned()].as_slice())
+    );
+    let branch = d.xrefs("RESET").unwrap();
+    assert!(
+        branch
+            .iter()
+            .any(|x| (x.bank, x.address, x.kind, x.line.as_str())
+                == (3, Address(0xe001), XrefKind::Branch, "beq RESET")),
+        "{branch:?}"
+    );
+    // A name inside the instruction is defined relative to it.
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{"labels": [{{"address": "$E000", "name": "Inner"}}], "options": {{{FIXED_PAIR}}}}}"#
+        )),
+    );
+    assert_lines(
+        &d,
+        &[
+            "L_DFFE:",
+            "\tlda $0390,x",
+            "Inner = L_DFFE+2",
+            "; Bank 3 starts at $E000, inside the instruction above",
+        ],
+    );
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_writes_one_file_for_the_last_two_banks() {
+    let rom = mmc3_rom(true);
+    let split = config(&format!(
+        r#"{{"options": {{{FIXED_PAIR}, "split_banks": true}}}}"#
+    ));
+    let d = round_trip(&rom, &split);
+    let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(
+        names,
+        [
+            "out.asm",
+            "out_bank00.asm",
+            "out_bank01.asm",
+            "out_bank02_03.asm"
+        ]
+        .map(PathBuf::from)
+    );
+    assert_eq!(includes(d.text()), names[1..]);
+    // `.catbank` in the main file lets bank 2 continue into bank 3.
+    assert_lines(
+        &d,
+        &[
+            "",
+            "\t.include \"out_bank00.asm\"",
+            "\t.include \"out_bank01.asm\"",
+            "\t.catbank $02",
+            "\t.include \"out_bank02_03.asm\"",
+        ],
+    );
+    assert_eq!(d.text().matches(".catbank").count(), 1);
+    let pair = &d.files()[3].1;
+    assert_eq!(pair.lines().nth(1), Some("\t.bank 2"), "{pair}");
+    assert!(!pair.contains(".catbank"), "{pair}");
+    assert!(!pair.contains("\t.bank 3"), "{pair}");
+    assert!(
+        pair.contains(
+            "\tlda $0390,x\n; Bank 3 starts at $E000, inside the instruction above\n\tbeq RESET\n"
+        ),
+        "{pair}"
+    );
+    assert_tab_indented(&d);
+    assert!(
+        d.files()
+            .iter()
+            .all(|(_, text)| disasm::is_unedited_source(text))
+    );
+    assert_eq!(
+        disasm::bank_pair_path(Path::new("a/x.asm"), 0x1e),
+        Path::new("a/x_bank1E_1F.asm")
+    );
+    // Without the option, each bank has its file.
+    let d = round_trip(&rom, &config(r#"{"options": {"split_banks": true}}"#));
+    let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(
+        names[3..],
+        ["out_bank02.asm", "out_bank03.asm"].map(PathBuf::from)
+    );
+    assert!(!d.text().contains(".catbank"), "{}", d.text());
+    // Between whole instructions, bank 3 starts with `.bank` and `.org`.
+    let d = round_trip(&mmc3_rom(false), &split);
+    let pair = &d.files()[3].1;
+    assert!(
+        pair.contains("\tnop\n\n\t.bank 3\n\t.org $E000\n\tbeq RESET\n"),
+        "{pair}"
+    );
+    assert_lines(&d, &["\t.catbank $02", "\t.include \"out_bank02_03.asm\""]);
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_needs_a_mapper_4_rom_and_agreeing_banks() {
+    let rom = mmc3_rom(true);
+    let fails = |rom: &[u8], json: &str, message: &str| {
+        let e = disasm::disassemble(rom, None, &config(json), Path::new("out.asm"), &NEVER)
+            .err()
+            .unwrap_or_else(|| panic!("{json} should fail"));
+        let messages: Vec<&str> = e.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages, [message], "{json}");
+    };
+    let option = format!(r#"{{"options": {{{FIXED_PAIR}}}}}"#);
+    fails(
+        &nrom("Reset:\nNmi:\n  rti"),
+        &option,
+        "options.mapper4_fixed_prg_16k applies only to mapper 4 (MMC3); the ROM uses mapper 0",
+    );
+    fails(
+        &rom[16..],
+        &option,
+        "options.mapper4_fixed_prg_16k applies only to iNES ROMs of mapper 4 (MMC3)",
+    );
+    let banks = |layout: &str| format!(r#"{{"banks": [{layout}], "options": {{{FIXED_PAIR}}}}}"#);
+    fails(
+        &rom,
+        &banks(r#"{"bank": 2, "org": "$8000"}"#),
+        "banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000",
+    );
+    fails(
+        &rom,
+        &banks(r#"{"bank": 3, "org": "$A000"}"#),
+        "banks gives bank 3 org $A000, but options.mapper4_fixed_prg_16k places it at $E000",
+    );
+    // The windows the option sets may also be given.
+    round_trip(
+        &rom,
+        &config(&banks(
+            r#"{"bank": 2, "org": "$C000"}, {"bank": 3, "org": "$E000"}"#,
+        )),
+    );
+    // 16 KiB of PRG ROM in the header, but less in the file.
+    let mut short = rom[..16].to_vec();
+    short[4] = 1;
+    short.extend(&rom[16..16 + 8192]);
+    fails(
+        &short,
+        &option,
+        "options.mapper4_fixed_prg_16k needs at least two 8 KiB PRG banks; the ROM has 1",
+    );
+    short.extend(&rom[16..116]);
+    fails(
+        &short,
+        &option,
+        "options.mapper4_fixed_prg_16k needs whole 8 KiB PRG banks; bank 1 has 100 bytes",
+    );
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_rom_hacks_continue_across_the_boundary() {
+    let base = mmc3_rom(true);
+    // The high byte of `lda $0390,x` ($E000) and free space at $E100.
+    let mut hack = base.clone();
+    hack[16 + 3 * 8192] = 0x04;
+    hack[16 + 3 * 8192 + 0x100] = 0xea;
+    let json = format!(r#"{{"options": {{{FIXED_PAIR}, "split_banks": true}}}}"#);
+    let d = patch_round_trip(&hack, &base, &json);
+    // The range of the changed byte is widened to the whole instruction,
+    // in both banks.
+    let diffs: Vec<_> = d
+        .diffs()
+        .iter()
+        .map(|d| (d.bank, d.start, d.end, d.changed_bytes))
+        .collect();
+    assert_eq!(
+        diffs,
+        [
+            (2, Address(0xdffe), Address(0xdfff), 0),
+            (3, Address(0xe000), Address(0xe000), 1),
+            (3, Address(0xe100), Address(0xe100), 1)
+        ]
+    );
+    let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(names, ["out.asm", "out_bank02_03.asm"].map(PathBuf::from));
+    assert_eq!(includes(d.text()), names[1..]);
+    assert_lines(
+        &d,
+        &[
+            "\t.incbin \"base.nes\", 16, 32768",
+            "",
+            "\t.catbank $02",
+            "\t.include \"out_bank02_03.asm\"",
+        ],
+    );
+    assert_eq!(d.text().matches(".incbin").count(), 1);
+    assert_tab_indented(&d);
+    let pair: Vec<&str> = d.files()[1].1.lines().skip(1).collect();
+    assert_eq!(
+        pair,
+        [
+            "\t.bank 2",
+            "\t.org $DFFE",
+            "\tlda $0490,x",
+            "; Bank 3 starts at $E000, inside the instruction above",
+            "",
+            "\t.bank 3",
+            "\t.org $E100",
+            "\t.db $EA",
+        ]
+    );
+    // As one file.
+    let d = patch_round_trip(&hack, &base, &format!(r#"{{"options": {{{FIXED_PAIR}}}}}"#));
+    assert_eq!(d.files().len(), 1);
+    assert_lines(
+        &d,
+        &[
+            "\t.incbin \"base.nes\", 16, 32768",
+            "",
+            "\t.catbank $02",
+            "\t.bank 2",
+            "\t.org $DFFE",
+            "\tlda $0490,x",
+            "; Bank 3 starts at $E000, inside the instruction above",
+            "",
+            "\t.bank 3",
+            "\t.org $E100",
+        ],
+    );
+    // Changes in the last bank only still go to the file of both.
+    let mut hack = base.clone();
+    hack[16 + 3 * 8192 + 0x100] = 0xea;
+    let d = patch_round_trip(&hack, &base, &json);
+    let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(names, ["out.asm", "out_bank02_03.asm"].map(PathBuf::from));
+    assert_eq!(d.files()[1].1.lines().nth(1), Some("\t.bank 3"));
+    assert_lines(&d, &["\t.catbank $02", "\t.include \"out_bank02_03.asm\""]);
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_random_code_round_trips() {
+    let mut rng = Lcg(0x4d4d43);
+    let code = r#""regions": [{"bank": 2, "start": "$C000", "length": 8192, "type": "code"},
+                              {"bank": 3, "start": "$E000", "length": 8192, "type": "code"}]"#;
+    let mut crossing = 0;
+    for _ in 0..4 {
+        let mut rom = vec![
+            b'N', b'E', b'S', 0x1a, 2, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        rom.extend((0..32768).map(|_| rng.next()));
+        for split in [false, true] {
+            let json =
+                format!(r#"{{{code}, "options": {{{FIXED_PAIR}, "split_banks": {split}}}}}"#);
+            let d = round_trip(&rom, &config(&json));
+            crossing += d
+                .view(Some(2), 0xdffd, 0xdfff)
+                .iter()
+                .filter(|l| l.address.unwrap().0 + l.size as u32 > 0xe000)
+                .count();
+            // A hack that changes bytes around the boundary.
+            let mut hack = rom.clone();
+            for offset in [0x1ffd, 0x1fff, 0x2000, 0x2002] {
+                hack[16 + 2 * 8192 + offset] ^= rng.next() | 1;
+            }
+            patch_round_trip(&hack, &rom, &json);
+        }
+    }
+    assert!(crossing > 0, "no instruction crossed $DFFF/$E000");
+}
+
+#[test]
+fn rom_hacks_with_many_changed_chr_banks_keep_a_small_main_file() {
+    // All 32 CHR banks changed: their data stays in the CHR file, so the
+    // main file is far below the 1 MiB the assembler reads.
+    let mut base = vec![b'N', b'E', b'S', 0x1a, 1, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    base.extend(vec![0; 16384 + 32 * 8192]);
+    let mut hack = base.clone();
+    for (i, b) in hack[16 + 16384..].iter_mut().enumerate() {
+        *b = if i % 2 == 0 { 0x55 } else { 0xaa };
+    }
+    let d = patch_round_trip(&hack, &base, r#"{"options": {"split_banks": true}}"#);
+    assert_eq!(d.files().len(), 1);
+    assert!(d.text().len() < 4096, "{}", d.text().len());
+    assert_eq!(d.text().matches("\t.incbin \"out.chr\", ").count(), 32);
+    assert_lines(
+        &d,
+        &[
+            "\t.bank 2",
+            "\t.org $0000",
+            "\t.incbin \"out.chr\", 0, 8192",
+            "\t.bank 33",
+            "\t.org $0000",
+            "\t.incbin \"out.chr\", 253952, 8192",
+        ],
+    );
+    assert_eq!(d.chr_file().unwrap().1, &hack[16 + 16384..]);
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_inline_arguments_cross_the_boundary() {
+    // `jsr Print` at $DFFC is followed by 4 bytes of arguments, $DFFF-$E002.
+    let rom = assemble(concat!(
+        "  .inesprg 2\n  .inesmap 4\n  .bank 2\n  .org $DFF8\n",
+        "Reset:\n  sei\n  cld\n  ldx #$00\n  jsr Print\n  .db 1\n",
+        "  .bank 3\n  .org $E000\n  .db 2, 3, 4\nLoop:\n  jmp Loop\nPrint:\n  rts\nNmi:\n  rti\n",
+        "  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    ));
+    let entry = r#""entry_points": [{"address": "$E006", "name": "Print", "inline_bytes": 4}]"#;
+    let d = round_trip(&rom, &config(&format!("{{{entry}}}")));
+    assert_eq!(
+        issues(&d, IssueKind::CodeDataConflict),
+        ["$DFFC The 4 inline bytes after the JSR at $DFFC overlap other code or data"]
+    );
+    let d = round_trip(
+        &rom,
+        &config(&format!(r#"{{{entry}, "options": {{{FIXED_PAIR}}}}}"#)),
+    );
+    assert!(issues(&d, IssueKind::CodeDataConflict).is_empty());
+    assert_lines(
+        &d,
+        &[
+            "\tjsr Print",
+            "\t.db $01",
+            "\t.bank 3",
+            "\t.org $E000",
+            "\t.db $02, $03, $04",
+            "L_E003:",
+            "\tjmp L_E003",
+        ],
+    );
+    // The code after the arguments belongs to the routine.
+    let routines = d.routines();
+    let reset = routines.iter().find(|r| r.name == "RESET").unwrap();
+    assert_eq!(reset.size, 10);
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_resolves_within_the_pair_unless_references_say() {
+    // Bank 1 is also at $E000, so `jsr Init` ($E010) at $DFF3 could go to
+    // bank 1 or 3.
+    let rom = mmc3_rom(true);
+    let banks = r#""banks": [{"bank": 1, "org": "$E000"}]"#;
+    let d = round_trip(&rom, &config(&format!("{{{banks}}}")));
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        ["$DFF3 $E010 is held by banks 1, 3; add a references entry with target_bank"]
+    );
+    // With the option, bank 2 sees bank 3 first.
+    let fixed = format!(r#"{{{banks}, "options": {{{FIXED_PAIR}}}}}"#);
+    let d = round_trip(&rom, &config(&fixed));
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(&d, &["RESET:", "\tsei", "\tldx #$00", "\tjsr sub_03_E010"]);
+    // references still chooses another bank.
+    let chosen = fixed.replace(
+        "\"options\"",
+        r#""references": [{"bank": 2, "address": "$DFF3", "target_bank": 1}], "options""#,
+    );
+    let d = round_trip(&rom, &config(&chosen));
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(&d, &["RESET:", "\tsei", "\tldx #$00", "\tjsr sub_01_E010"]);
 }

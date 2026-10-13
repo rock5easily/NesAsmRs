@@ -98,6 +98,8 @@ fn protocol_errors_identity_and_schemas() {
     let schemas = listed["result"]["tools"].to_string();
     assert!(schemas.contains("\"maximum\":3"), "{schemas}");
     assert!(schemas.contains("instructions"), "{schemas}");
+    // The annotation options of disassemble and export_disassembly.
+    assert!(schemas.contains("mapper4_fixed_prg_16k"), "{schemas}");
 }
 
 #[test]

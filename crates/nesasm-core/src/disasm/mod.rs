@@ -289,6 +289,14 @@ pub fn bank_path(source: &Path, bank: usize) -> PathBuf {
     source.with_file_name(format!("{stem}_bank{bank:02X}.asm"))
 }
 
+/// The file of the fixed pair of `options.mapper4_fixed_prg_16k`, whose
+/// first bank is `first`, next to a source path split by bank:
+/// `<stem>_bankXX_YY.asm` (`_bank1E_1F`).
+pub fn bank_pair_path(source: &Path, first: usize) -> PathBuf {
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    source.with_file_name(format!("{stem}_bank{first:02X}_{:02X}.asm", first + 1))
+}
+
 fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(DiagnosticCode::Disasm, message, SourceLocation::default())
 }
@@ -321,6 +329,13 @@ pub fn disassemble(
                 path.display()
             ))]);
         }
+    }
+    // A ROM hack includes its changed CHR banks from the CHR file, which
+    // CHR editors change; `.db` lines would be edited rarely.
+    if config.base.is_some() && config.options.chr == ChrMode::Db {
+        return Err(vec![error(
+            "options.chr \"db\" does not apply with base: changed CHR banks are included from the CHR file",
+        )]);
     }
     let mut analysis = Analysis::run(rom_file, config, cancel).map_err(errors)?;
     let patches = match (base_file, &config.base) {
