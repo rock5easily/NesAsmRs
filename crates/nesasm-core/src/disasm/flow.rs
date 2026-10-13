@@ -78,6 +78,11 @@ impl Sym {
     }
 }
 
+/// The number of distinct lost ranges of two states.
+fn lost_count(a: &[(u16, u16)], b: &[(u16, u16)]) -> usize {
+    a.len() + b.iter().filter(|r| !a.contains(r)).count()
+}
+
 fn meet_option(a: Option<Sym>, b: Option<Sym>) -> Option<Sym> {
     if a == b { a } else { Some(Sym::Unknown) }
 }
@@ -112,6 +117,10 @@ pub(crate) struct State {
     pub windows: [Option<Sym>; 2],
     /// The return address was kept: stored or pushed again.
     pub return_used: bool,
+    /// The code wrote the bank of a window to the mapper itself (not
+    /// through a call): code in a switched bank does not assume its own
+    /// bank is still there.
+    pub switched: [bool; 2],
 }
 
 /// What an instruction did that the analysis reports.
@@ -282,6 +291,8 @@ impl State {
             // Not written is unknown too.
             memory.retain(|(_, v)| *v != Sym::Unknown);
         }
+        // Values dropped are unknown, not the ones at the start.
+        let overflow = memory.len() > MAX_MEMORY || lost_count(&self.lost, &other.lost) > MAX_STACK;
         if memory.len() > MAX_MEMORY {
             memory.drain(..memory.len() - MAX_MEMORY);
         }
@@ -305,10 +316,7 @@ impl State {
             } else {
                 None
             },
-            entry_memory: self.entry_memory
-                && other.entry_memory
-                && memory.len() <= MAX_MEMORY
-                && lost.len() <= MAX_STACK,
+            entry_memory: self.entry_memory && other.entry_memory && !overflow,
             memory,
             lost: if lost.len() <= MAX_STACK {
                 lost
@@ -329,7 +337,27 @@ impl State {
             select: meet_option(self.select, other.select),
             windows: [0, 1].map(|w| meet_option(self.windows[w], other.windows[w])),
             return_used: self.return_used || other.return_used,
+            switched: [0, 1].map(|w| self.switched[w] || other.switched[w]),
         }
+    }
+
+    /// The registers after a call whose effects are unknown.
+    fn forget_registers(&mut self) {
+        self.a = Sym::Unknown;
+        self.x = Sym::Unknown;
+        self.y = Sym::Unknown;
+        self.carry = None;
+    }
+
+    /// Like [`Self::apply`], but keeping what the call does not know.
+    fn apply_hopeful(&mut self, summary: &Summary) {
+        let mut known = summary.clone();
+        known.windows = summary.windows.map(|w| w.filter(|v| *v != Sym::Unknown));
+        known.select = summary.select.filter(|v| *v != Sym::Unknown);
+        known.forgets_memory = false;
+        known.lost.clear();
+        known.changed.clear();
+        self.apply(&known);
     }
 
     /// After a call whose effects are unknown.
@@ -418,10 +446,7 @@ impl State {
             Mode::Abs if tracked(address) => state.read(address),
             Mode::Abs => rom_byte(address).map_or(Sym::Unknown, Sym::Const),
             // Through a pointer holding the return address.
-            Mode::Zi | Mode::Zix | Mode::Ziy
-                if state.read(address).is_return()
-                    || state.read((address + 1) & 0xff).is_return() =>
-            {
+            Mode::Zi | Mode::Zix | Mode::Ziy if state.pointer_is_return(insn) => {
                 Sym::Input(Input::AfterCall, 0)
             }
             _ => Sym::Unknown,
@@ -536,10 +561,16 @@ impl State {
             Mode::Zpy | Mode::Ay => Some(self.y),
             _ => None,
         };
+        // A pointer through which the instruction writes, when known.
+        let pointer = self.pointer(insn).and_then(|p| self.word(p)).map(u32::from);
         let address = match (insn.mode, index.and_then(Sym::constant)) {
             (Mode::Zp | Mode::Abs, _) => Some(base),
             (Mode::Zpx | Mode::Zpy, Some(i)) => Some((base + u32::from(i)) & 0xff),
             (Mode::Ax | Mode::Ay, Some(i)) => Some((base + u32::from(i)) & 0xffff),
+            (Mode::Zi | Mode::Zix, _) => pointer,
+            (Mode::Ziy, _) => pointer
+                .zip(self.y.constant())
+                .map(|(p, y)| (p + u32::from(y)) & 0xffff),
             _ => None,
         };
         match (address, insn.mode) {
@@ -556,19 +587,56 @@ impl State {
             }
             (Some(_), _) => {}
             (None, Mode::Zpx | Mode::Zpy) => self.clobber(0, 0xff),
-            (None, Mode::Ax | Mode::Ay) => {
-                if base < 0x8000 {
-                    self.clobber(base, base + 0xff);
+            (None, Mode::Ax | Mode::Ay | Mode::Ziy)
+                if insn.mode != Mode::Ziy || pointer.is_some() =>
+            {
+                // From the base (or the pointer) up to 255 bytes on, wrapping
+                // around $FFFF.
+                let low = if insn.mode == Mode::Ziy {
+                    pointer.unwrap_or(base)
+                } else {
+                    base
+                };
+                let high = low + 0xff;
+                if low < 0x8000 {
+                    self.clobber(low, high.min(0x7fff));
                 }
-                if mmc3 && base + 0xff >= 0x8000 {
+                if high > 0xffff {
+                    self.clobber(0, high & 0xffff);
+                }
+                if mmc3 && high >= 0x8000 && low <= 0x9fff {
                     effect.mapper = Some(self.mmc3_write(None, value));
                 }
             }
-            // Through a pointer: any RAM (writes to the mapper this way are
-            // not followed).
-            _ => self.clobber_all(),
+            // Through a pointer that is not known: any RAM, and the mapper.
+            _ => {
+                self.clobber_all();
+                if mmc3 {
+                    self.select = Some(Sym::Unknown);
+                    self.windows = [Some(Sym::Unknown); 2];
+                }
+            }
         }
         effect
+    }
+
+    /// The zero page pointer an indirect instruction uses, when known.
+    fn pointer(&self, insn: Insn) -> Option<u32> {
+        match insn.mode {
+            Mode::Zi | Mode::Ziy => Some(insn.value & 0xff),
+            Mode::Zix => self
+                .x
+                .constant()
+                .map(|x| (insn.value + u32::from(x)) & 0xff),
+            _ => None,
+        }
+    }
+
+    /// Whether the pointer an indirect instruction uses holds the return
+    /// address (both bytes pulled from below the routine's pushes).
+    fn pointer_is_return(&self, insn: Insn) -> bool {
+        self.pointer(insn)
+            .is_some_and(|p| self.read(p).is_return() && self.read((p + 1) & 0xff).is_return())
     }
 
     /// An MMC3 write to $8000-$9FFF (at `address` if it is known): bank
@@ -578,6 +646,7 @@ impl State {
         let Some(address) = address else {
             self.select = Some(Sym::Unknown);
             self.windows = [Some(Sym::Unknown); 2];
+            self.switched = [true; 2];
             return "an indexed write to the mapper".into();
         };
         let register = match (address >> 13, address % 2) {
@@ -602,6 +671,7 @@ impl State {
             // $8000: the bank there is no longer known.
             if value.constant().is_none_or(|v| v & 0x40 != 0) {
                 self.windows[0] = Some(Sym::Unknown);
+                self.switched[0] = true;
             }
             return match value.constant() {
                 Some(v) if v & 7 >= 6 && v & 0x40 != 0 => format!(
@@ -620,19 +690,23 @@ impl State {
         match self.select.and_then(Sym::constant) {
             Some(s) if s & 7 == 6 && s & 0x40 == 0 => {
                 self.windows[0] = Some(value);
+                self.switched[0] = true;
                 format!("MMC3 R6 = {}: the PRG bank at $8000", shown(value))
             }
             Some(s) if s & 7 == 7 => {
                 self.windows[1] = Some(value);
+                self.switched[1] = true;
                 format!("MMC3 R7 = {}: the PRG bank at $A000", shown(value))
             }
             Some(s) if s & 7 == 6 => {
                 self.windows[0] = Some(Sym::Unknown);
+                self.switched[0] = true;
                 format!("MMC3 R6 = {} in PRG mode 1, not followed", shown(value))
             }
             Some(s) => format!("MMC3 R{} = {} (CHR)", s & 7, shown(value)),
             None => {
                 self.windows = [Some(Sym::Unknown); 2];
+                self.switched = [true; 2];
                 "MMC3 bank data after an unknown bank select".into()
             }
         }
@@ -664,6 +738,8 @@ pub(crate) struct Summary {
     forgets_memory: bool,
     /// Some path returns to the caller.
     pub returns: bool,
+    /// A path that can be followed returns to the caller.
+    pub returns_known: bool,
     /// Some path keeps its return address: it reads arguments after the
     /// JSR, or a jump table there.
     pub takes_return: bool,
@@ -681,7 +757,10 @@ impl Summary {
     fn switching(banks: [Option<u16>; 2]) -> Self {
         Self {
             windows: banks.map(|b| b.map(|a| Sym::Input(Input::Mem(a), 0))),
+            // The routine leaves another register selected.
+            select: Some(Sym::Unknown),
             returns: true,
+            returns_known: true,
             ..Self::default()
         }
     }
@@ -714,6 +793,8 @@ pub(crate) trait Code {
     fn switches(&self, loc: Loc) -> Option<[Option<u16>; 2]>;
     /// The window ($8000 = 0, $A000 = 1) of a bank that is switched.
     fn window_of(&self, bank: usize) -> Option<usize>;
+    /// The PRG bank a mapper bank number selects.
+    fn bank_number(&self, bank: u8) -> usize;
     fn mmc3(&self) -> bool;
 }
 
@@ -746,9 +827,20 @@ impl Summaries {
             return Arc::new(Summary::unknown());
         }
         self.active.push(key);
-        let summary = self
-            .explore(code, entry, windows)
+        let mut summary = self
+            .explore(code, entry, windows, false)
             .unwrap_or_else(|| self.fallback(code, key));
+        // Advice only: the banks the routine switches in if the code it
+        // cannot follow changed nothing.
+        if summary.windows.contains(&Some(Sym::Unknown))
+            && let Some(hopeful) = self.explore(code, entry, windows, true)
+        {
+            let hint = hopeful.windows.map(|w| match w {
+                Some(Sym::Input(Input::Mem(a), 0)) => Some(a),
+                _ => None,
+            });
+            summary.hint = (hint != [None; 2]).then_some(hint);
+        }
         self.active.pop();
         let summary = Arc::new(summary);
         self.memo.insert(key, summary.clone());
@@ -756,11 +848,14 @@ impl Summaries {
     }
 
     /// Follows every path of the routine; `None` if there are too many.
+    /// `hopeful`: as if calls and jumps that cannot be followed changed
+    /// nothing but the registers (for advice only).
     fn explore(
         &mut self,
         code: &impl Code,
         entry: Loc,
         windows: [Option<u8>; 2],
+        hopeful: bool,
     ) -> Option<Summary> {
         let current = |state: &State| -> [Option<u8>; 2] {
             [0, 1].map(|w| match state.windows[w] {
@@ -772,15 +867,17 @@ impl Summaries {
         let mut exits: Vec<State> = Vec::new();
         let mut unknown_exit = false;
         let mut summary = Summary::default();
-        let mut paths = vec![(entry, State::routine([None; 2]), HashMap::new())];
-        while let Some((mut loc, mut state, mut seen)) = paths.pop() {
+        // What is known at each instruction reached: paths that join (or
+        // loop back) are walked again knowing only what they share, until
+        // they know nothing new.
+        let mut seen: HashMap<Loc, State> = HashMap::new();
+        let mut paths = vec![(entry, State::routine([None; 2]))];
+        while let Some((mut loc, mut state)) = paths.pop() {
             loop {
                 steps += 1;
                 if steps > MAX_SUMMARY_STEPS {
                     return None;
                 }
-                // A loop: walked again knowing only what the passes share,
-                // until another pass knows nothing new.
                 if let Some(before) = seen.get(&loc) {
                     let met = state.meet(before);
                     if met == *before {
@@ -789,6 +886,17 @@ impl Summaries {
                     state = met;
                 }
                 seen.insert(loc, state.clone());
+                // Code that switched another bank (or an unknown one) into
+                // the window it runs in goes on elsewhere.
+                if let Some(w) = code.window_of(loc.bank) {
+                    let bank = current(&state)[w];
+                    if bank.is_some_and(|b| code.bank_number(b) != loc.bank)
+                        || (state.switched[w] && bank.is_none())
+                    {
+                        unknown_exit = true;
+                        break;
+                    }
+                }
                 // Code that goes on into an annotated routine returns as it does.
                 if loc != entry
                     && let Some(banks) = code.switches(loc)
@@ -818,10 +926,13 @@ impl Summaries {
                                     state.forget();
                                 } else if callee.takes_return || !callee.returns {
                                     break;
+                                } else if hopeful {
+                                    state.apply_hopeful(&callee);
                                 } else {
                                     state.apply(&callee);
                                 }
                             }
+                            None if hopeful => state.forget_registers(),
                             None => state.forget(),
                         }
                         advance += annotated.map_or(0, |(_, inline)| inline);
@@ -868,7 +979,7 @@ impl Summaries {
                         break;
                     }
                     (_, Mode::Rel) => match code.target(loc, insn.value, current(&state)) {
-                        Some(target) => paths.push((target, state.clone(), seen.clone())),
+                        Some(target) => paths.push((target, state.clone())),
                         None => unknown_exit = true,
                     },
                     _ => {
@@ -886,27 +997,12 @@ impl Summaries {
             }
         }
         summary.returns = unknown_exit || !exits.is_empty();
-        // The RAM each window is switched from on the paths that know it.
-        let hint = [0, 1].map(|w| {
-            let mut found = None;
-            for exit in &exits {
-                match exit.windows[w] {
-                    Some(Sym::Input(Input::Mem(a), 0)) if found.is_none_or(|f| f == a) => {
-                        found = Some(a);
-                    }
-                    Some(Sym::Unknown) => {}
-                    _ => return None,
-                }
-            }
-            found
-        });
-        let hint = (hint != [None; 2]).then_some(hint);
-        if unknown_exit {
+        summary.returns_known = !exits.is_empty();
+        if unknown_exit && !hopeful {
             let unknown = Summary::unknown();
             summary.windows = unknown.windows;
             summary.select = unknown.select;
             summary.forgets_memory = true;
-            summary.hint = hint;
             return Some(summary);
         }
         let Some(first) = exits.first() else {
@@ -920,9 +1016,6 @@ impl Summaries {
         summary.select = exits
             .iter()
             .fold(first.select, |acc, e| meet_option(acc, e.select));
-        if summary.windows.contains(&Some(Sym::Unknown)) {
-            summary.hint = hint;
-        }
         summary.forgets_memory = exits.iter().any(|e| !e.entry_memory);
         for exit in &exits {
             for range in &exit.lost {
@@ -1003,7 +1096,8 @@ impl Summaries {
                     | Mnemonic::Ror
             );
             let absolute = matches!(insn.mode, Mode::Abs | Mode::Ax | Mode::Ay);
-            if writes && absolute && insn.value >= 0x8000 {
+            let indirect = matches!(insn.mode, Mode::Zi | Mode::Zix | Mode::Ziy);
+            if writes && ((absolute && insn.value + 0xff >= 0x8000) || indirect) {
                 free = false;
                 break;
             }

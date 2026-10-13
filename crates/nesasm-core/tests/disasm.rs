@@ -2429,23 +2429,38 @@ fn routines_taking_their_return_address_stop_the_trace() {
 
 #[test]
 fn pushed_return_addresses_and_rts_jumps_are_followed() {
-    // A return address pushed before an indirect jump (the routine returns
-    // there), and an RTS to a pushed constant.
-    let rom = nrom(concat!(
+    // A return address pushed before a jump through a pointer that is not
+    // known: whether the targets return is not known either, so the issue
+    // suggests it as an entry point.
+    let code = concat!(
         "Reset:\n  lda #HIGH(Back-1)\n  pha\n  lda #LOW(Back-1)\n  pha\n  jmp [$0000]\n",
         "Back:\n  lda #HIGH(Next-1)\n  pha\n  lda #LOW(Next-1)\n  pha\n  rts\n",
         "Next:\n  jmp Next\nNmi:\n  rti\n",
-    ));
-    let d = round_trip(&rom, &DisasmConfig::default());
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert_eq!(
+        issues(&d, IssueKind::IndirectJump),
+        [
+            "$E006 Indirect JMP [$0000] at $E006; describe its targets with a pointers region (code_targets) or entry_points (it pushes the return address $E009 first: if the targets return, give it in entry_points)"
+        ]
+    );
+    assert!(!d.text().contains("L_E009:"), "{}", d.text());
+    // Through a known pointer to a routine that returns, and an RTS to a
+    // pushed constant.
+    let code = code.replace(
+        "Reset:\n",
+        "Reset:\n  lda #LOW(Done)\n  sta <$00\n  lda #HIGH(Done)\n  sta <$01\n",
+    ) + "Done:\n  rts\n";
+    let d = round_trip(&nrom(&code), &DisasmConfig::default());
     assert_lines(
         &d,
         &[
             "\tjmp [$0000]",
-            "L_E009:",
+            "L_E011:",
             "\tlda #$E0",
             "\trts",
-            "L_E010:",
-            "\tjmp L_E010",
+            "L_E018:",
+            "\tjmp L_E018",
         ],
     );
     // An RTS to an address pushed from tables: how to describe them.
@@ -2825,4 +2840,143 @@ fn values_pushed_before_a_loop_are_kept_through_it() {
         d.issues()
     );
     assert_lines(&d, &["sub_02_8000:", "\tjsr sub_E00D", "\tjsr sub_02_8000"]);
+}
+
+#[test]
+fn summaries_of_routines_with_many_branches_stay_small() {
+    // 32 values stored, then 4000 branches: the summary keeps one state per
+    // instruction rather than the history of every path.
+    let mut code = String::from("Reset:\n  jsr Many\nHalt:\n  jmp Halt\nMany:\n");
+    for i in 0..32 {
+        code.push_str(&format!("  sta <${:02X}\n", 0x20 + i));
+    }
+    for _ in 0..2000 {
+        code.push_str("  bne *+2\n");
+    }
+    code.push_str("  rts\nNmi:\n  rti\n");
+    let started = std::time::Instant::now();
+    round_trip(&nrom(&code), &DisasmConfig::default());
+    assert!(started.elapsed().as_secs() < 60);
+}
+
+#[test]
+fn summaries_stop_where_code_switches_its_own_bank_out() {
+    // Sel in bank 0 switches bank 2 in at $8000 and goes on there (an RTS
+    // in bank 2); the bytes after it in bank 0 would select bank 4.
+    let banks = concat!(
+        "  .bank 0\n  .org $8000\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+        "  .db $A9, $06, $8D, $00, $80, $A9, $04, $8D, $01, $80, $60\n",
+        "  .bank 2\n  .org $8000\n  .db $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA, $EA\n  rts\n",
+        "  .bank 4\n  .org $8000\n  lda #$04\n  rts\n",
+    );
+    let reset = "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jsr $8000\n";
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $04, $60"), "{}", d.text());
+    assert!(
+        d.text()
+            .contains("\t.db $A9, $06, $8D, $00, $80, $A9, $04, $8D"),
+        "{}",
+        d.text()
+    );
+    // An unknown bank written into its own window stops the trace too.
+    let banks = banks.replace("  lda #$02\n  sta $8001\n", "  lda $0300\n  sta $8001\n");
+    let d = round_trip(&switching_rom(&banks, reset), &DisasmConfig::default());
+    assert!(
+        d.text()
+            .contains("\t.db $A9, $06, $8D, $00, $80, $A9, $04, $8D"),
+        "{}",
+        d.text()
+    );
+}
+
+#[test]
+fn annotated_bank_switches_leave_the_bank_select_unknown() {
+    // Switch (annotated) leaves R7 selected: the write to $8001 after it
+    // does not switch bank 4 in at $8000.
+    let reset = concat!(
+        "  lda #$06\n  sta $8000\n  lda #$02\n  sta <$F5\n  jsr Switch\n",
+        "  lda #$04\n  sta $8001\n  jsr $8000\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &config(r#"{"entry_points": [{"address": "$E01D", "switch_banks": ["$F5", "$F6"]}]}"#),
+    );
+    assert_unresolved_8000(&d);
+}
+
+#[test]
+fn writes_through_pointers_may_switch_banks() {
+    // R6 = 2, then a write through a pointer: unknown, or $8001.
+    let reset = |pointer: &str| {
+        format!(
+            "  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n{pointer}  ldy #$00\n  lda #$04\n  sta [$10],y\n  jsr $8000\n"
+        )
+    };
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, &reset("")),
+        &DisasmConfig::default(),
+    );
+    assert_unresolved_8000(&d);
+    let d = round_trip(
+        &switching_rom(
+            SWITCHED_BANKS,
+            &reset("  lda #$01\n  sta <$10\n  lda #$80\n  sta <$11\n"),
+        ),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["sub_04_8000:", "\tjsr sub_04_8000"]);
+}
+
+#[test]
+fn indexed_writes_wrap_around_ffff() {
+    // `sta $FFFF,x` with an unknown X may write $0000-$00FE.
+    let code = concat!(
+        "Reset:\n  lda #$00\n  sta <$00\n  lda #$E1\n  sta <$01\n",
+        "  ldx $0300\n  lda #$E2\n  sta $FFFF,x\n  jmp [$0000]\nNmi:\n  rti\n",
+        "  .org $E100\n  lda #$07\n  rts\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn only_pointers_holding_the_return_address_read_the_bytes_after_a_jsr() {
+    // The return address is in $20/$21, but [$20,x] with X = 4 reads
+    // through $24/$25: no jump table after the JSR.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Args\n  .db $10, $E1\n  jmp Reset\n",
+        "Args:\n  pla\n  sta <$20\n  pla\n  sta <$21\n  ldx #$04\n  lda [$20,x]\n  sta <$10\n",
+        "  lda [$20,x]\n  sta <$11\n  jmp [$0010]\nNmi:\n  rti\n",
+        "  .org $E110\n  lda #$07\n  rts\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn stored_pointers_into_switched_banks_are_not_followed() {
+    // The jump through $10 comes later, when another bank may be at $8000.
+    let banks = "  .bank 0\n  .org $8000\n  lda #$00\n  rts\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n",
+        "  lda #$00\n  sta <$10\n  lda #$80\n  sta <$11\n  jsr Run\n  jmp Halt\n",
+        "Run:\n  jmp [$0010]\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert!(d.text().contains("\t.db $A9, $00, $60"), "{}", d.text());
+}
+
+#[test]
+fn pushed_addresses_need_a_routine_that_returns() {
+    // Wrapper jumps through a pointer to Hang: it is not known to return.
+    let code = concat!(
+        "Reset:\n  lda #LOW(Hang)\n  sta <$10\n  lda #HIGH(Hang)\n  sta <$11\n",
+        "  lda #$E1\n  pha\n  lda #$0F\n  pha\n  jmp Wrapper\n",
+        "Wrapper:\n  jmp [$0010]\nHang:\n  jmp Hang\nNmi:\n  rti\n",
+        "  .org $E110\n  lda #$07\n  rts\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
 }

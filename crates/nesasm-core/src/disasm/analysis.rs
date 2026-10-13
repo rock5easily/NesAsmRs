@@ -1307,7 +1307,7 @@ impl Analysis {
                             let state = State::default();
                             self.reference_at(loc, insn, &state);
                             if insn.mnemonic == Mnemonic::Jmp && insn.mode != Mode::Abs {
-                                self.indirect_jump(loc, insn, &Sources::default());
+                                self.indirect_jump(loc, insn, &Sources::default(), &state);
                             }
                             insn.len
                         }
@@ -1367,23 +1367,16 @@ impl Analysis {
             }
         }
         let any = !found.is_empty();
-        for (store, vector, address, windows) in found {
+        for (store, vector, address, _) in found {
             self.followed_pointers.insert((store, vector));
-            let mut state = State::default();
-            for (w, bank) in windows.into_iter().enumerate() {
-                if let Some(bank) = bank {
-                    state.set_window(w, bank);
-                }
+            // The jump comes later, elsewhere: the banks switched in at
+            // $8000/$A000 then are not known.
+            if window_index(address).is_some() {
+                continue;
             }
-            let target = match window_index(address).and_then(|w| windows[w]) {
-                Some(bank) => match self.infer(store, address, bank) {
-                    Some(loc) => Target::Rom(loc),
-                    None => self.target_of(store, address),
-                },
-                None => self.target_of(store, address),
-            };
+            let target = self.target_of(store, address);
             if let Target::Rom(loc) = target {
-                self.queue(loc, Some(store), state);
+                self.queue(loc, Some(store), State::default());
                 self.want(loc, Want::Jump);
                 self.refs.push(Ref {
                     from: store,
@@ -1798,6 +1791,8 @@ impl Analysis {
             if let Some(w) = self.memory.window_of(loc.bank) {
                 match state.window(w) {
                     Some(bank) if self.memory.bank_number(bank) != loc.bank => return,
+                    // The code itself switched an unknown bank in there.
+                    None if state.switched[w] => return,
                     _ => state.set_window(w, loc.bank as u8),
                 }
             }
@@ -1844,13 +1839,22 @@ impl Analysis {
             let mut advance = insn.len;
             match (insn.mnemonic, insn.mode) {
                 (Mnemonic::Jmp, mode) => {
-                    // A routine jumped to returns to a pushed address: through
-                    // a pointer (a call), or a routine found to return.
-                    let returns = mode != Mode::Abs
-                        || self.flow_target(loc).is_some_and(|t| {
-                            let summary = self.summary(t, &state);
-                            summary.returns && !summary.takes_return
-                        });
+                    // A routine jumped to returns to a pushed address when a
+                    // path of it that can be followed returns.
+                    let target = if mode == Mode::Abs {
+                        self.flow_target(loc)
+                    } else {
+                        state.jump_word(insn.value).and_then(|a| {
+                            match self.target_of(loc, u32::from(a)) {
+                                Target::Rom(t) => Some(t),
+                                _ => None,
+                            }
+                        })
+                    };
+                    let returns = target.is_some_and(|t| {
+                        let summary = self.summary(t, &state);
+                        summary.returns_known && !summary.takes_return
+                    });
                     if returns {
                         self.pushed_return(loc, &state);
                     }
@@ -1859,7 +1863,7 @@ impl Analysis {
                             Some(address) => self.jump_to(loc, u32::from(address), &state),
                             None => {
                                 self.jump_vectors.insert(insn.value);
-                                self.indirect_jump(loc, insn, &sources);
+                                self.indirect_jump(loc, insn, &sources, &state);
                             }
                         }
                     }
@@ -2129,9 +2133,16 @@ impl Analysis {
     }
 
     /// An indirect JMP whose targets are not known: how to describe them.
-    fn indirect_jump(&mut self, loc: Loc, insn: Insn, sources: &Sources) {
+    fn indirect_jump(&mut self, loc: Loc, insn: Insn, sources: &Sources, state: &State) {
         let address = self.memory.address(loc);
         let vector = insn.value;
+        // A return address pushed before: where the targets return, if they do.
+        let back = state.pushed_word().map_or(String::new(), |w| {
+            format!(
+                " (it pushes the return address ${:04X} first: if the targets return, give it in entry_points)",
+                w.wrapping_add(1)
+            )
+        });
         let advice = match (sources.at(vector), sources.at(vector + 1)) {
             (Some(low), Some(high)) => self.table_advice(loc, low, high, 0),
             _ => None,
@@ -2144,7 +2155,7 @@ impl Analysis {
             IssueKind::IndirectJump,
             Some(loc),
             address,
-            format!("Indirect JMP [${vector:04X}] at ${address:04X}; {advice}"),
+            format!("Indirect JMP [${vector:04X}] at ${address:04X}; {advice}{back}"),
         );
         let end = self.memory.banks[loc.bank].end;
         if let Some(issue) = self.issues.last_mut() {
@@ -2780,6 +2791,10 @@ impl flow::Code for Analysis {
 
     fn window_of(&self, bank: usize) -> Option<usize> {
         self.memory.window_of(bank)
+    }
+
+    fn bank_number(&self, bank: u8) -> usize {
+        self.memory.bank_number(bank)
     }
 
     fn mmc3(&self) -> bool {

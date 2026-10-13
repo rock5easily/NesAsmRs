@@ -74,10 +74,14 @@ nothing is inferred from it:
   constants: loaded immediately, from RAM written on the path, or from a ROM
   byte; moved, incremented, added to. A write whose address is not known
   (indexed by an unknown register, or through a pointer) forgets the RAM it
-  may reach.
+  may reach, and one through a pointer that is not known also the banks.
+  Indexed writes wrap around $FFFF.
 - The PRG banks at $8000 and $A000. In a switched bank ($8000/$A000 window of
-  the layout), code runs with its own bank switched in; code that switches
-  another bank into its own window is not followed further. On mapper 4
+  the layout), code runs with its own bank switched in; code that writes
+  another bank, or one that is not known, into its own window is not
+  followed further. A call that leaves the bank of the caller's window
+  unknown is taken to keep it (code does not switch its own bank out
+  through a call unless the new bank is known). On mapper 4
   (MMC3), writes of known values to the bank select ($8000) and bank data
   ($8001) registers switch R6 ($8000) and R7 ($A000) in PRG mode 0; a bank
   select for PRG mode 1 or of an unknown value, and any other write to the
@@ -87,17 +91,18 @@ nothing is inferred from it:
   `banks` entry to add. A call into a switched bank runs with the caller's
   banks.
 - What a called routine does: each of its paths is followed with symbolic
-  values (up to 4096 instructions in all, calls nested 6 deep; a loop is
-  walked again knowing only what its passes share, until a pass knows nothing
-  new), giving the banks and RAM it sets in terms of the caller's registers
+  values (up to 4096 instructions in all, calls nested 6 deep; paths that
+  join or loop back are walked again knowing only what they share, until
+  they know nothing new), giving the banks and RAM it sets in terms of the caller's registers
   and RAM. A routine that switches the bank in A, or the banks a game keeps in
   RAM, is recognised from its code; the caller then knows the banks after the
   call. A routine with too many paths keeps the banks only if no code it
   reaches writes to $8000-$FFFF or jumps where the scan cannot follow. A path
   through code that cannot be followed (an indirect jump, a routine that is
-  not known) makes the banks after the call unknown. If the other paths all
-  switch in banks held in RAM, `bank_switch` names the routine and the
-  `switch_banks` to give it in `entry_points` if it always does.
+  not known) makes the banks after the call unknown. If the routine would
+  switch in banks held in RAM were that code to change nothing,
+  `bank_switch` names the routine and the `switch_banks` to give it in
+  `entry_points` if it always does.
 - Where paths that know different values join, the code is traced again
   knowing only what they share (up to 16 times), so a reference never uses a
   bank that only one of the paths switched in.
@@ -109,12 +114,14 @@ From these values it also follows:
   code stores into the pointer of an indirect JMP elsewhere (thread entries,
   interrupt handlers that chain): two stores in a row into its two bytes, still
   unchanged when the path jumps, calls or branches, unless code also reads
-  data through that pointer (`lda [ptr],y`). The `indirect_jump` issue lists
-  where they were stored.
+  data through that pointer (`lda [ptr],y`) or the address is in
+  $8000-$BFFF (the bank there at the jump is not known). The `indirect_jump`
+  issue lists where they were stored.
 - A return address pushed before a jump (`pha` of a constant address-1): the
-  code there runs when the routine returns, if the jump goes through a pointer
-  (a call through a table) or to a routine found to return. An RTS after
-  pushing a constant address jumps to it plus one.
+  code there runs when the routine jumped to returns, if a path of it that
+  can be followed returns. Before a jump through a pointer that is not known,
+  `indirect_jump` names the address to give in `entry_points` if the targets
+  return. An RTS after pushing a constant address jumps to it plus one.
 - Routines that take their return address. One that jumps through a pointer
   read through it (a jump table after each JSR to it) makes the words after
   each JSR a jump table: an entry at a time, while the two bytes are
