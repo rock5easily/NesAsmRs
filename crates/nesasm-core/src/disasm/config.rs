@@ -142,6 +142,10 @@ pub struct EntryPoint {
     /// Bytes of inline arguments after each JSR to the routine; they are emitted as data.
     #[serde(default)]
     pub inline_bytes: usize,
+    /// The routine switches in the PRG bank held in the first RAM address
+    /// at $8000 and the one in the second at $A000 (`null`: not switched),
+    /// and changes no other RAM the caller knows.
+    pub switch_banks: Option<[Option<Address>; 2]>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

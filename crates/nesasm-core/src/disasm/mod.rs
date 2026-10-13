@@ -68,6 +68,9 @@ pub enum IssueKind {
     /// A routine takes its return address (arguments after each JSR?), so
     /// the code after a JSR to it is not followed.
     ReturnAddress,
+    /// A routine switches banks held in RAM on the paths that can be
+    /// followed: `switch_banks` would let calls to it resolve.
+    BankSwitch,
     /// A reference to an address that several banks hold.
     UnresolvedBank,
     /// Code outside the ROM (RAM, SRAM) is called or jumped to.

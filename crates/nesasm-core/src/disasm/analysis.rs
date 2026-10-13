@@ -358,10 +358,16 @@ impl Memory {
             .then(|| (b.org as usize - 0x8000) / BANK_SIZE)
     }
 
+    /// The PRG bank the mapper selects with `bank` (wrapped to the ROM's
+    /// banks).
+    pub fn bank_number(&self, bank: u8) -> usize {
+        usize::from(bank) % self.prg_count.max(1)
+    }
+
     /// The location of `address` in the PRG bank numbered `bank` by the
     /// mapper (wrapped to the ROM's banks), if that bank holds it.
     pub fn in_bank(&self, bank: u8, address: u32) -> Option<Loc> {
-        let bank = usize::from(bank) % self.prg_count.max(1);
+        let bank = self.bank_number(bank);
         let image = &self.banks[bank];
         image.holds(address).then(|| Loc {
             bank,
@@ -637,6 +643,7 @@ pub(crate) struct Label {
 struct Routine {
     no_return: bool,
     inline_bytes: usize,
+    switch_banks: Option<[Option<u16>; 2]>,
 }
 
 /// A named address outside the ROM, emitted as `NAME = $xxxx`.
@@ -702,6 +709,9 @@ pub(crate) struct Analysis {
     tables: Vec<JumpTable>,
     /// Issues of indirect JMPs, with their pointer.
     jump_issues: Vec<(usize, u32)>,
+    /// Routines called that switch in banks held in RAM on the paths that
+    /// can be followed (see `Summary::hint`).
+    switch_hints: BTreeMap<Loc, [Option<u16>; 2]>,
     /// Pointers in RAM written from ROM tables, by the low byte's address:
     /// the instruction that completed the pointer, and the low and high
     /// byte tables with their index register.
@@ -789,6 +799,7 @@ impl Analysis {
             followed_pointers: HashSet::new(),
             tables: Vec::new(),
             jump_issues: Vec::new(),
+            switch_hints: BTreeMap::new(),
             table_pointers: BTreeMap::new(),
         };
         analysis.apply(config)?;
@@ -836,14 +847,27 @@ impl Analysis {
                     } else if let Some(comment) = &entry.comment {
                         self.comment(loc, comment, CommentPosition::Above);
                     }
+                    let mut switch_banks = None;
+                    if let Some(banks) = entry.switch_banks {
+                        for address in banks.iter().flatten() {
+                            if !(address.0 < 0x800 || (0x6000..0x8000).contains(&address.0)) {
+                                errors.push(format!(
+                                    "entry_points {}: switch_banks {address} is not RAM ($0000-$07FF, $6000-$7FFF)",
+                                    entry.address
+                                ));
+                            }
+                        }
+                        switch_banks = Some(banks.map(|b| b.map(|a| a.0 as u16)));
+                    }
                     self.entries.insert(
                         loc,
                         Routine {
                             no_return: entry.no_return,
                             inline_bytes: entry.inline_bytes,
+                            switch_banks,
                         },
                     );
-                    self.work.push_back((loc, None, State::default()));
+                    self.queue(loc, None, State::default());
                     self.want(loc, Want::Call);
                 }
                 Err(e) => errors.push(format!("entry_points {}: {e}", entry.address)),
@@ -1186,19 +1210,26 @@ impl Analysis {
             if let Some(loc) = self.infer(from, address, bank) {
                 return Target::Rom(loc);
             }
-            if let Target::Ambiguous(_) = self.default_target(from, address) {
-                let bank = usize::from(bank) % self.memory.prg_count.max(1);
-                let at = self.memory.address(from);
-                let org = 0x8000 + window as u32 * BANK_SIZE as u32;
-                let message = format!(
-                    "${address:04X} is in bank {bank} here (switched in at ${org:04X}), but the layout places bank {bank} at ${:04X}; add {{\"bank\": {bank}, \"org\": \"${org:04X}\"}} to banks",
-                    self.memory.banks[bank].org
-                );
-                self.issue(IssueKind::UnresolvedBank, Some(from), at, message);
-                return Target::Ambiguous(address);
-            }
+            // Another bank holding the address is not the one switched in.
+            let bank = self.memory.bank_number(bank);
+            let at = self.memory.address(from);
+            let org = 0x8000 + window as u32 * BANK_SIZE as u32;
+            let message = format!(
+                "${address:04X} is in bank {bank} here (switched in at ${org:04X}), but the layout places bank {bank} at ${:04X}; add {{\"bank\": {bank}, \"org\": \"${org:04X}\"}} to banks",
+                self.memory.banks[bank].org
+            );
+            self.issue(IssueKind::UnresolvedBank, Some(from), at, message);
+            return Target::Ambiguous(address);
         }
         self.resolve_from(from, address)
+    }
+
+    /// Queues code at `loc` to trace: it runs with its own bank switched in.
+    fn queue(&mut self, loc: Loc, from: Option<Loc>, mut state: State) {
+        if let Some(w) = self.memory.window_of(loc.bank) {
+            state.set_window(w, loc.bank as u8);
+        }
+        self.work.push_back((loc, from, state));
     }
 
     /// Like [`Self::target_of`], reporting references it cannot resolve.
@@ -1250,14 +1281,14 @@ impl Analysis {
             .cloned()
             .collect();
         for region in &code_regions {
-            self.work.push_back((
+            self.queue(
                 Loc {
                     bank: region.bank,
                     offset: region.start,
                 },
                 None,
                 State::default(),
-            ));
+            );
         }
         self.drain(cancel)?;
         self.settle(cancel)?;
@@ -1323,7 +1354,8 @@ impl Analysis {
     fn follow_pointers(&mut self) -> bool {
         let mut found = Vec::new();
         for &vector in &self.jump_vectors {
-            if self.data_pointers.contains(&vector) {
+            // JMP [$xxFF] reads its high byte from $xx00, not $xx00+$100.
+            if self.data_pointers.contains(&vector) || vector & 0xff == 0xff {
                 continue;
             }
             for &(store, address, windows) in
@@ -1351,7 +1383,7 @@ impl Analysis {
                 None => self.target_of(store, address),
             };
             if let Target::Rom(loc) = target {
-                self.work.push_back((loc, Some(store), state));
+                self.queue(loc, Some(store), state);
                 self.want(loc, Want::Jump);
                 self.refs.push(Ref {
                     from: store,
@@ -1402,7 +1434,7 @@ impl Analysis {
                     state.set_window(w, bank);
                 }
             }
-            self.work.push_back((target, Some(element), state));
+            self.queue(target, Some(element), state);
             self.want(target, Want::Jump);
             self.refs.push(Ref {
                 from: element,
@@ -1467,6 +1499,25 @@ impl Analysis {
     /// Reports the jump tables found after JSRs, to be confirmed, and the
     /// indirect jumps whose pointers were followed where code stored them.
     fn report_found(&mut self) {
+        for (routine, banks) in std::mem::take(&mut self.switch_hints) {
+            let address = self.memory.address(routine);
+            let shown = |b: Option<u16>| b.map_or("null".to_owned(), |a| format!("\"${a:04X}\""));
+            let what: Vec<String> = [(banks[0], "$8000"), (banks[1], "$A000")]
+                .iter()
+                .filter_map(|(b, w)| b.map(|a| format!("the bank in ${a:04X} at {w}")))
+                .collect();
+            self.issue(
+                IssueKind::BankSwitch,
+                Some(routine),
+                address,
+                format!(
+                    "The routine at ${address:04X} switches in {} on the paths that can be followed, but others run code whose effects are not known, so the banks after a call to it are not known; if it always does, give it \"switch_banks\": [{}, {}] in entry_points",
+                    what.join(" and "),
+                    shown(banks[0]),
+                    shown(banks[1])
+                ),
+            );
+        }
         for (index, vector) in std::mem::take(&mut self.jump_issues) {
             let mut parts = Vec::new();
             let mut stores: Vec<u32> = self
@@ -1598,7 +1649,7 @@ impl Analysis {
                 if let Target::Rom(loc) = target {
                     self.vectors.entry(loc).or_insert(name);
                     if covered[i] {
-                        self.work.push_back((loc, Some(from), State::default()));
+                        self.queue(loc, Some(from), State::default());
                         self.want(loc, Want::Jump);
                     }
                 }
@@ -1652,7 +1703,7 @@ impl Analysis {
                                 state.set_window(w, bank as u8);
                             }
                         }
-                        self.work.push_back((loc, Some(from), state));
+                        self.queue(loc, Some(from), state);
                         self.want(loc, Want::Jump);
                     } else {
                         self.want(loc, Want::Data);
@@ -1704,18 +1755,50 @@ impl Analysis {
 
     /// Follows code from `loc` until it stops or reaches known bytes, with
     /// what is known on the way (`state`).
-    fn trace(&mut self, mut loc: Loc, mut from: Option<Loc>, mut state: State) {
-        let mut sources = Sources::default();
-        loop {
-            // Code in a switched bank runs with that bank switched in.
-            if let Some(w) = self.memory.window_of(loc.bank) {
-                state.set_window(w, loc.bank as u8);
+    fn trace(&mut self, loc: Loc, from: Option<Loc>, state: State) {
+        let mut stored = Vec::new();
+        self.trace_path(loc, from, state, &mut stored);
+        self.keep_pointers(&mut stored);
+    }
+
+    /// Pointers stored on a path that it did not change again before it
+    /// jumps, calls or branches: an indirect JMP may go through them.
+    fn keep_pointers(&mut self, stored: &mut Vec<(u32, StoredPointer)>) {
+        for (low, pointer) in stored.drain(..) {
+            let list = self.stored_pointers.entry(low).or_default();
+            if !list.contains(&pointer) {
+                list.push(pointer);
             }
+        }
+    }
+
+    fn trace_path(
+        &mut self,
+        mut loc: Loc,
+        mut from: Option<Loc>,
+        mut state: State,
+        stored: &mut Vec<(u32, StoredPointer)>,
+    ) {
+        let mut sources = Sources::default();
+        // A constant just stored that may be the first byte of a pointer
+        // the next store completes.
+        let mut pending: Option<u32> = None;
+        loop {
             if let Some(join) = self.joins.get(&loc) {
                 let met = state.meet(join);
                 if met != state {
                     state = met;
                     sources = Sources::default();
+                    pending = None;
+                }
+            }
+            // Code in a switched bank runs with that bank switched in. If
+            // the code switched another bank in there, it goes on in that
+            // bank, which is not followed.
+            if let Some(w) = self.memory.window_of(loc.bank) {
+                match state.window(w) {
+                    Some(bank) if self.memory.bank_number(bank) != loc.bank => return,
+                    _ => state.set_window(w, loc.bank as u8),
                 }
             }
             match self.class[loc.bank][loc.offset] {
@@ -1761,9 +1844,18 @@ impl Analysis {
             let mut advance = insn.len;
             match (insn.mnemonic, insn.mode) {
                 (Mnemonic::Jmp, mode) => {
-                    self.pushed_return(loc, &state);
+                    // A routine jumped to returns to a pushed address: through
+                    // a pointer (a call), or a routine found to return.
+                    let returns = mode != Mode::Abs
+                        || self.flow_target(loc).is_some_and(|t| {
+                            let summary = self.summary(t, &state);
+                            summary.returns && !summary.takes_return
+                        });
+                    if returns {
+                        self.pushed_return(loc, &state);
+                    }
                     if mode != Mode::Abs {
-                        match state.word(insn.value) {
+                        match state.jump_word(insn.value) {
                             Some(address) => self.jump_to(loc, u32::from(address), &state),
                             None => {
                                 self.jump_vectors.insert(insn.value);
@@ -1779,13 +1871,18 @@ impl Analysis {
                 }
                 (Mnemonic::Rti | Mnemonic::Brk, _) => return,
                 (Mnemonic::Jsr, _) => {
+                    self.keep_pointers(stored);
                     match self.call(loc, insn, &mut state) {
                         Some(inline) => advance += inline,
                         None => return,
                     }
                     sources = Sources::default();
+                    pending = None;
                 }
                 _ => {
+                    if insn.mode == Mode::Rel {
+                        self.keep_pointers(stored);
+                    }
                     sources.step(insn);
                     if matches!(insn.mnemonic, Mnemonic::Sta | Mnemonic::Stx | Mnemonic::Sty) {
                         self.table_pointer(loc, insn.value, &sources);
@@ -1795,8 +1892,40 @@ impl Analysis {
                     let effect =
                         state.step(insn, |a| flow::Code::rom_byte(&*self, loc, a, at), mmc3);
                     if let Some(address) = effect.stored {
-                        self.store_pointer(loc, u32::from(address), &state);
+                        // Two stores in a row to the bytes of a pointer set
+                        // it; the second does not start another pair.
+                        let address = u32::from(address);
+                        match pending {
+                            Some(first) if first.abs_diff(address) == 1 => {
+                                let low = first.min(address);
+                                if let Some(word) = state.word(low).map(u32::from)
+                                    && word >= 0x8000
+                                {
+                                    stored.push((low, (loc, word, state.known_windows())));
+                                }
+                                pending = None;
+                            }
+                            _ => pending = Some(address),
+                        }
+                    } else if matches!(
+                        insn.mnemonic,
+                        Mnemonic::Sta
+                            | Mnemonic::Stx
+                            | Mnemonic::Sty
+                            | Mnemonic::Inc
+                            | Mnemonic::Dec
+                            | Mnemonic::Asl
+                            | Mnemonic::Lsr
+                            | Mnemonic::Rol
+                            | Mnemonic::Ror
+                    ) && insn.mode != Mode::Acc
+                    {
+                        pending = None;
                     }
+                    // A pointer written again is not the one stored.
+                    stored.retain(|(low, (_, word, _))| {
+                        state.word(*low).map(u32::from) == Some(*word)
+                    });
                 }
             }
             let Some(next) = self.next_code(loc, advance) else {
@@ -1852,6 +1981,9 @@ impl Analysis {
             .and_then(|t| self.entries.get(&t).copied())
             .filter(|r| r.no_return || r.inline_bytes > 0);
         let summary = target.map(|t| self.summary(t, state));
+        if let (Some(t), Some(hint)) = (target, summary.as_ref().and_then(|s| s.hint)) {
+            self.switch_hints.entry(t).or_insert(hint);
+        }
         let inline = match (routine, &summary, target) {
             (Some(r), _, _) if r.no_return => None,
             (Some(r), _, _) => self
@@ -1954,7 +2086,7 @@ impl Analysis {
         {
             return;
         }
-        self.work.push_back((target, Some(from), State::default()));
+        self.queue(target, Some(from), State::default());
         self.want(target, Want::Jump);
         self.refs.push(Ref {
             from,
@@ -1967,7 +2099,7 @@ impl Analysis {
     fn jump_to(&mut self, loc: Loc, address: u32, state: &State) {
         let target = self.resolve_with(loc, address, state);
         if let Target::Rom(t) = target {
-            self.work.push_back((t, Some(loc), state.clone()));
+            self.queue(t, Some(loc), state.clone());
             self.want(t, Want::Jump);
             self.refs.push(Ref {
                 from: loc,
@@ -2029,23 +2161,6 @@ impl Analysis {
                 && l.1 == h.1
             {
                 self.table_pointers.entry(low).or_insert((loc, l, h));
-            }
-        }
-    }
-
-    /// A constant written to RAM: with the byte before or after it, the
-    /// address of code an indirect JMP may go to (such as a thread entry).
-    fn store_pointer(&mut self, loc: Loc, address: u32, state: &State) {
-        for low in [address.wrapping_sub(1), address] {
-            let Some(word) = state.word(low).map(u32::from) else {
-                continue;
-            };
-            if word < 0x8000 {
-                continue;
-            }
-            let list = self.stored_pointers.entry(low).or_default();
-            if !list.iter().any(|(l, w, _)| *l == loc && *w == word) {
-                list.push((loc, word, state.known_windows()));
             }
         }
     }
@@ -2253,12 +2368,12 @@ impl Analysis {
             }
             (Target::Rom(t), XrefKind::Call) => {
                 self.flow.insert(loc, *t);
-                self.work.push_back((*t, Some(loc), state.call()));
+                self.queue(*t, Some(loc), state.call());
                 self.want(*t, Want::Call);
             }
             (Target::Rom(t), XrefKind::Jump | XrefKind::Branch) => {
                 self.flow.insert(loc, *t);
-                self.work.push_back((*t, Some(loc), state.clone()));
+                self.queue(*t, Some(loc), state.clone());
                 self.want(*t, Want::Jump);
             }
             (Target::Rom(t), XrefKind::Read) => self.want(*t, Want::Data),
@@ -2636,9 +2751,8 @@ impl flow::Code for Analysis {
         }
         if let Some(window) = window_index(address)
             && let Some(bank) = windows[window]
-            && let Some(loc) = self.memory.in_bank(bank, address)
         {
-            return Some(loc);
+            return self.memory.in_bank(bank, address);
         }
         match self.memory.resolve(Some(from.bank), address) {
             Resolved::Rom(loc) => Some(loc),
@@ -2658,6 +2772,10 @@ impl flow::Code for Analysis {
             .get(&loc)
             .filter(|r| r.no_return || r.inline_bytes > 0)
             .map(|r| (r.no_return, r.inline_bytes))
+    }
+
+    fn switches(&self, loc: Loc) -> Option<[Option<u16>; 2]> {
+        self.entries.get(&loc).and_then(|r| r.switch_banks)
     }
 
     fn window_of(&self, bank: usize) -> Option<usize> {

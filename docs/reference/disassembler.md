@@ -67,56 +67,72 @@ Code is traced from the vectors, `entry_points`, `code` regions and jump
 tables, following JSR, JMP and branches. The disassembler never decodes
 unreached bytes as code: what is not traced stays `.db` (`unknown_range`).
 Along each path it keeps the values it knows, so that it can follow code that
-only runs after some setup:
+only runs after some setup. Where it cannot be sure, a value is unknown and
+nothing is inferred from it:
 
 - Registers, RAM ($0000-$07FF, $6000-$7FFF) and pushed values that are
   constants: loaded immediately, from RAM written on the path, or from a ROM
-  byte; moved, incremented, added to.
+  byte; moved, incremented, added to. A write whose address is not known
+  (indexed by an unknown register, or through a pointer) forgets the RAM it
+  may reach.
 - The PRG banks at $8000 and $A000. In a switched bank ($8000/$A000 window of
-  the layout), code runs with its own bank switched in. On mapper 4 (MMC3),
-  writes of known values to the bank select ($8000) and bank data ($8001)
-  registers switch R6 ($8000) and R7 ($A000) in PRG mode 0. References into
-  $8000-$BFFF resolve to the bank switched in there, if the layout places it
-  at that window; otherwise `unresolved_bank` names the `banks` entry to add.
-  A call into a switched bank runs with the caller's banks.
+  the layout), code runs with its own bank switched in; code that switches
+  another bank into its own window is not followed further. On mapper 4
+  (MMC3), writes of known values to the bank select ($8000) and bank data
+  ($8001) registers switch R6 ($8000) and R7 ($A000) in PRG mode 0; a bank
+  select for PRG mode 1 or of an unknown value, and any other write to the
+  bank data register, make the bank at $8000 (or both) unknown. References
+  into $8000-$BFFF resolve to the bank switched in there; if the layout places
+  that bank at another window, the reference is `unresolved_bank`, naming the
+  `banks` entry to add. A call into a switched bank runs with the caller's
+  banks.
 - What a called routine does: each of its paths is followed with symbolic
-  values (up to 4096 instructions in all, calls nested 6 deep), giving the
-  banks and RAM it sets in terms of the caller's registers and RAM. A routine
-  that switches the bank in A, or the banks a game keeps in RAM, is
-  recognised from its code; the caller then knows the banks after the call.
-  A routine with too many paths keeps the banks only if no code it reaches
-  writes to $8000-$FFFF or jumps where the scan cannot follow.
+  values (up to 4096 instructions in all, calls nested 6 deep; a loop is
+  walked again knowing only what its passes share, until a pass knows nothing
+  new), giving the banks and RAM it sets in terms of the caller's registers
+  and RAM. A routine that switches the bank in A, or the banks a game keeps in
+  RAM, is recognised from its code; the caller then knows the banks after the
+  call. A routine with too many paths keeps the banks only if no code it
+  reaches writes to $8000-$FFFF or jumps where the scan cannot follow. A path
+  through code that cannot be followed (an indirect jump, a routine that is
+  not known) makes the banks after the call unknown. If the other paths all
+  switch in banks held in RAM, `bank_switch` names the routine and the
+  `switch_banks` to give it in `entry_points` if it always does.
 - Where paths that know different values join, the code is traced again
   knowing only what they share (up to 16 times), so a reference never uses a
   bank that only one of the paths switched in.
 
 From these values it also follows:
 
-- Indirect jumps through a pointer the path knows, and the constant addresses
+- Indirect jumps through a pointer the path knows (`JMP [$xxFF]` reads its
+  high byte from $xx00, as the NMOS 6502 does), and the constant addresses
   code stores into the pointer of an indirect JMP elsewhere (thread entries,
-  interrupt handlers that chain), unless code also reads data through that
-  pointer (`lda [ptr],y`). The `indirect_jump` issue lists where they were
-  stored.
-- A return address pushed before a jump (`pha` of a constant address-1, then
-  `jmp`): the code there runs when the routine jumped to returns. An RTS
-  after pushing a constant address jumps to it plus one.
-- Routines that take their return address. One that jumps through it (a jump
-  table after each JSR to it) makes the words after each JSR a jump table: an
-  entry at a time, while the two bytes are unclassified, before the first
-  target that follows the table, and point to an instruction in the banks of
-  the call (up to 128 entries); `jump_table` reports each table to confirm. One
-  that reads arguments after the JSR stops the trace after the JSR
-  (`return_address`), until `entry_points` gives its `inline_bytes`.
+  interrupt handlers that chain): two stores in a row into its two bytes, still
+  unchanged when the path jumps, calls or branches, unless code also reads
+  data through that pointer (`lda [ptr],y`). The `indirect_jump` issue lists
+  where they were stored.
+- A return address pushed before a jump (`pha` of a constant address-1): the
+  code there runs when the routine returns, if the jump goes through a pointer
+  (a call through a table) or to a routine found to return. An RTS after
+  pushing a constant address jumps to it plus one.
+- Routines that take their return address. One that jumps through a pointer
+  read through it (a jump table after each JSR to it) makes the words after
+  each JSR a jump table: an entry at a time, while the two bytes are
+  unclassified, before the first target that follows the table, and point to
+  an instruction in the banks of the call (up to 128 entries); `jump_table`
+  reports each table to confirm. One that reads arguments after the JSR stops
+  the trace after the JSR (`return_address`), until `entry_points` gives its
+  `inline_bytes`.
 - For jumps through values read from ROM tables (`lda table,x` stored into
   the pointer, or pushed before an RTS), `indirect_jump` names the tables and
   the region to add (`pointers`, or `low_bytes` with its `pair`, and
   `adjust: -1` for RTS jumps).
 
 Annotations take precedence: `references` over the banks a path knows,
-`entry_points` with `no_return` or `inline_bytes` over what a routine is found
-to do, and regions over jump tables found after a JSR. Writes to $8000-$FFFF
-are mapper registers: their operands are numbers (`sta $8000`), and the
-`mapper_write` issue explains MMC3 bank selects and PRG banks.
+`entry_points` with `no_return`, `inline_bytes` or `switch_banks` over what a
+routine is found to do, and regions over jump tables found after a JSR.
+Writes to $8000-$FFFF are mapper registers: their operands are numbers
+(`sta $8000`), and the `mapper_write` issue explains the MMC3 registers.
 
 ## Mapper 4 fixed PRG banks
 
@@ -166,11 +182,15 @@ these two banks as one range, $C000-$FFFF:
   (multiples of $2000 up to $E000). By default the last two PRG banks are at
   $C000/$E000 and the others alternate $8000/$A000; a single bank is at $E000.
   CHR banks follow the PRG banks.
-- `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes"}]`.
+- `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes", "switch_banks"}]`.
   Code is traced from the interrupt vectors and these addresses. `no_return`:
   a JSR to the routine does not return. `inline_bytes`: bytes of inline
   arguments after each JSR to it, emitted as data (or as the regions that
-  describe them).
+  describe them). `switch_banks`: `["$F5", "$F6"]`, the RAM addresses holding
+  the PRG banks the routine switches in at $8000 and $A000 (`null` for a
+  window it leaves); a call to the routine, or code going on into it, then
+  switches those banks in and changes no other RAM the caller knows. The
+  addresses must be RAM ($0000-$07FF, $6000-$7FFF).
 - `labels`: `[{"address", "bank", "name", "comment"}]`, names of ROM
   addresses. The comment is placed above the label.
 - `symbols`: `[{"name", "value", "size", "comment"}]`, names of RAM, I/O and
@@ -276,6 +296,9 @@ stored into it were followed), `jump_table` (a jump table found after a JSR
 to a routine that jumps through its return address: confirm its length with
 a `pointers` region), `return_address` (a routine takes its return address,
 so the code after the JSR is not followed: give its `inline_bytes`),
+`bank_switch` (a routine switches in banks held in RAM on the paths that can
+be followed, but other paths run code that cannot: give it `switch_banks` if
+it always does),
 `unresolved_bank` (add `references`, or the `banks` entry the message names
 for a bank switched in where the layout does not place it), `outside_rom`
 (code in RAM or SRAM is called), `flow_leaves_rom` (code runs off a bank),

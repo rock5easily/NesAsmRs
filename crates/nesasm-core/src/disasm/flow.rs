@@ -35,6 +35,9 @@ pub(crate) enum Input {
     /// A byte pulled from below the routine's own pushes: its return
     /// address (0 the low byte, 1 the high byte).
     Return(u8),
+    /// A byte read through a pointer holding the return address: from the
+    /// bytes after the JSR.
+    AfterCall,
 }
 
 /// A byte value: a constant, an input plus a constant, or unknown.
@@ -66,6 +69,10 @@ impl Sym {
         matches!(self, Self::Input(Input::Return(_), _))
     }
 
+    fn is_after_call(self) -> bool {
+        matches!(self, Self::Input(Input::AfterCall, _))
+    }
+
     fn meet(self, other: Self) -> Self {
         if self == other { self } else { Self::Unknown }
     }
@@ -90,6 +97,9 @@ pub(crate) struct State {
     /// RAM not written yet holds its value at the start of the routine
     /// (summaries, until an unknown call).
     entry_memory: bool,
+    /// RAM written in unknown ways (indexed writes): not written values are
+    /// unknown there.
+    lost: Vec<(u16, u16)>,
     /// Values pushed along the path, the last on top.
     pub stack: Vec<Sym>,
     /// Bytes pulled from below the path's own pushes.
@@ -157,7 +167,11 @@ impl State {
         let address = address as u16;
         match self.memory.iter().rev().find(|(a, _)| *a == address) {
             Some((_, value)) => *value,
-            None if self.entry_memory => Sym::Input(Input::Mem(address), 0),
+            None if self.entry_memory
+                && !self.lost.iter().any(|(l, h)| (*l..=*h).contains(&address)) =>
+            {
+                Sym::Input(Input::Mem(address), 0)
+            }
             None => Sym::Unknown,
         }
     }
@@ -169,7 +183,10 @@ impl State {
         let address = address as u16;
         self.memory.retain(|(a, _)| *a != address);
         if self.memory.len() == MAX_MEMORY {
+            // A value no longer remembered is unknown, not the one at the
+            // start of the routine.
             self.memory.remove(0);
+            self.entry_memory = false;
         }
         self.memory.push((address, value));
         if value.is_return() {
@@ -177,11 +194,45 @@ impl State {
         }
     }
 
+    /// RAM from `low` to `high` may have been written with unknown values.
+    fn clobber(&mut self, low: u32, high: u32) {
+        let (low, high) = (low.min(0xffff) as u16, high.min(0xffff) as u16);
+        self.memory.retain(|(a, _)| !(low..=high).contains(a));
+        if !self.lost.contains(&(low, high)) {
+            if self.lost.len() == MAX_STACK {
+                self.lost.clear();
+                self.entry_memory = false;
+            }
+            self.lost.push((low, high));
+        }
+    }
+
+    /// All RAM may have been written with unknown values.
+    fn clobber_all(&mut self) {
+        self.memory.clear();
+        self.lost.clear();
+        self.entry_memory = false;
+    }
+
     /// The known value of the 16-bit pointer at `address`.
     pub fn word(&self, address: u32) -> Option<u16> {
         let low = self.read(address).constant()?;
         let high = self.read(address + 1).constant()?;
         Some(u16::from_le_bytes([low, high]))
+    }
+
+    /// The address `JMP [address]` reads: the NMOS 6502 takes the high byte
+    /// from the same page.
+    pub fn jump_word(&self, address: u32) -> Option<u16> {
+        let (low, high) = Self::jump_bytes(address);
+        let low = self.read(low).constant()?;
+        let high = self.read(high).constant()?;
+        Some(u16::from_le_bytes([low, high]))
+    }
+
+    /// The addresses of the low and high byte `JMP [address]` reads.
+    pub fn jump_bytes(address: u32) -> (u32, u32) {
+        (address, (address & 0xff00) | ((address + 1) & 0xff))
     }
 
     fn push(&mut self, value: Sym) {
@@ -216,13 +267,33 @@ impl State {
 
     /// What is known on both `self` and `other`.
     pub fn meet(&self, other: &Self) -> Self {
-        let memory = self
-            .memory
-            .iter()
-            .filter(|(a, v)| other.memory.iter().any(|(b, w)| a == b && v == w))
-            .copied()
-            .collect();
-        let same_stack = self.stack == other.stack
+        // RAM written on one path only holds an unknown value.
+        let mut memory: Vec<(u16, Sym)> = Vec::new();
+        for (address, _) in self.memory.iter().chain(&other.memory) {
+            if memory.iter().any(|(a, _)| a == address) {
+                continue;
+            }
+            let value = self
+                .read(u32::from(*address))
+                .meet(other.read(u32::from(*address)));
+            memory.push((*address, value));
+        }
+        if !(self.entry_memory && other.entry_memory) {
+            // Not written is unknown too.
+            memory.retain(|(_, v)| *v != Sym::Unknown);
+        }
+        if memory.len() > MAX_MEMORY {
+            memory.drain(..memory.len() - MAX_MEMORY);
+        }
+        let mut lost = self.lost.clone();
+        for range in &other.lost {
+            if !lost.contains(range) {
+                lost.push(*range);
+            }
+        }
+        // Stacks of the same shape keep their positions, with the values
+        // both paths pushed there.
+        let same_stack = self.stack.len() == other.stack.len()
             && self.popped == other.popped
             && self.stack_lost == other.stack_lost;
         Self {
@@ -234,27 +305,29 @@ impl State {
             } else {
                 None
             },
+            entry_memory: self.entry_memory
+                && other.entry_memory
+                && memory.len() <= MAX_MEMORY
+                && lost.len() <= MAX_STACK,
             memory,
-            entry_memory: self.entry_memory && other.entry_memory,
+            lost: if lost.len() <= MAX_STACK {
+                lost
+            } else {
+                Vec::new()
+            },
             stack: if same_stack {
-                self.stack.clone()
+                self.stack
+                    .iter()
+                    .zip(&other.stack)
+                    .map(|(a, b)| a.meet(*b))
+                    .collect()
             } else {
                 Vec::new()
             },
             popped: if same_stack { self.popped } else { 0 },
             stack_lost: !same_stack || self.stack_lost,
-            select: if self.select == other.select {
-                self.select
-            } else {
-                None
-            },
-            windows: [0, 1].map(|w| {
-                if self.windows[w] == other.windows[w] {
-                    self.windows[w]
-                } else {
-                    None
-                }
-            }),
+            select: meet_option(self.select, other.select),
+            windows: [0, 1].map(|w| meet_option(self.windows[w], other.windows[w])),
             return_used: self.return_used || other.return_used,
         }
     }
@@ -265,8 +338,7 @@ impl State {
         self.x = Sym::Unknown;
         self.y = Sym::Unknown;
         self.carry = None;
-        self.memory.clear();
-        self.entry_memory = false;
+        self.clobber_all();
         self.select = Some(Sym::Unknown);
         self.windows = [Some(Sym::Unknown); 2];
     }
@@ -280,7 +352,7 @@ impl State {
                 Input::X => self.x,
                 Input::Y => self.y,
                 Input::Mem(address) => self.read(u32::from(address)),
-                Input::Return(_) => Sym::Unknown,
+                Input::Return(_) | Input::AfterCall => Sym::Unknown,
             }
             .add(add),
             other => other,
@@ -301,8 +373,10 @@ impl State {
         self.y = Sym::Unknown;
         self.carry = None;
         if summary.forgets_memory {
-            self.memory.clear();
-            self.entry_memory = false;
+            self.clobber_all();
+        }
+        for (low, high) in &summary.lost {
+            self.clobber(u32::from(*low), u32::from(*high));
         }
         for address in &summary.changed {
             self.write(u32::from(*address), Sym::Unknown);
@@ -343,6 +417,13 @@ impl State {
             Mode::Zp => state.read(address),
             Mode::Abs if tracked(address) => state.read(address),
             Mode::Abs => rom_byte(address).map_or(Sym::Unknown, Sym::Const),
+            // Through a pointer holding the return address.
+            Mode::Zi | Mode::Zix | Mode::Ziy
+                if state.read(address).is_return()
+                    || state.read((address + 1) & 0xff).is_return() =>
+            {
+                Sym::Input(Input::AfterCall, 0)
+            }
             _ => Sym::Unknown,
         };
         match insn.mnemonic {
@@ -351,14 +432,7 @@ impl State {
             Mnemonic::Ldy => self.y = load(self),
             Mnemonic::Sta | Mnemonic::Stx | Mnemonic::Sty => {
                 let value = self.stored(insn.mnemonic);
-                if direct && tracked(address) {
-                    self.write(address, value);
-                    if value.constant().is_some() {
-                        effect.stored = Some(address as u16);
-                    }
-                } else if mmc3 && address >= 0x8000 {
-                    effect.mapper = Some(self.mmc3_write(direct.then_some(address), value));
-                }
+                effect = self.store(insn, value, mmc3);
             }
             Mnemonic::Tax => self.x = self.a,
             Mnemonic::Tay => self.y = self.a,
@@ -373,14 +447,19 @@ impl State {
             Mnemonic::Iny => self.y = self.y.add(1),
             Mnemonic::Dex => self.x = self.x.add(0xff),
             Mnemonic::Dey => self.y = self.y.add(0xff),
-            Mnemonic::Inc | Mnemonic::Dec if direct => {
+            Mnemonic::Inc | Mnemonic::Dec => {
                 let add = if insn.mnemonic == Mnemonic::Inc {
                     1
                 } else {
                     0xff
                 };
-                let value = self.read(address).add(add);
-                self.write(address, value);
+                let value = if direct {
+                    self.read(address).add(add)
+                } else {
+                    Sym::Unknown
+                };
+                effect = self.store(insn, value, mmc3);
+                effect.stored = None;
             }
             Mnemonic::Clc => self.carry = Some(false),
             Mnemonic::Sec => self.carry = Some(true),
@@ -428,9 +507,8 @@ impl State {
                     self.a = a.map_or(Sym::Unknown, Sym::Const);
                     self.carry = carry;
                 } else {
-                    if direct {
-                        self.write(address, Sym::Unknown);
-                    }
+                    effect = self.store(insn, Sym::Unknown, mmc3);
+                    effect.stored = None;
                     self.carry = None;
                 }
             }
@@ -444,6 +522,51 @@ impl State {
             Mnemonic::Php => self.push(Sym::Unknown),
             Mnemonic::Pla => self.a = self.pull(),
             _ => {}
+        }
+        effect
+    }
+
+    /// A write of `value` by `insn`: to RAM (all the RAM it may reach when
+    /// the address is not known) or to the mapper.
+    fn store(&mut self, insn: Insn, value: Sym, mmc3: bool) -> Effect {
+        let mut effect = Effect::default();
+        let base = insn.value;
+        let index = match insn.mode {
+            Mode::Zpx | Mode::Ax => Some(self.x),
+            Mode::Zpy | Mode::Ay => Some(self.y),
+            _ => None,
+        };
+        let address = match (insn.mode, index.and_then(Sym::constant)) {
+            (Mode::Zp | Mode::Abs, _) => Some(base),
+            (Mode::Zpx | Mode::Zpy, Some(i)) => Some((base + u32::from(i)) & 0xff),
+            (Mode::Ax | Mode::Ay, Some(i)) => Some((base + u32::from(i)) & 0xffff),
+            _ => None,
+        };
+        match (address, insn.mode) {
+            (Some(address), _) if tracked(address) => {
+                self.write(address, value);
+                if value.constant().is_some() {
+                    effect.stored = Some(address as u16);
+                }
+            }
+            (Some(address), _) if address >= 0x8000 => {
+                if mmc3 {
+                    effect.mapper = Some(self.mmc3_write(Some(address), value));
+                }
+            }
+            (Some(_), _) => {}
+            (None, Mode::Zpx | Mode::Zpy) => self.clobber(0, 0xff),
+            (None, Mode::Ax | Mode::Ay) => {
+                if base < 0x8000 {
+                    self.clobber(base, base + 0xff);
+                }
+                if mmc3 && base + 0xff >= 0x8000 {
+                    effect.mapper = Some(self.mmc3_write(None, value));
+                }
+            }
+            // Through a pointer: any RAM (writes to the mapper this way are
+            // not followed).
+            _ => self.clobber_all(),
         }
         effect
     }
@@ -475,6 +598,11 @@ impl State {
         };
         if address % 2 == 0 {
             self.select = Some(value);
+            // PRG mode 1 (bit 6) puts R6 at $C000 and a fixed bank at
+            // $8000: the bank there is no longer known.
+            if value.constant().is_none_or(|v| v & 0x40 != 0) {
+                self.windows[0] = Some(Sym::Unknown);
+            }
             return match value.constant() {
                 Some(v) if v & 7 >= 6 && v & 0x40 != 0 => format!(
                     "MMC3 bank select ${v:02X}: R{} in PRG mode 1, not followed",
@@ -530,6 +658,8 @@ pub(crate) struct Summary {
     memory: Vec<(u16, Sym)>,
     /// Other RAM written.
     changed: Vec<u16>,
+    /// RAM ranges written in unknown ways.
+    lost: Vec<(u16, u16)>,
     /// RAM the routine may change without being followed.
     forgets_memory: bool,
     /// Some path returns to the caller.
@@ -540,9 +670,22 @@ pub(crate) struct Summary {
     /// Some path jumps through a pointer after taking its return address:
     /// a jump table follows each JSR.
     pub dispatch: bool,
+    /// The banks after a call are not known, but every path that can be
+    /// followed switches in the banks held in these RAM addresses ($8000,
+    /// $A000): the annotation `switch_banks` would say so.
+    pub hint: Option<[Option<u16>; 2]>,
 }
 
 impl Summary {
+    /// A routine that switches in the banks held in RAM (`switch_banks`).
+    fn switching(banks: [Option<u16>; 2]) -> Self {
+        Self {
+            windows: banks.map(|b| b.map(|a| Sym::Input(Input::Mem(a), 0))),
+            returns: true,
+            ..Self::default()
+        }
+    }
+
     fn unknown() -> Self {
         Self {
             windows: [Some(Sym::Unknown); 2],
@@ -567,6 +710,8 @@ pub(crate) trait Code {
     fn rom_byte(&self, from: Loc, address: u32, windows: [Option<u8>; 2]) -> Option<u8>;
     /// `no_return` and `inline_bytes` of an annotated entry point.
     fn annotated(&self, loc: Loc) -> Option<(bool, usize)>;
+    /// `switch_banks` of an annotated entry point.
+    fn switches(&self, loc: Loc) -> Option<[Option<u16>; 2]>;
     /// The window ($8000 = 0, $A000 = 1) of a bank that is switched.
     fn window_of(&self, bank: usize) -> Option<usize>;
     fn mmc3(&self) -> bool;
@@ -589,6 +734,9 @@ impl Summaries {
         let mut windows = windows;
         if let Some(w) = code.window_of(entry.bank) {
             windows[w] = Some(entry.bank as u8);
+        }
+        if let Some(banks) = code.switches(entry) {
+            return Arc::new(Summary::switching(banks));
         }
         let key = (entry, windows);
         if let Some(summary) = self.memo.get(&key) {
@@ -624,15 +772,29 @@ impl Summaries {
         let mut exits: Vec<State> = Vec::new();
         let mut unknown_exit = false;
         let mut summary = Summary::default();
-        let mut paths = vec![(entry, State::routine([None; 2]), HashSet::new())];
+        let mut paths = vec![(entry, State::routine([None; 2]), HashMap::new())];
         while let Some((mut loc, mut state, mut seen)) = paths.pop() {
             loop {
                 steps += 1;
                 if steps > MAX_SUMMARY_STEPS {
                     return None;
                 }
-                // A loop: the first time through stands for the others.
-                if !seen.insert(loc) {
+                // A loop: walked again knowing only what the passes share,
+                // until another pass knows nothing new.
+                if let Some(before) = seen.get(&loc) {
+                    let met = state.meet(before);
+                    if met == *before {
+                        break;
+                    }
+                    state = met;
+                }
+                seen.insert(loc, state.clone());
+                // Code that goes on into an annotated routine returns as it does.
+                if loc != entry
+                    && let Some(banks) = code.switches(loc)
+                {
+                    state.apply(&Summary::switching(banks));
+                    exits.push(state);
                     break;
                 }
                 let Some(insn) = code.insn(loc) else {
@@ -677,9 +839,13 @@ impl Summaries {
                         }
                     }
                     (Mnemonic::Jmp, _) => {
+                        // A jump table after the JSR: the pointer was read
+                        // through the return address.
+                        let (low, high) = State::jump_bytes(insn.value);
+                        let after_call = [low, high].iter().any(|a| state.read(*a).is_after_call());
                         if state.return_used {
-                            summary.dispatch = true;
                             summary.takes_return = true;
+                            summary.dispatch |= after_call;
                         } else {
                             unknown_exit = true;
                         }
@@ -720,11 +886,27 @@ impl Summaries {
             }
         }
         summary.returns = unknown_exit || !exits.is_empty();
+        // The RAM each window is switched from on the paths that know it.
+        let hint = [0, 1].map(|w| {
+            let mut found = None;
+            for exit in &exits {
+                match exit.windows[w] {
+                    Some(Sym::Input(Input::Mem(a), 0)) if found.is_none_or(|f| f == a) => {
+                        found = Some(a);
+                    }
+                    Some(Sym::Unknown) => {}
+                    _ => return None,
+                }
+            }
+            found
+        });
+        let hint = (hint != [None; 2]).then_some(hint);
         if unknown_exit {
             let unknown = Summary::unknown();
             summary.windows = unknown.windows;
             summary.select = unknown.select;
             summary.forgets_memory = true;
+            summary.hint = hint;
             return Some(summary);
         }
         let Some(first) = exits.first() else {
@@ -738,7 +920,17 @@ impl Summaries {
         summary.select = exits
             .iter()
             .fold(first.select, |acc, e| meet_option(acc, e.select));
+        if summary.windows.contains(&Some(Sym::Unknown)) {
+            summary.hint = hint;
+        }
         summary.forgets_memory = exits.iter().any(|e| !e.entry_memory);
+        for exit in &exits {
+            for range in &exit.lost {
+                if !summary.lost.contains(range) {
+                    summary.lost.push(*range);
+                }
+            }
+        }
         let mut written: Vec<u16> = exits
             .iter()
             .flat_map(|e| e.memory.iter().map(|(a, _)| *a))
