@@ -840,9 +840,28 @@ impl Analysis {
             address: Address(address),
             message,
             suggestions: Vec::new(),
+            id: String::new(),
             spans: loc.map(|l| (l.offset, 1)).into_iter().collect(),
             fix: None,
+            topic: None,
+            via: None,
         });
+    }
+
+    /// Records the instruction whose path reached the last issue, for its id.
+    fn via(&mut self, from: Option<Loc>) {
+        let via = from.map(|f| (f.bank, self.memory.address(f)));
+        if let Some(issue) = self.issues.last_mut() {
+            issue.via = via;
+        }
+    }
+
+    /// A header issue: they all name $0000, so `topic` tells them apart.
+    fn header_issue(&mut self, topic: &'static str, message: String) {
+        self.issue(IssueKind::Header, None, 0, message);
+        if let Some(issue) = self.issues.last_mut() {
+            issue.topic = Some(topic);
+        }
     }
 
     /// Records how the last issue could be settled.
@@ -1165,27 +1184,21 @@ impl Analysis {
         let header = self.memory.header.clone();
         if header.len() == HEADER_SIZE {
             if header[7] & 0x0f != 0 || header[8..].iter().any(|&b| b != 0) {
-                self.issue(
-                    IssueKind::Header,
-                    None,
-                    0,
+                self.header_issue(
+                    "nes2",
                     "Header bytes 7 (low nibble) and 8-15 are not zero (NES 2.0 or extra fields); NESASM writes them as zero".into(),
                 );
             }
             if self.memory.trainer {
-                self.issue(
-                    IssueKind::Header,
-                    None,
-                    0,
+                self.header_issue(
+                    "trainer",
                     "The ROM has a 512-byte trainer, which NESASM cannot produce".into(),
                 );
             }
             let declared = usize::from(header[4]) * PRG_UNIT + usize::from(header[5]) * BANK_SIZE;
             if declared != self.memory.payload_len {
-                self.issue(
-                    IssueKind::Header,
-                    None,
-                    0,
+                self.header_issue(
+                    "size",
                     format!(
                         "The header declares {declared} bytes of PRG+CHR ROM, the file has {}",
                         self.memory.payload_len
@@ -1196,10 +1209,8 @@ impl Analysis {
         if !self.memory.payload_len.is_multiple_of(BANK_SIZE)
             && self.memory.format != RomFormat::Fragment
         {
-            self.issue(
-                IssueKind::Header,
-                None,
-                0,
+            self.header_issue(
+                "partial_bank",
                 "The ROM data is not a whole number of 8 KiB banks; NESASM pads the last bank"
                     .into(),
             );
@@ -1874,6 +1885,7 @@ impl Analysis {
                         address,
                         format!("Code{source} enters the middle of an instruction at ${address:04X} (a skip trick, or a wrong entry)"),
                     );
+                    self.via(from);
                     return;
                 }
                 Class::Data => {
@@ -1889,6 +1901,7 @@ impl Analysis {
                             "Code{source} reaches ${address:04X}, which a region describes as data"
                         ),
                     );
+                    self.via(from);
                     return;
                 }
             }
@@ -2351,6 +2364,7 @@ impl Analysis {
                 address,
                 format!("${code:02X} at ${address:04X}{source} is not an NMOS 6502 instruction; the flow may be wrong, or this is data"),
             );
+            self.via(from);
             return None;
         };
         let len = inspect::operand_size(mode) + 1;
@@ -2367,6 +2381,7 @@ impl Analysis {
                 address,
                 format!("The instruction at ${address:04X}{source} would overlap other code, data or the end of the bank"),
             );
+            self.via(from);
             if let Some(issue) = self.issues.last_mut() {
                 issue.spans = vec![(loc.offset, len.min(end - loc.offset))];
             }

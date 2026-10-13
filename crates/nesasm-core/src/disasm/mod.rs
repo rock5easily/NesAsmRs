@@ -91,6 +91,14 @@ pub enum IssueKind {
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Issue {
+    /// Identifies the issue across analyses of the ROM: its kind, bank and
+    /// address (`"unresolved_bank:30:$DEB1"`, `"-"` without a bank), a
+    /// topic for header issues (`"header:-:$0000:trainer"`), and for
+    /// `overlap`, `invalid_opcode` and `code_data_conflict` the instruction
+    /// whose path reached the place (`"invalid_opcode:1:$E008:from=1:$E005"`;
+    /// none from an entry point or vector). It does not depend on the
+    /// message.
+    pub id: String,
     pub kind: IssueKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bank: Option<usize>,
@@ -109,6 +117,155 @@ pub struct Issue {
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub(crate) fix: Option<Fix>,
+    /// What a header issue is about, for its id.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) topic: Option<&'static str>,
+    /// The bank and address of the instruction whose path reached the
+    /// issue, for issues reported per path.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) via: Option<(usize, u32)>,
+}
+
+/// An issue reported in both analyses with another message.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct ChangedIssue {
+    #[serde(flatten)]
+    pub issue: Issue,
+    pub previous_message: String,
+    /// For an unknown range that continues others (annotations described a
+    /// part, or no longer describe the bytes between ranges): the ids of all
+    /// the unknown ranges before it shares bytes with. `previous_message` is
+    /// that of the range with its own id, or of the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_ids: Vec<String>,
+}
+
+/// How the issues of two analyses differ, matched by id.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct IssueComparison {
+    /// Issues only the first analysis reports.
+    pub resolved: Vec<Issue>,
+    /// Issues only the second analysis reports.
+    pub introduced: Vec<Issue>,
+    /// Issues both report, with different messages (as in the second), and
+    /// unknown ranges that continue others. Unknown ranges are resolved or
+    /// introduced only when no range of the other analysis shares bytes
+    /// with them.
+    pub changed: Vec<ChangedIssue>,
+}
+
+/// Compares the issues of two analyses of a ROM by id.
+pub fn compare_issues(before: &[Issue], after: &[Issue]) -> IssueComparison {
+    let ids = |issues: &[Issue]| -> BTreeMap<String, usize> {
+        issues
+            .iter()
+            .enumerate()
+            .map(|(i, issue)| (issue.id.clone(), i))
+            .collect()
+    };
+    let (old, new) = (ids(before), ids(after));
+    // Unknown ranges are named by their first address, which annotations of
+    // a part move: ranges of a bank that share bytes continue one another.
+    // Only they are compared by their bytes, within their bank.
+    fn ranges(issues: &[Issue]) -> BTreeMap<Option<usize>, Vec<&Issue>> {
+        let mut banks: BTreeMap<Option<usize>, Vec<&Issue>> = BTreeMap::new();
+        for issue in issues.iter().filter(|i| i.kind == IssueKind::UnknownRange) {
+            banks.entry(issue.bank).or_default().push(issue);
+        }
+        banks
+    }
+    fn overlapping<'a>(
+        issue: &Issue,
+        ranges: &BTreeMap<Option<usize>, Vec<&'a Issue>>,
+    ) -> Vec<&'a Issue> {
+        if issue.kind != IssueKind::UnknownRange {
+            return Vec::new();
+        }
+        ranges
+            .get(&issue.bank)
+            .into_iter()
+            .flatten()
+            .filter(|other| {
+                issue.spans.iter().any(|(start, length)| {
+                    other
+                        .spans
+                        .iter()
+                        .any(|(s, l)| *start < s + l && *s < start + length)
+                })
+            })
+            .copied()
+            .collect()
+    }
+    let (old_ranges, new_ranges) = (ranges(before), ranges(after));
+    IssueComparison {
+        resolved: before
+            .iter()
+            .filter(|i| !new.contains_key(&i.id) && overlapping(i, &new_ranges).is_empty())
+            .cloned()
+            .collect(),
+        introduced: after
+            .iter()
+            .filter(|i| !old.contains_key(&i.id) && overlapping(i, &old_ranges).is_empty())
+            .cloned()
+            .collect(),
+        changed: after
+            .iter()
+            .filter_map(|issue| {
+                let same = old.get(&issue.id).map(|i| &before[*i]);
+                let others: Vec<&Issue> = overlapping(issue, &old_ranges)
+                    .into_iter()
+                    .filter(|b| b.id != issue.id)
+                    .collect();
+                let previous = same.or_else(|| others.first().copied())?;
+                let previous_ids: Vec<String> = if others.is_empty() {
+                    Vec::new()
+                } else {
+                    same.into_iter()
+                        .chain(others)
+                        .map(|i| i.id.clone())
+                        .collect()
+                };
+                (previous.message != issue.message || !previous_ids.is_empty()).then(|| {
+                    ChangedIssue {
+                        issue: issue.clone(),
+                        previous_message: previous.message.clone(),
+                        previous_ids,
+                    }
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Gives each issue its id (see [`Issue::id`]). Two issues of a kind at one
+/// place from one path are not expected; should they occur, the further
+/// ones get `#2`, `#3` in report order.
+fn assign_ids(issues: &mut [Issue]) {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for issue in issues {
+        let kind = serde_json::to_value(issue.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let bank = issue.bank.map_or("-".to_owned(), |b| b.to_string());
+        let mut id = format!("{kind}:{bank}:{}", issue.address);
+        if let Some(topic) = issue.topic {
+            id = format!("{id}:{topic}");
+        }
+        if let Some((bank, address)) = issue.via {
+            id = format!("{id}:from={bank}:{}", Address(address));
+        }
+        let count = seen.entry(id.clone()).or_default();
+        *count += 1;
+        if *count > 1 {
+            id = format!("{id}#{count}");
+        }
+        issue.id = id;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -373,6 +530,8 @@ pub fn disassemble(
         (None, Some(_)) => return Err(vec![error("The base ROM was not given")]),
         (Some(_), None) => return Err(vec![error("A base ROM was given without base")]),
     };
+    // Before the issues of a ROM hack are narrowed, so ids do not depend on it.
+    assign_ids(&mut analysis.issues);
     if let Some(patches) = &patches {
         // Only the changed ranges matter.
         analysis.issues.retain(|issue| match issue.bank {

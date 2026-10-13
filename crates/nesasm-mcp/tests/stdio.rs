@@ -325,6 +325,10 @@ fn structured_content_matches_output_schema() {
             json!({"inline":{"rom":"hack.bin","base":"game.bin"},"routines":{},"ram":{}}),
         ),
         ("export_disassembly", json!({"inline":{"rom":"game.bin"}})),
+        (
+            "disassemble",
+            json!({"inline":{"rom":"game.bin"},"baseline":{"inline":{"rom":"game.bin"}}}),
+        ),
         ("disassemble", json!({"inline":{"rom":"missing.bin"}})),
         (
             "annotate",

@@ -3917,3 +3917,209 @@ fn bytes_read_from_one_table_suggest_no_address_table() {
         serde_json::json!([[]])
     );
 }
+
+fn ids(d: &Disassembly) -> Vec<&str> {
+    d.issues().iter().map(|i| i.id.as_str()).collect()
+}
+
+#[test]
+fn issue_ids_name_the_kind_and_place() {
+    let rom = nrom(concat!(
+        "Reset:\n  sta $8000\n  lda #0\n  beq Bad\n  rts\n",
+        "Bad:\n  .db $02\nNmi:\n  rti\nLoose:\n  .db 1, 2, 3, 4, 5\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(
+        ids(&d),
+        [
+            "mapper_write:1:$E000",
+            "invalid_opcode:1:$E008:from=1:$E005",
+            "unknown_range:1:$E008",
+            "unknown_range:1:$E00A",
+        ]
+    );
+    // The ids stay when the annotations change what is around them.
+    let d = round_trip(
+        &rom,
+        &config(
+            r#"{"labels": [{"address": "$E008", "name": "Bad"}], "options": {"uppercase": true}}"#,
+        ),
+    );
+    assert!(
+        ids(&d).contains(&"invalid_opcode:1:$E008:from=1:$E005"),
+        "{:?}",
+        ids(&d)
+    );
+    // Header issues all name $0000; a topic tells them apart.
+    let mut rom = rom;
+    rom[8] = 1;
+    rom.push(0);
+    let d = disasm::disassemble(
+        &rom,
+        None,
+        &DisasmConfig::default(),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .unwrap();
+    let header: Vec<&str> = ids(&d)
+        .into_iter()
+        .filter(|id| id.starts_with("header:"))
+        .collect();
+    assert_eq!(
+        header,
+        [
+            "header:-:$0000:nes2",
+            "header:-:$0000:size",
+            "header:-:$0000:partial_bank",
+        ]
+    );
+}
+
+#[test]
+fn issue_ids_name_the_path_to_the_place() {
+    // Two paths enter the middle of the instruction at $E00E.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Two\n  lda $0300\n  beq Other\n  jmp Two+1\nOther:\n  jmp Two+1\n",
+        "Two:\n  lda #$EA\n  rts\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    let overlaps: Vec<&str> = ids(&d)
+        .into_iter()
+        .filter(|id| id.starts_with("overlap:"))
+        .collect();
+    assert_eq!(
+        overlaps,
+        [
+            "overlap:1:$E00F:from=1:$E008",
+            "overlap:1:$E00F:from=1:$E00B"
+        ],
+        "{:?}",
+        d.issues()
+            .iter()
+            .map(|i| (&i.id, &i.message))
+            .collect::<Vec<_>>()
+    );
+    let all = ids(&d);
+    let unique: std::collections::BTreeSet<&&str> = all.iter().collect();
+    assert_eq!(unique.len(), all.len());
+    // Without the entry point that also reaches the bad byte, the issue the
+    // branch reaches keeps its id.
+    let rom = nrom(concat!(
+        "Reset:\n  sta $8000\n  lda #0\n  beq Bad\n  rts\n",
+        "Bad:\n  .db $02\nNmi:\n  rti\n",
+    ));
+    let with = round_trip(&rom, &config(r#"{"entry_points": [{"address": "$E008"}]}"#));
+    let without = round_trip(&rom, &DisasmConfig::default());
+    let c = disasm::compare_issues(with.issues(), without.issues());
+    let names =
+        |issues: &[disasm::Issue]| -> Vec<String> { issues.iter().map(|i| i.id.clone()).collect() };
+    assert_eq!(names(&c.resolved), ["invalid_opcode:1:$E008"]);
+    assert!(c.introduced.is_empty() && c.changed.is_empty(), "{c:?}");
+}
+
+#[test]
+fn narrowed_unknown_ranges_are_changed_issues() {
+    let rom = nrom("Reset:\n  jmp Reset\nLoose:\n  .db 1, 2, 3, 4, 5\nNmi:\n  rti\n");
+    let before = round_trip(&rom, &DisasmConfig::default());
+    let after = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E003", "length": 1}]}"#),
+    );
+    let c = disasm::compare_issues(before.issues(), after.issues());
+    assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
+    assert_eq!(c.changed.len(), 1);
+    assert_eq!(c.changed[0].issue.id, "unknown_range:1:$E004");
+    assert_eq!(c.changed[0].previous_ids, ["unknown_range:1:$E003"]);
+    assert_eq!(
+        c.changed[0].previous_message,
+        "$E003-$E007 (5 bytes) is not reached by code nor described by a region"
+    );
+    let json = serde_json::to_value(&c.changed[0]).unwrap();
+    assert_eq!(
+        json["previous_ids"],
+        serde_json::json!(["unknown_range:1:$E003"])
+    );
+    // A part in the middle: the first part keeps the id with another message,
+    // and the second continues it; nothing is new.
+    let split = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E004", "length": 1}]}"#),
+    );
+    let c = disasm::compare_issues(before.issues(), split.issues());
+    assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
+    let changed: Vec<(&str, &[String])> = c
+        .changed
+        .iter()
+        .map(|i| (i.issue.id.as_str(), i.previous_ids.as_slice()))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            ("unknown_range:1:$E003", &[][..]),
+            (
+                "unknown_range:1:$E005",
+                &["unknown_range:1:$E003".to_owned()][..]
+            ),
+        ]
+    );
+    // Without the part again, the range continues both.
+    let c = disasm::compare_issues(split.issues(), before.issues());
+    assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
+    assert_eq!(c.changed.len(), 1);
+    assert_eq!(
+        c.changed[0].previous_ids,
+        ["unknown_range:1:$E003", "unknown_range:1:$E005"]
+    );
+    // Described whole, it is resolved.
+    let all = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E003", "length": 5}]}"#),
+    );
+    let c = disasm::compare_issues(before.issues(), all.issues());
+    assert_eq!(c.resolved.len(), 1);
+    assert!(c.changed.is_empty());
+}
+
+#[test]
+fn issues_are_compared_by_id() {
+    let rom = nrom(concat!(
+        "Reset:\n  ldx $0300\n  lda Hi,x\n  pha\n  lda Lo,x\n  pha\n  rts\n",
+        "A1:\n  rts\nA2:\n  rts\nLo:\n  .db LOW(A1-1), LOW(A2-1)\nHi:\n  .db HIGH(A1-1), HIGH(A2-1)\n",
+        "Nmi:\n  rti\n",
+    ));
+    let before = round_trip(&rom, &DisasmConfig::default());
+    let after = round_trip(
+        &rom,
+        &config(
+            r#"{"regions": [{"start": "$E00E", "length": 2, "type": "low_bytes", "pair": "$E010", "code_targets": true, "adjust": -1},
+                            {"start": "$E010", "length": 2, "type": "high_bytes"}]}"#,
+        ),
+    );
+    let c = disasm::compare_issues(before.issues(), after.issues());
+    let names =
+        |issues: &[disasm::Issue]| -> Vec<String> { issues.iter().map(|i| i.id.clone()).collect() };
+    assert_eq!(names(&c.resolved), ["unknown_range:1:$E00C"]);
+    assert!(c.introduced.is_empty(), "{:?}", names(&c.introduced));
+    assert_eq!(c.changed.len(), 1);
+    assert_eq!(c.changed[0].issue.id, "indirect_jump:1:$E00B");
+    assert!(
+        c.changed[0]
+            .previous_message
+            .contains("the low bytes at $E00E and the high bytes at $E010"),
+        "{:?}",
+        c.changed[0]
+    );
+    assert!(
+        c.changed[0]
+            .issue
+            .message
+            .contains("which a region describes")
+    );
+    let json = serde_json::to_value(&c.changed[0]).unwrap();
+    assert_eq!(json["id"], "indirect_jump:1:$E00B");
+    assert_eq!(json["kind"], "indirect_jump");
+    // Nothing differs from itself.
+    let same = disasm::compare_issues(after.issues(), after.issues());
+    assert!(same.resolved.is_empty() && same.introduced.is_empty() && same.changed.is_empty());
+}
