@@ -174,6 +174,8 @@ MCPの `assemble` が書き込めるのは、拡張子が `.nes` か `.bin` のR
 `nesasm_core::disasm` が解析・ソース生成・往復検証を行い、MCPの `disassemble`／
 `export_disassembly` から使います。CLIには提供しません。使い方と注釈の全項目は
 [逆アセンブラのリファレンス](reference/disassembler.md) を参照してください。
+MCPの解析結果をLLMが読み、根拠付きの注釈を追加して再解析する実際の進め方は、
+[MCPとLLMによる逆アセンブル手順](disassembly-workflow.md) にまとめています。
 
 - 入力は注釈（`DisasmConfig`、JSON）とROMです。注釈の `rom` がROMファイルを指し、
   ラベル・シンボル・領域（コード、バイト、ワード、ポインタ表、下位／上位バイト表、テキスト）・
