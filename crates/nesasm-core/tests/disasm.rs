@@ -4163,3 +4163,38 @@ fn names_taken_by_automatic_names_name_their_entry() {
         );
     }
 }
+
+#[test]
+fn canonical_order_keeps_the_order_of_names_for_one_place() {
+    let rom = nrom("Reset:\n  jmp Reset\nNmi:\n  rti\n");
+    for (first, second) in [("Zulu", "Alpha"), ("Alpha", "Zulu")] {
+        let original = config(&format!(
+            r#"{{"labels": [{{"address": "$E000", "name": "{first}"}}, {{"address": "$E000", "name": "{second}"}}],
+                "symbols": [{{"name": "{first}_v", "value": "$10"}}, {{"name": "{second}_v", "value": "$10"}}]}}"#
+        ));
+        let changed = apply(&rom, &original, serde_json::json!([]));
+        let labels: Vec<&str> = changed.labels.iter().map(|l| l.name.as_str()).collect();
+        let symbols: Vec<&str> = changed.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(labels, [first, second]);
+        assert_eq!(symbols, [format!("{first}_v"), format!("{second}_v")]);
+    }
+}
+
+#[test]
+fn layout_errors_of_operations_name_the_changed_banks() {
+    let rom = mmc3_rom(false);
+    let original = config(&format!(
+        r#"{{"banks": [{{"bank": 2, "org": "$C000"}}, {{"bank": 3, "org": "$E000"}}], "options": {{{FIXED_PAIR}}}}}"#
+    ));
+    // The upserted bank moves to the end, then back to its place by bank.
+    assert_eq!(
+        apply_errors(
+            &rom,
+            &original,
+            serde_json::json!([{"op": "upsert", "kind": "banks", "item": {"bank": 2, "org": "$8000"}}]),
+        ),
+        [
+            "In the changed annotations: banks[0]: banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000"
+        ]
+    );
+}

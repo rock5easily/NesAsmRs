@@ -266,7 +266,9 @@ writes it as one change:
 - The file is written in canonical form: `rom`, `load_address`, `base`,
   `options`, then the lists (`banks`, `entry_points`, `labels`, `symbols`,
   `regions`, `comments`, `operands`, `references`, `patches`) with one entry
-  per line, ordered by bank and address (symbols by value), each naming its
+  per line, ordered by bank and address (symbols by value; labels at one
+  address and symbols of one value keep their order, as the first one names
+  the place), banks by bank, each naming its
   bank, addresses as `"$C000"` and fields at their default values left out.
   `reformatted` tells that a file was not in that form before.
 - Each write appends a line to `<name>.disasm.log.jsonl` beside the file: the

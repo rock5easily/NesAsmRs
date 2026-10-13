@@ -203,7 +203,8 @@ trait Entry: Clone + Serialize + DeserializeOwned {
     /// The bank and address in the ROM the entry names, if any.
     fn location(&mut self) -> Option<(&mut Option<usize>, Address)>;
     fn key(&self) -> Key;
-    /// Where the entry goes in the written file.
+    /// Where the entry goes in the written file; entries with the same place
+    /// keep their order (the sort is stable).
     fn order(&self) -> (Option<usize>, u32, String);
     fn check(&self) -> Result<(), String> {
         Ok(())
@@ -234,7 +235,8 @@ impl Entry for LabelDef {
         Key::Name(self.name.clone())
     }
     fn order(&self) -> (Option<usize>, u32, String) {
-        (self.bank, self.address.0, self.name.clone())
+        // Labels at one address keep their order: the first names the place.
+        (self.bank, self.address.0, String::new())
     }
 }
 
@@ -246,7 +248,8 @@ impl Entry for SymbolDef {
         Key::Name(self.name.clone())
     }
     fn order(&self) -> (Option<usize>, u32, String) {
-        (None, self.value.0, self.name.clone())
+        // Symbols of one value keep their order: the first names the value.
+        (None, self.value.0, String::new())
     }
 }
 
@@ -590,10 +593,12 @@ pub fn apply_operations(
     for index in (0..operations.len()).filter(|i| layout(&operations[*i])) {
         apply(&mut config, index, None);
     }
+    // Layout errors name banks entries by their index in canonical order.
+    sort(&mut config.banks);
     let memory = match Memory::new(rom_file, &config) {
         Ok(memory) => memory,
         Err(e) => {
-            errors.push(e);
+            errors.push(format!("In the changed annotations: {e}"));
             return Err(errors);
         }
     };

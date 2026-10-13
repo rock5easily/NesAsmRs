@@ -1149,3 +1149,19 @@ fn annotate_errors_name_entries_of_the_changed_annotations() {
         a["structuredContent"]["sha256"]
     );
 }
+
+#[test]
+fn inline_digests_tell_the_order_of_names_for_one_place() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let digest = |c: &mut Client, first: &str, second: &str| {
+        let inline = json!({"rom": "old/loose.nes", "labels": [
+            {"address": "$E000", "name": first}, {"address": "$E000", "name": second}]});
+        let r = c.call("disassemble", json!({"inline":inline}));
+        assert_eq!(r["isError"], false, "{r}");
+        r["structuredContent"]["inputs"]["annotations_sha256"].clone()
+    };
+    let one = digest(&mut c, "Zulu", "Alpha");
+    let other = digest(&mut c, "Alpha", "Zulu");
+    assert_ne!(one, other);
+}
