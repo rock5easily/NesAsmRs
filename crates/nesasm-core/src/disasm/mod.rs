@@ -170,35 +170,55 @@ pub fn compare_issues(before: &[Issue], after: &[Issue]) -> IssueComparison {
     let (old, new) = (ids(before), ids(after));
     // Unknown ranges are named by their first address, which annotations of
     // a part move: ranges of a bank that share bytes continue one another.
-    let unknown = |issue: &Issue| issue.kind == IssueKind::UnknownRange;
-    let overlap = |a: &Issue, b: &Issue| {
-        unknown(a)
-            && unknown(b)
-            && a.bank == b.bank
-            && a.spans.iter().any(|(start, length)| {
-                b.spans
-                    .iter()
-                    .any(|(s, l)| *start < s + l && *s < start + length)
+    // Only they are compared by their bytes, within their bank.
+    fn ranges(issues: &[Issue]) -> BTreeMap<Option<usize>, Vec<&Issue>> {
+        let mut banks: BTreeMap<Option<usize>, Vec<&Issue>> = BTreeMap::new();
+        for issue in issues.iter().filter(|i| i.kind == IssueKind::UnknownRange) {
+            banks.entry(issue.bank).or_default().push(issue);
+        }
+        banks
+    }
+    fn overlapping<'a>(
+        issue: &Issue,
+        ranges: &BTreeMap<Option<usize>, Vec<&'a Issue>>,
+    ) -> Vec<&'a Issue> {
+        if issue.kind != IssueKind::UnknownRange {
+            return Vec::new();
+        }
+        ranges
+            .get(&issue.bank)
+            .into_iter()
+            .flatten()
+            .filter(|other| {
+                issue.spans.iter().any(|(start, length)| {
+                    other
+                        .spans
+                        .iter()
+                        .any(|(s, l)| *start < s + l && *s < start + length)
+                })
             })
-    };
+            .copied()
+            .collect()
+    }
+    let (old_ranges, new_ranges) = (ranges(before), ranges(after));
     IssueComparison {
         resolved: before
             .iter()
-            .filter(|i| !new.contains_key(&i.id) && !after.iter().any(|j| overlap(i, j)))
+            .filter(|i| !new.contains_key(&i.id) && overlapping(i, &new_ranges).is_empty())
             .cloned()
             .collect(),
         introduced: after
             .iter()
-            .filter(|i| !old.contains_key(&i.id) && !before.iter().any(|j| overlap(i, j)))
+            .filter(|i| !old.contains_key(&i.id) && overlapping(i, &old_ranges).is_empty())
             .cloned()
             .collect(),
         changed: after
             .iter()
             .filter_map(|issue| {
                 let same = old.get(&issue.id).map(|i| &before[*i]);
-                let others: Vec<&Issue> = before
-                    .iter()
-                    .filter(|b| b.id != issue.id && overlap(issue, b))
+                let others: Vec<&Issue> = overlapping(issue, &old_ranges)
+                    .into_iter()
+                    .filter(|b| b.id != issue.id)
                     .collect();
                 let previous = same.or_else(|| others.first().copied())?;
                 let previous_ids: Vec<String> = if others.is_empty() {
