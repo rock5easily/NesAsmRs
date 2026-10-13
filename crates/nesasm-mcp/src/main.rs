@@ -958,11 +958,7 @@ impl Server {
                 let (config, bytes) = Self::read_annotations(root, path)?;
                 (config, SourceLocation::file(path), bytes)
             }
-            (None, Some(config)) => (
-                config.clone(),
-                SourceLocation::default(),
-                disasm::canonical_json(config).into_bytes(),
-            ),
+            (None, Some(config)) => (config.clone(), SourceLocation::default(), Vec::new()),
             _ => {
                 return Err(vec![error(
                     DiagnosticCode::Disasm,
@@ -972,6 +968,15 @@ impl Server {
         };
         let rom = Self::read_rom(root, &config, &location)?;
         let disassembly = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        // Inline annotations as annotate would write them: canonical, each
+        // entry with its bank.
+        let text = if annotations.is_some() {
+            text
+        } else {
+            let normalized = disasm::apply_operations(&config, &rom.bytes, &[])
+                .map_or_else(|_| config.clone(), |(config, _)| config);
+            disasm::canonical_json(&normalized).into_bytes()
+        };
         let inputs = Inputs {
             rom_sha256: disasm::sha256_hex(&rom.bytes),
             base_sha256: rom.base.as_deref().map(disasm::sha256_hex),
@@ -1355,7 +1360,21 @@ impl Server {
         let (config, applied) = disasm::apply_operations(&original, &rom.bytes, &input.operations)
             .map_err(with_location)?;
         report.applied = applied;
-        let after = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        let after = match Self::disassemble_with(root, &config, &rom, output, &location, cancel) {
+            Ok(after) => after,
+            Err(diagnostics) => {
+                // The errors name entries by their index in the changed
+                // annotations, which are in canonical order: return them.
+                report.annotations = serde_json::from_str(&disasm::canonical_json(&config)).ok();
+                return Err(diagnostics
+                    .into_iter()
+                    .map(|d| Diagnostic {
+                        message: format!("In the changed annotations: {}", d.message),
+                        ..d
+                    })
+                    .collect());
+            }
+        };
         let verification = after.verify(root, Some(root), cancel);
         let matched = verification.matched;
         report.verification = Some(verification);

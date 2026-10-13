@@ -250,7 +250,9 @@ writes it as one change:
   be held by one bank of the resulting layout. The result is checked as a
   whole: duplicate keys (also ones the file already had), overlapping
   regions and the other annotation errors fail, naming the operation where
-  they come from one.
+  they come from one. Errors of the analysis of the changed annotations
+  start with `In the changed annotations:` and name entries by their index in
+  them, in canonical order; the result then returns them as `annotations`.
 - `evidence` is required for entries that override what the analysis finds:
   `references`, `entry_points` with `no_return`, `inline_bytes`,
   `switch_banks` or `keeps_banks`, and `regions` of type `code` or with

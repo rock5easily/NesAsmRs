@@ -420,7 +420,7 @@ fn fixed_pair(
             banks[first + 1].end
         ));
     }
-    for layout in &config.banks {
+    for (i, layout) in config.banks.iter().enumerate() {
         let fixed = match layout.bank {
             b if b == first => 0xc000,
             b if b == first + 1 => 0xe000,
@@ -428,7 +428,7 @@ fn fixed_pair(
         };
         if layout.org.0 != fixed {
             return Err(format!(
-                "banks gives bank {} org {}, but {OPTION} places it at {}",
+                "banks[{i}]: banks gives bank {} org {}, but {OPTION} places it at {}",
                 layout.bank,
                 layout.org,
                 Address(fixed)
@@ -755,6 +755,8 @@ pub(crate) struct Analysis {
     /// the instruction that completed the pointer, and the low and high
     /// byte tables with their index register.
     table_pointers: BTreeMap<u32, (Loc, Source, Source)>,
+    /// The annotation that gives each user name, for errors.
+    user_names: HashMap<String, String>,
 }
 
 impl Analysis {
@@ -841,6 +843,7 @@ impl Analysis {
             jump_issues: Vec::new(),
             switch_hints: BTreeMap::new(),
             table_pointers: BTreeMap::new(),
+            user_names: HashMap::new(),
         };
         analysis.apply(config)?;
         analysis.check_header();
@@ -997,6 +1000,7 @@ impl Analysis {
                 }
             }
         }
+        self.user_names = names;
         for (i, comment) in config.comments.iter().enumerate() {
             match self.memory.locate(comment.bank, comment.address) {
                 Ok(loc) => self.comment(loc, &comment.text, comment.position),
@@ -2531,6 +2535,13 @@ impl Analysis {
 
     /// Gives every wanted address a name: annotations first, then vectors,
     /// then automatic names.
+    /// `"labels[3] $C00B (Wait): "`: the annotation that gives `name`.
+    fn given(&self, name: &str) -> String {
+        self.user_names
+            .get(name)
+            .map_or(String::new(), |what| format!("{what}: "))
+    }
+
     fn name_labels(&mut self) -> Result<(), Vec<String>> {
         // Code targets inside an instruction are written as `label+n`, so the
         // instruction needs a label.
@@ -2592,7 +2603,8 @@ impl Analysis {
             };
             if user.contains(&name) {
                 errors.push(format!(
-                    "Name '{name}' is also the automatic label of ${address:04X} in bank {}; choose another name",
+                    "{}Name '{name}' is also the automatic label of ${address:04X} in bank {}; choose another name",
+                    self.given(&name),
                     loc.bank
                 ));
             }
@@ -2623,7 +2635,8 @@ impl Analysis {
                 };
                 if user.contains(&name) {
                     errors.push(format!(
-                        "Name '{name}' is also an automatic RAM name; choose another name"
+                        "{}Name '{name}' is also an automatic RAM name; choose another name",
+                        self.given(&name)
                     ));
                 }
                 self.symbols.push(SymbolEntry {

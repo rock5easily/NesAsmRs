@@ -1119,3 +1119,33 @@ fn disassembly_reports_name_their_inputs() {
     );
     assert_eq!(r["structuredContent"]["diagnostics"], json!([]), "{r}");
 }
+
+#[test]
+fn annotate_errors_name_entries_of_the_changed_annotations() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    // Canonical order puts the invalid label first.
+    let inline = json!({"rom": "old/loose.nes", "labels": [
+        {"address": "$E005", "name": "Fine"}, {"address": "$E000", "name": "9lives"}]});
+    let r = c.call("annotate", json!({"inline":inline,"operations":[]}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains(
+            "In the changed annotations: labels[0] $E000 (9lives): Invalid name '9lives'"
+        ),
+        "{r}"
+    );
+    assert_eq!(
+        r["structuredContent"]["annotations"]["labels"][0]["name"],
+        "9lives"
+    );
+    // The digest of inline annotations is that of what annotate writes.
+    let inline = json!({"rom": "old/loose.nes", "labels": [{"address": "$E005", "name": "Fine"}]});
+    let d = c.call("disassemble", json!({"inline":inline}));
+    let a = c.call("annotate", json!({"inline":inline,"operations":[]}));
+    assert_eq!(a["isError"], false, "{a}");
+    assert_eq!(
+        d["structuredContent"]["inputs"]["annotations_sha256"],
+        a["structuredContent"]["sha256"]
+    );
+}

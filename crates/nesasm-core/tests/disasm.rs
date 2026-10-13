@@ -1951,12 +1951,12 @@ fn mapper4_fixed_prg_16k_needs_a_mapper_4_rom_and_agreeing_banks() {
     fails(
         &rom,
         &banks(r#"{"bank": 2, "org": "$8000"}"#),
-        "banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000",
+        "banks[0]: banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000",
     );
     fails(
         &rom,
         &banks(r#"{"bank": 3, "org": "$A000"}"#),
-        "banks gives bank 3 org $A000, but options.mapper4_fixed_prg_16k places it at $E000",
+        "banks[0]: banks gives bank 3 org $A000, but options.mapper4_fixed_prg_16k places it at $E000",
     );
     // The windows the option sets may also be given.
     round_trip(
@@ -4138,4 +4138,28 @@ fn issues_are_compared_by_id() {
     // Nothing differs from itself.
     let same = disasm::compare_issues(after.issues(), after.issues());
     assert!(same.resolved.is_empty() && same.introduced.is_empty() && same.changed.is_empty());
+}
+
+#[test]
+fn names_taken_by_automatic_names_name_their_entry() {
+    let rom = nrom("Reset:\n  lda <$20\n  jmp Next\nNext:\n  jmp Reset\nNmi:\n  rti\n");
+    for (json, message) in [
+        (
+            r#"{"labels": [{"address": "$E000", "name": "Start"}, {"address": "$E002", "name": "L_E005"}]}"#,
+            "labels[1] $E002 (L_E005): Name 'L_E005' is also the automatic label of $E005 in bank 1; choose another name",
+        ),
+        (
+            r#"{"symbols": [{"name": "zp_20", "value": "$30"}], "options": {"auto_ram_labels": true}}"#,
+            "symbols[0] $0030 (zp_20): Name 'zp_20' is also an automatic RAM name; choose another name",
+        ),
+    ] {
+        let e = disasm::disassemble(&rom, None, &config(json), Path::new("out.asm"), &NEVER)
+            .err()
+            .unwrap_or_else(|| panic!("{json} should fail"));
+        assert!(
+            e.iter().any(|d| d.message == message),
+            "{json}: {:?}",
+            e.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }
