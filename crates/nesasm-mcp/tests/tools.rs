@@ -974,3 +974,18 @@ fn annotate_inline_returns_the_annotations_and_suggestions_apply() {
     let issue = &r["structuredContent"]["issues"]["items"][0];
     assert!(issue.get("suggestions").is_none(), "{r}");
 }
+
+#[test]
+fn annotate_compares_inline_annotations_with_themselves_before() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let r = c.call(
+        "annotate",
+        json!({"inline":{"rom":"old/loose.nes"},"operations":[]}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["summary_before"], report["summary_after"]);
+    assert_eq!(report["issues_resolved"]["total"], 0);
+    assert_eq!(report["issues_introduced"]["total"], 0);
+}

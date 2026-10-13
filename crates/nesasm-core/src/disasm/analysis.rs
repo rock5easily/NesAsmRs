@@ -2213,7 +2213,12 @@ impl Analysis {
         let described = self
             .region_at(low)
             .is_some_and(|r| r.code_targets && r.start == low.offset);
-        (low.bank == high.bank && !described).then_some(Fix::Table { low, high, adjust })
+        // Bytes read from one table are not an address table.
+        (low.bank == high.bank && low != high && !described).then_some(Fix::Table {
+            low,
+            high,
+            adjust,
+        })
     }
 
     /// An indirect JMP whose targets are not known: how to describe them.

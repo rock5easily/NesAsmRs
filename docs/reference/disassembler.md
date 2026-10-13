@@ -278,7 +278,8 @@ writes it as one change:
   issue whose message changed at the same place is neither).
 
 Only files named `*.disasm.json` inside the root and outside hidden
-directories are written (also after following links), with their log.
+directories are written (also after following links; a link to a file or
+directory that does not exist is refused), with their log.
 
 ## Annotation file
 

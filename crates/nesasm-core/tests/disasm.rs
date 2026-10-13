@@ -3858,3 +3858,62 @@ fn issues_suggest_jump_tables() {
     );
     assert_lines(&d, &["\t.db LOW(L_E00C-1), LOW(L_E00D-1)"]);
 }
+
+#[test]
+fn entries_without_a_bank_that_several_banks_hold_can_be_replaced() {
+    let rom = two_banks_at_8000();
+    // With bank 1 at $8000, the entry point names no single bank.
+    let original = config(
+        r#"{"banks": [{"bank": 1, "org": "$8000"}], "entry_points": [{"address": "$8000", "name": "Here"}],
+            "comments": [{"address": "$8000", "text": "one"}]}"#,
+    );
+    for key in [
+        serde_json::json!({"bank": 1, "address": "$8000"}),
+        serde_json::json!({"address": "$8000"}),
+    ] {
+        let changed = apply(
+            &rom,
+            &original,
+            serde_json::json!([
+                {"op": "remove", "kind": "entry_points", "key": key},
+                {"op": "remove", "kind": "comments", "key": key},
+            ]),
+        );
+        assert!(changed.entry_points.is_empty() && changed.comments.is_empty());
+    }
+    let changed = apply(
+        &rom,
+        &original,
+        serde_json::json!([
+            {"op": "upsert", "kind": "entry_points", "item": {"bank": 1, "address": "$8000", "name": "Here"}},
+            {"op": "upsert", "kind": "comments", "item": {"bank": 1, "address": "$8000", "text": "one"}},
+        ]),
+    );
+    assert_eq!(changed.entry_points.len(), 1);
+    assert_eq!(changed.entry_points[0].bank, Some(1));
+    assert_eq!(changed.comments[0].bank, Some(1));
+    round_trip(&rom, &changed);
+    // An entry that names its bank is not removed without it.
+    assert_eq!(
+        apply_errors(
+            &rom,
+            &changed,
+            serde_json::json!([{"op": "remove", "kind": "entry_points", "key": {"address": "$8000"}}]),
+        ),
+        ["operations[0] (remove entry_points): no entry matches the key"]
+    );
+}
+
+#[test]
+fn bytes_read_from_one_table_suggest_no_address_table() {
+    let rom = nrom(concat!(
+        "Reset:\n  ldx $0300\n  lda Table,x\n  pha\n  pha\n  rts\n",
+        "Table:\n  .db $E0, $E1\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_eq!(issues(&d, IssueKind::IndirectJump).len(), 1);
+    assert_eq!(
+        suggestions(&d, IssueKind::IndirectJump),
+        serde_json::json!([[]])
+    );
+}

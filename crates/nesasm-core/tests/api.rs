@@ -1316,3 +1316,22 @@ fn annotation_files_are_written_only_over_what_was_read() {
         .unwrap_err();
     assert!(e.contains("hidden"), "{e}");
 }
+
+#[cfg(unix)]
+#[test]
+fn annotation_files_do_not_follow_links_to_missing_files() {
+    let t = Temp::new();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("stolen.disasm.log.jsonl");
+    std::os::unix::fs::symlink(&target, t.0.join("game.disasm.log.jsonl")).unwrap();
+    let e =
+        nesasm_core::append_annotation_log(Path::new("game.disasm.json"), &t.0, "{}").unwrap_err();
+    assert!(e.contains("is a link to a file that does not exist"), "{e}");
+    assert!(!target.exists());
+    // Nor directories that do not exist.
+    std::os::unix::fs::symlink(outside.path().join("missing"), t.0.join("notes")).unwrap();
+    let e = nesasm_core::write_annotations(Path::new("notes/game.disasm.json"), &t.0, "{}", None)
+        .unwrap_err();
+    assert!(e.contains("is a link to a file that does not exist"), "{e}");
+    assert!(!outside.path().join("missing").exists());
+}

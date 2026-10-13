@@ -169,6 +169,20 @@ fn rooted_file(path: &Path, root: &Path, suffix: &str) -> Result<PathBuf, String
     if !has_suffix(path, suffix) {
         return Err(format!("The file name must end with {suffix}"));
     }
+    // A link whose target does not exist is not resolved, but creating the
+    // file or its directories would follow it, possibly out of the root.
+    let full = root.join(path);
+    for ancestor in full
+        .ancestors()
+        .take_while(|a| a.starts_with(root) && *a != root)
+    {
+        if fs::symlink_metadata(ancestor).is_ok() && !ancestor.exists() {
+            return Err(format!(
+                "{} is a link to a file that does not exist",
+                ancestor.display()
+            ));
+        }
+    }
     let resolved = resolve_path(path, root, Some(root))?;
     check_not_hidden(&resolved, root)?;
     if !has_suffix(&resolved, suffix) {
@@ -195,24 +209,30 @@ pub fn write_annotations(
     expected: Option<&str>,
 ) -> Result<Artifact, String> {
     let resolved = rooted_file(path, root, ANNOTATIONS_SUFFIX)?;
-    match (fs::read(&resolved), expected) {
+    let unchanged = || match (fs::read(&resolved), expected) {
         (Ok(current), Some(expected)) => {
-            if !crate::disasm::sha256_hex(&current).eq_ignore_ascii_case(expected) {
-                return Err(format!(
+            if crate::disasm::sha256_hex(&current).eq_ignore_ascii_case(expected) {
+                Ok(())
+            } else {
+                Err(format!(
                     "{} changed since it was read (its SHA-256 is not expected_sha256); read it again",
                     path.display()
-                ));
+                ))
             }
         }
-        (Ok(_), None) => return Err(format!("{} exists", path.display())),
-        (Err(e), None) if e.kind() == io::ErrorKind::NotFound => {}
-        (Err(e), _) => return Err(format!("{}: {e}", path.display())),
-    }
+        (Ok(_), None) => Err(format!("{} exists", path.display())),
+        (Err(e), None) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        (Err(e), _) => Err(format!("{}: {e}", path.display())),
+    };
+    unchanged()?;
     if let Some(parent) = resolved.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let staged = StagedArtifact::write(ArtifactKind::Annotations, resolved, text.as_bytes())
-        .map_err(|e| e.to_string())?;
+    let staged =
+        StagedArtifact::write(ArtifactKind::Annotations, resolved.clone(), text.as_bytes())
+            .map_err(|e| e.to_string())?;
+    // Again just before the rename, after the time writing took.
+    unchanged()?;
     let (mut artifacts, _) = commit_all(vec![staged], &mut |from, to| fs::rename(from, to))?;
     Ok(artifacts.remove(0))
 }
@@ -227,9 +247,13 @@ pub fn append_annotation_log(
     let log = annotation_log_path(annotations)
         .ok_or_else(|| format!("The file name must end with {ANNOTATIONS_SUFFIX}"))?;
     let resolved = rooted_file(&log, root, ANNOTATION_LOG_SUFFIX)?;
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // A new log is created only where nothing is, not even a link.
     let mut file = fs::OpenOptions::new()
-        .create(true)
         .append(true)
+        .create_new(!resolved.exists())
         .open(&resolved)
         .map_err(|e| format!("{}: {e}", log.display()))?;
     file.write_all(format!("{line}\n").as_bytes())

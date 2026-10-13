@@ -162,6 +162,21 @@ enum Key {
     Bank(usize),
 }
 
+impl Key {
+    /// Whether an entry with the key `entry` has this key, or would have it
+    /// with a bank: one that leaves out a bank no single bank holds the
+    /// address of can still be replaced or removed.
+    fn names(&self, entry: &Key) -> bool {
+        match (self, entry) {
+            (Self::At(_, address), Self::At(None, other)) => address == other,
+            (Self::Comment(_, address, position), Self::Comment(None, other, at)) => {
+                address == other && position == at
+            }
+            _ => self == entry,
+        }
+    }
+}
+
 impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let at = |bank: &Option<usize>, address: u32| match bank {
@@ -356,7 +371,7 @@ fn upsert<T: Entry>(
     let key = item.key();
     let mut previous = Vec::new();
     list.retain(|entry| {
-        let same = entry.key() == key;
+        let same = key.names(&entry.key());
         if same {
             previous.push(to_value(entry));
         }
@@ -377,10 +392,11 @@ fn remove<T: Entry>(
         key.address
             .ok_or_else(|| format!("{} are removed by address", kind.name()))
     };
+    // Without a bank no single bank holds, only entries without one match.
     let bank = |address: Address| match (key.bank, memory) {
-        (Some(bank), _) => Ok(bank),
-        (None, Some(memory)) => memory.locate(None, address).map(|l| l.bank),
-        (None, None) => Err("give bank".to_owned()),
+        (Some(bank), _) => Some(bank),
+        (None, Some(memory)) => memory.locate(None, address).ok().map(|l| l.bank),
+        (None, None) => None,
     };
     let matches: Box<dyn Fn(&Key) -> bool> = match kind {
         AnnotationKind::Labels | AnnotationKind::Symbols => {
@@ -396,17 +412,18 @@ fn remove<T: Entry>(
         }
         AnnotationKind::Comments => {
             let address = address()?;
-            let bank = bank(address)?;
+            let bank = bank(address);
             let position = key.position;
             Box::new(move |k| {
-                matches!(k, Key::Comment(b, a, p)
-                    if *b == Some(bank) && *a == address.0 && position.is_none_or(|q| q == *p))
+                matches!(k, Key::Comment(_, _, p)
+                    if position.is_none_or(|q| q == *p)
+                        && Key::Comment(bank, address.0, *p).names(k))
             })
         }
         _ => {
             let address = address()?;
-            let bank = bank(address)?;
-            Box::new(move |k| *k == Key::At(Some(bank), address.0))
+            let bank = bank(address);
+            Box::new(move |k| Key::At(bank, address.0).names(k))
         }
     };
     let mut previous = Vec::new();

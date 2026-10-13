@@ -596,6 +596,17 @@ impl Server {
         &self,
         work: impl FnOnce(&Path, &AtomicBool) -> T + Send + 'static,
     ) -> Result<T, Diagnostic> {
+        self.guarded_late(work)
+            .await
+            .map_err(|(diagnostic, _)| diagnostic)
+    }
+
+    /// Like [`Self::guarded`]; on timeout, also the result of the work,
+    /// which ran on after the flag was set.
+    async fn guarded_late<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Path, &AtomicBool) -> T + Send + 'static,
+    ) -> Result<T, (Diagnostic, Option<T>)> {
         let guard = self.gate.clone().lock_owned().await;
         let root = self.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -612,15 +623,18 @@ impl Server {
             }
         };
         if timed_out {
-            return Err(error(
-                DiagnosticCode::Timeout,
-                format!(
-                    "Assembly exceeded the {} second time limit",
-                    self.timeout.as_secs()
+            return Err((
+                error(
+                    DiagnosticCode::Timeout,
+                    format!(
+                        "Assembly exceeded the {} second time limit",
+                        self.timeout.as_secs()
+                    ),
                 ),
+                joined.ok(),
             ));
         }
-        joined.map_err(|e| error(DiagnosticCode::Internal, e.to_string()))
+        joined.map_err(|e| (error(DiagnosticCode::Internal, e.to_string()), None))
     }
 
     async fn execute(
@@ -1156,8 +1170,10 @@ impl Server {
         };
         let rom = Self::read_rom(root, &original, &location)?;
         let output = input.output.as_deref();
-        let before = existing
-            .is_some()
+        // A new file has nothing before; inline annotations do.
+        let before = input
+            .create
+            .is_none()
             .then(|| Self::disassemble_with(root, &original, &rom, output, &location, cancel).ok())
             .flatten();
         if let Some(bytes) = &existing {
@@ -1613,13 +1629,28 @@ impl Server {
     }
     #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations: upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after, and the issues resolved and introduced. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
     async fn annotate(&self, Parameters(input): Parameters<AnnotateInput>) -> CallToolResult {
-        let report = self
-            .guarded(move |root, cancel| Self::annotate_report(root, &input, cancel))
+        let report = match self
+            .guarded_late(move |root, cancel| Self::annotate_report(root, &input, cancel))
             .await
-            .unwrap_or_else(|diagnostic| AnnotateReport {
+        {
+            Ok(report) => report,
+            // The file was written once writing had started: say so.
+            Err((diagnostic, Some(mut report))) if report.written => {
+                report.diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: format!(
+                        "{}; it passed while writing, and the annotations were written",
+                        diagnostic.message
+                    ),
+                    ..diagnostic
+                });
+                report
+            }
+            Err((diagnostic, _)) => AnnotateReport {
                 diagnostics: vec![diagnostic],
                 ..AnnotateReport::default()
-            });
+            },
+        };
         let summary = Self::annotate_summary(&report);
         tool_result(&report, report.success, summary)
     }
