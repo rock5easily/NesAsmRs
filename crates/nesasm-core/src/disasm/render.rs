@@ -155,7 +155,11 @@ pub(crate) fn render(
         stops[region.bank].extend([region.start, region.end]);
     }
     for (loc, insn) in &a.insns {
-        stops[loc.bank].extend([loc.offset, loc.offset + insn.len]);
+        stops[loc.bank].insert(loc.offset);
+        // An instruction of the fixed pair may end in the next bank.
+        if let Some(last) = a.memory.step(*loc, insn.len - 1) {
+            stops[last.bank].insert(last.offset + 1);
+        }
     }
     for (bank, ranges) in patches.iter().flat_map(|p| p.ranges.iter().enumerate()) {
         for range in ranges {
@@ -188,12 +192,26 @@ pub(crate) fn render(
             }
         }
     }
+    // Where the fixed pair starts, after its blank separator line: the
+    // second-to-last bank continues into the last with `.catbank`.
+    let pair = a.memory.pair;
+    let mut catbank = None;
     for bank in a.memory.prg_banks() {
+        if pair == Some(bank.index) {
+            catbank = Some(w.lines.len() + 1);
+        }
         w.prg_bank(bank.index);
     }
+    let catbank = catbank.filter(|at| *at <= w.lines.len());
+    let mut body = std::mem::take(&mut w.lines);
     let chr_path = super::chr_path(source);
     let chr = w.chr_banks(&quoted_path(&chr_path));
-    let body = std::mem::take(&mut w.lines);
+    // A ROM hack writes its changed CHR banks in the main file, over the
+    // base ROM; there are no bank files of CHR banks.
+    let mut chr_lines = std::mem::take(&mut w.lines);
+    if patches.is_none() {
+        body.append(&mut chr_lines);
+    }
     w.include_base();
     let base = std::mem::take(&mut w.lines);
     let mut head = Vec::new();
@@ -267,47 +285,68 @@ pub(crate) fn render(
         push(String::new());
         head.extend(base);
     }
-    let size: usize = head.iter().chain(&body).map(|l| l.text.len() + 1).sum();
+    let size: usize = head
+        .iter()
+        .chain(&body)
+        .chain(&chr_lines)
+        .map(|l| l.text.len() + 1)
+        .sum();
     let split = a.options.split_banks.unwrap_or(size > SPLIT_SIZE);
+    let main_line = |text: String| SourceLine {
+        bank: None,
+        address: None,
+        size: 0,
+        bytes: String::new(),
+        text,
+    };
+    let catbank_line = |first: usize| main_line(format!("{INDENT}.catbank {}", hex2(first as u32)));
     let mut files = Vec::new();
     let mut lines = head.clone();
     if split {
-        // One file per bank, included from the main file.
+        // One file per bank (one for the fixed pair), included from the main file.
+        let file_of = |bank: usize| match pair {
+            Some(first) if bank == first + 1 => first,
+            _ => bank,
+        };
         let mut banks: Vec<(usize, Vec<SourceLine>)> = Vec::new();
         for line in body {
-            let bank = line.bank.unwrap_or_default();
+            let bank = file_of(line.bank.unwrap_or_default());
             match banks.last_mut() {
                 Some((b, lines)) if *b == bank => lines.push(line),
                 _ => banks.push((bank, vec![line])),
             }
         }
-        head.push(SourceLine {
-            bank: None,
-            address: None,
-            size: 0,
-            bytes: String::new(),
-            text: String::new(),
-        });
+        if !banks.is_empty() {
+            head.push(main_line(String::new()));
+        }
         for (bank, mut bank_lines) in banks {
             // The blank separator line belongs to the main file.
             if bank_lines.first().is_some_and(|l| l.text.is_empty()) {
                 bank_lines.remove(0);
             }
-            let path = super::bank_path(source, bank);
-            head.push(SourceLine {
-                bank: None,
-                address: None,
-                size: 0,
-                bytes: String::new(),
-                text: format!("{INDENT}.include \"{}\"", quoted_path(&path)),
-            });
+            let path = if pair == Some(bank) {
+                head.push(catbank_line(bank));
+                lines.push(catbank_line(bank));
+                super::bank_pair_path(source, bank)
+            } else {
+                super::bank_path(source, bank)
+            };
+            head.push(main_line(format!(
+                "{INDENT}.include \"{}\"",
+                quoted_path(&path)
+            )));
             files.push((path, file_text(&bank_lines)));
             lines.extend(bank_lines);
         }
     } else {
+        if let (Some(at), Some(first)) = (catbank, pair) {
+            body.insert(at, catbank_line(first));
+        }
         lines.extend(body.iter().cloned());
         head.extend(body);
     }
+    lines.extend(chr_lines.iter().cloned());
+    head.extend(chr_lines);
     files.insert(0, (source.to_owned(), file_text(&head)));
     Rendered {
         files,
@@ -330,16 +369,25 @@ fn hex4(value: u32) -> String {
 
 impl Writer<'_> {
     fn push(&mut self, bank: usize, address: Option<u32>, size: usize, text: String) {
-        let image = &self.a.memory.banks[bank];
+        let memory = &self.a.memory;
+        let image = &memory.banks[bank];
         let bytes = match address {
             Some(address) if size > 0 => {
-                let offset = if image.chr {
-                    address as usize
+                let shown: Vec<u8> = if image.chr {
+                    let offset = address as usize;
+                    image.data[offset..offset + size.min(SHOWN_BYTES)].to_vec()
                 } else {
-                    (address - image.org) as usize
+                    // An instruction of the fixed pair may end in the next bank.
+                    let loc = Loc {
+                        bank,
+                        offset: (address - image.org) as usize,
+                    };
+                    (0..size.min(SHOWN_BYTES))
+                        .map_while(|n| memory.step(loc, n))
+                        .map(|l| memory.byte(l))
+                        .collect()
                 };
-                let mut hex =
-                    crate::inspect::hex(&image.data[offset..offset + size.min(SHOWN_BYTES)]);
+                let mut hex = crate::inspect::hex(&shown);
                 if size > SHOWN_BYTES {
                     hex.push_str(" ..");
                 }
@@ -375,33 +423,78 @@ impl Writer<'_> {
     fn prg_bank(&mut self, index: usize) {
         let bank = &self.a.memory.banks[index];
         let (org, start, end) = (bank.org, bank.start, bank.end);
+        // Bytes at the start that an instruction of the previous bank of the
+        // fixed pair ends with: no `.bank` or `.org` can split it, so the
+        // assembler continues into this bank (`.catbank`).
+        let continued = self.continued(index);
         let Some(patches) = self.patches else {
-            self.push(index, None, 0, String::new());
-            self.push(index, None, 0, format!("{INDENT}.bank {index}"));
-            self.push(
-                index,
-                None,
-                0,
-                format!("{INDENT}.org {}", hex4(org + start as u32)),
-            );
-            self.code_and_data(index, start, end);
+            if continued > 0 {
+                self.boundary(index);
+            } else {
+                self.push(index, None, 0, String::new());
+                self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+                self.push(
+                    index,
+                    None,
+                    0,
+                    format!("{INDENT}.org {}", hex4(org + start as u32)),
+                );
+            }
+            self.code_and_data(index, start + continued, end);
             return;
         };
         // A ROM hack: only the changed ranges, written over the base ROM
         // that the main file includes. A bank without changes has no lines.
-        for (i, range) in patches.ranges[index].iter().enumerate() {
-            self.push(index, None, 0, String::new());
-            if i == 0 {
-                self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+        let mut opened = false;
+        for range in &patches.ranges[index] {
+            // A range ending with such an instruction continues into this one.
+            let continues = range.start < continued;
+            if !continues {
+                self.push(index, None, 0, String::new());
+                if !opened {
+                    self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+                }
+                opened = true;
             }
             let address = org + range.start as u32;
             for line in range.comment.iter().flat_map(|c| c.lines()) {
                 let text = format!("; {line}").trim_end().to_owned();
                 self.push(index, Some(address), 0, text);
             }
-            self.push(index, None, 0, format!("{INDENT}.org {}", hex4(address)));
-            self.code_and_data(index, range.start, range.end);
+            if continues {
+                self.boundary(index);
+                self.code_and_data(index, continued, range.end);
+            } else {
+                self.push(index, None, 0, format!("{INDENT}.org {}", hex4(address)));
+                self.code_and_data(index, range.start, range.end);
+            }
         }
+    }
+
+    /// How many bytes at the start of `bank` belong to an instruction that
+    /// starts in the previous bank of the fixed pair.
+    fn continued(&self, bank: usize) -> usize {
+        let start = Loc { bank, offset: 0 };
+        (1..=2)
+            .find_map(|n| {
+                let insn = self.a.insns.get(&self.a.memory.back(start, n)?)?;
+                (insn.len > n).then(|| insn.len - n)
+            })
+            .unwrap_or(0)
+    }
+
+    /// The note where the last bank of the fixed pair starts inside an instruction.
+    fn boundary(&mut self, index: usize) {
+        let org = self.a.memory.banks[index].org;
+        self.push(
+            index,
+            Some(org),
+            0,
+            format!(
+                "; Bank {index} starts at {}, inside the instruction above",
+                hex4(org)
+            ),
+        );
     }
 
     /// The instructions and data of `start..end` of a PRG bank.
@@ -493,8 +586,8 @@ impl Writer<'_> {
             above.extend(comment.lines().map(str::to_owned));
         }
         let size = self.a.insns.get(&loc).map_or(1, |i| i.len);
-        for offset in loc.offset..loc.offset + size {
-            if let Some((lines, _)) = self.a.comments.get(&loc.at(offset)) {
+        for inner in self.covered(loc, size) {
+            if let Some((lines, _)) = self.a.comments.get(&inner) {
                 above.extend(lines.iter().cloned());
             }
         }
@@ -526,8 +619,8 @@ impl Writer<'_> {
         if self.a.options.address_comments {
             parts.push(hex4(self.a.memory.address(loc)));
         }
-        for offset in loc.offset..loc.offset + size {
-            if let Some((_, line)) = self.a.comments.get(&loc.at(offset)) {
+        for inner in self.covered(loc, size) {
+            if let Some((_, line)) = self.a.comments.get(&inner) {
                 parts.extend(line.iter().cloned());
             }
         }
@@ -536,6 +629,14 @@ impl Writer<'_> {
         } else {
             format!(" ; {}", parts.join(" "))
         }
+    }
+
+    /// The locations of the `size` bytes from `loc` (into the next bank of
+    /// the fixed pair).
+    fn covered(&self, loc: Loc, size: usize) -> Vec<Loc> {
+        (0..size)
+            .filter_map(|n| self.a.memory.step(loc, n))
+            .collect()
     }
 
     fn instruction(&mut self, loc: Loc) -> usize {
@@ -553,20 +654,19 @@ impl Writer<'_> {
         let address = self.a.memory.address(loc);
         self.push(loc.bank, Some(address), insn.len, text);
         // Labels inside the instruction (skip tricks) are defined relative to it.
-        for offset in loc.offset + 1..loc.offset + insn.len {
-            let inner = loc.at(offset);
+        for (n, inner) in self.covered(loc, insn.len).into_iter().enumerate().skip(1) {
             let Some(base) = self.a.labels.get(&loc).and_then(|l| l.first()) else {
                 continue;
             };
             for label in self.a.labels.get(&inner).into_iter().flatten() {
                 let base = base.name.clone();
-                let inner_address = address + (offset - loc.offset) as u32;
+                let inner_address = address + n as u32;
                 self.label_comment(loc.bank, inner_address, label);
                 self.push(
                     loc.bank,
                     Some(inner_address),
                     0,
-                    format!("{} = {base}+{}", label.name, offset - loc.offset),
+                    format!("{} = {base}+{n}", label.name),
                 );
             }
         }
@@ -597,7 +697,12 @@ impl Writer<'_> {
             }
             Mode::Rel => {
                 let address = self.a.memory.address(loc);
-                let delta = i64::from(self.a.memory.byte(loc.at(loc.offset + 1)) as i8) + 2;
+                let operand = self
+                    .a
+                    .memory
+                    .step(loc, 1)
+                    .map_or(0, |l| self.a.memory.byte(l));
+                let delta = i64::from(operand as i8) + 2;
                 // A branch that wraps around $FFFF/$0000 is written relative to `*`.
                 if !(0..=0xffff).contains(&(i64::from(address) + delta)) {
                     format!("*{delta:+}")

@@ -59,6 +59,9 @@ pub(crate) struct Memory {
     pub banks: Vec<BankImage>,
     /// Bytes of ROM data (without header and trainer).
     pub payload_len: usize,
+    /// With `options.mapper4_fixed_prg_16k`: the second-to-last PRG bank,
+    /// which continues into the last one ($C000-$FFFF as one range).
+    pub pair: Option<usize>,
 }
 
 /// Where a CPU address points.
@@ -177,6 +180,11 @@ impl Memory {
                 }
             }
         }
+        let pair = if config.options.mapper4_fixed_prg_16k {
+            Some(fixed_pair(&rom, &banks, prg_count, config)?)
+        } else {
+            None
+        };
         Ok(Self {
             format,
             header,
@@ -190,7 +198,47 @@ impl Memory {
             },
             banks,
             payload_len: payload.len(),
+            pair,
         })
+    }
+
+    /// The location `n` bytes after `loc`: in its bank, or for the first bank
+    /// of the fixed pair, in the next one.
+    pub fn step(&self, loc: Loc, n: usize) -> Option<Loc> {
+        let bank = &self.banks[loc.bank];
+        let offset = loc.offset + n;
+        if offset < bank.end {
+            return Some(loc.at(offset));
+        }
+        if self.pair != Some(loc.bank) {
+            return None;
+        }
+        let next = &self.banks[loc.bank + 1];
+        let offset = offset - BANK_SIZE;
+        (offset < next.end).then_some(Loc {
+            bank: next.index,
+            offset,
+        })
+    }
+
+    /// The location `n` bytes before `loc`, as [`Self::step`] goes.
+    pub fn back(&self, loc: Loc, n: usize) -> Option<Loc> {
+        if let Some(offset) = loc.offset.checked_sub(n) {
+            return (offset >= self.banks[loc.bank].start).then_some(loc.at(offset));
+        }
+        let previous = loc.bank.checked_sub(1)?;
+        (self.pair == Some(previous) && n - loc.offset <= BANK_SIZE).then(|| Loc {
+            bank: previous,
+            offset: BANK_SIZE + loc.offset - n,
+        })
+    }
+
+    /// The banks seen together from `bank`: the fixed pair, or the bank alone.
+    fn window(&self, bank: usize) -> Vec<usize> {
+        match self.pair {
+            Some(first) if bank == first || bank == first + 1 => vec![first, first + 1],
+            _ => vec![bank],
+        }
     }
 
     pub fn address(&self, loc: Loc) -> u32 {
@@ -210,15 +258,17 @@ impl Memory {
             .collect()
     }
 
-    /// Where `address` points, seen from `from` (whose own window wins).
+    /// Where `address` points, seen from `from` (whose own window wins;
+    /// the fixed pair is one window).
     pub fn resolve(&self, from: Option<usize>, address: u32) -> Resolved {
-        if let Some(bank) = from.map(|b| &self.banks[b])
-            && bank.holds(address)
-        {
-            return Resolved::Rom(Loc {
-                bank: bank.index,
-                offset: (address - bank.org) as usize,
-            });
+        for bank in from.map(|b| self.window(b)).unwrap_or_default() {
+            let bank = &self.banks[bank];
+            if bank.holds(address) {
+                return Resolved::Rom(Loc {
+                    bank: bank.index,
+                    offset: (address - bank.org) as usize,
+                });
+            }
         }
         match self.holders(address).as_slice() {
             [] => Resolved::Outside,
@@ -287,6 +337,56 @@ impl Memory {
     pub fn prg_banks(&self) -> impl Iterator<Item = &BankImage> {
         self.banks.iter().filter(|b| !b.chr)
     }
+}
+
+/// The second-to-last PRG bank, checked for `options.mapper4_fixed_prg_16k`.
+fn fixed_pair(
+    rom: &Rom,
+    banks: &[BankImage],
+    prg_count: usize,
+    config: &DisasmConfig,
+) -> Result<usize, String> {
+    const OPTION: &str = "options.mapper4_fixed_prg_16k";
+    let Some(header) = &rom.header else {
+        return Err(format!(
+            "{OPTION} applies only to iNES ROMs of mapper 4 (MMC3)"
+        ));
+    };
+    if header.mapper != 4 {
+        return Err(format!(
+            "{OPTION} applies only to mapper 4 (MMC3); the ROM uses mapper {}",
+            header.mapper
+        ));
+    }
+    if prg_count < 2 {
+        return Err(format!(
+            "{OPTION} needs at least two 8 KiB PRG banks; the ROM has {prg_count}"
+        ));
+    }
+    let first = prg_count - 2;
+    if banks[first + 1].end != BANK_SIZE {
+        return Err(format!(
+            "{OPTION} needs whole 8 KiB PRG banks; bank {} has {} bytes",
+            first + 1,
+            banks[first + 1].end
+        ));
+    }
+    for layout in &config.banks {
+        let fixed = match layout.bank {
+            b if b == first => 0xc000,
+            b if b == first + 1 => 0xe000,
+            _ => continue,
+        };
+        if layout.org.0 != fixed {
+            return Err(format!(
+                "banks gives bank {} org {}, but {OPTION} places it at {}",
+                layout.bank,
+                layout.org,
+                Address(fixed)
+            ));
+        }
+    }
+    Ok(first)
 }
 
 fn join(banks: &[usize]) -> String {
@@ -1085,7 +1185,7 @@ impl Analysis {
             let Some(insn) = self.decode_at(loc, from) else {
                 return;
             };
-            let mut next = loc.offset + insn.len;
+            let mut advance = insn.len;
             match (insn.mnemonic, insn.mode) {
                 (Mnemonic::Jmp, _) | (Mnemonic::Rts | Mnemonic::Rti | Mnemonic::Brk, _) => return,
                 (Mnemonic::Jsr, _) => {
@@ -1097,40 +1197,42 @@ impl Analysis {
                         return;
                     }
                     if routine.inline_bytes > 0
-                        && !self.inline_data(loc, next, routine.inline_bytes)
+                        && !self.inline_data(loc, advance, routine.inline_bytes)
                     {
                         return;
                     }
-                    next += routine.inline_bytes;
+                    advance += routine.inline_bytes;
                 }
                 _ => {}
             }
-            let bank = &self.memory.banks[loc.bank];
-            if next >= bank.end {
-                // Code continues into the bank that holds the next address.
-                let address = bank.org + next as u32;
-                match self.memory.resolve(Some(loc.bank), address) {
-                    Resolved::Rom(n) if n.bank != loc.bank => {
-                        from = Some(loc);
-                        loc = n;
-                        continue;
-                    }
-                    _ => {
-                        self.issue(
-                            IssueKind::FlowLeavesRom,
-                            Some(loc),
-                            address,
-                            format!(
-                                "Code runs past the end of bank {} into ${address:04X}",
-                                loc.bank
-                            ),
-                        );
-                        return;
-                    }
-                }
-            }
+            let Some(next) = self.next_code(loc, advance) else {
+                let address = self.memory.address(loc) + advance as u32;
+                self.issue(
+                    IssueKind::FlowLeavesRom,
+                    Some(loc),
+                    address,
+                    format!(
+                        "Code runs past the end of bank {} into ${address:04X}",
+                        loc.bank
+                    ),
+                );
+                return;
+            };
             from = Some(loc);
-            loc = loc.at(next);
+            loc = next;
+        }
+    }
+
+    /// Where code continues `advance` bytes after `loc`: in its bank (or the
+    /// fixed pair), or past its end in the bank that holds the next address.
+    fn next_code(&self, loc: Loc, advance: usize) -> Option<Loc> {
+        if let Some(next) = self.memory.step(loc, advance) {
+            return Some(next);
+        }
+        let address = self.memory.address(loc) + advance as u32;
+        match self.memory.resolve(Some(loc.bank), address) {
+            Resolved::Rom(n) if n.bank != loc.bank => Some(n),
+            _ => None,
         }
     }
 
@@ -1139,15 +1241,16 @@ impl Analysis {
         self.flow.get(&loc).copied()
     }
 
-    /// Marks the inline arguments after a JSR as data.
-    fn inline_data(&mut self, call: Loc, start: usize, count: usize) -> bool {
-        let bank = &self.memory.banks[call.bank];
-        let end = start + count;
-        if end > bank.end
-            || self.class[call.bank][start..end]
+    /// Marks the `count` inline arguments `advance` bytes after a JSR as data.
+    fn inline_data(&mut self, call: Loc, advance: usize, count: usize) -> bool {
+        let bytes: Option<Vec<Loc>> = (advance..advance + count)
+            .map(|n| self.memory.step(call, n))
+            .collect();
+        let Some(bytes) = bytes.filter(|bytes| {
+            bytes
                 .iter()
-                .any(|c| matches!(c, Class::Insn | Class::Operand))
-        {
+                .all(|l| !matches!(self.class[l.bank][l.offset], Class::Insn | Class::Operand))
+        }) else {
             let address = self.memory.address(call);
             self.issue(
                 IssueKind::CodeDataConflict,
@@ -1156,23 +1259,29 @@ impl Analysis {
                 format!("The {count} inline bytes after the JSR at ${address:04X} overlap other code or data"),
             );
             return false;
-        }
-        // Bytes a region already describes keep it; the others become bytes.
-        let mut offset = start;
-        while offset < end {
-            if self.class[call.bank][offset] != Class::Unknown {
-                offset += 1;
+        };
+        // Bytes a region already describes keep it; the others become bytes,
+        // a region per run in one bank.
+        let mut i = 0;
+        while i < bytes.len() {
+            let piece = bytes[i];
+            let mut end = piece.offset;
+            while i < bytes.len()
+                && bytes[i] == piece.at(end)
+                && self.class[piece.bank][end] == Class::Unknown
+            {
+                i += 1;
+                end += 1;
+            }
+            if end == piece.offset {
+                i += 1;
                 continue;
             }
-            let piece = offset;
-            while offset < end && self.class[call.bank][offset] == Class::Unknown {
-                offset += 1;
-            }
-            self.class[call.bank][piece..offset].fill(Class::Data);
-            self.regions[call.bank].push(Region {
-                bank: call.bank,
-                start: piece,
-                end: offset,
+            self.class[piece.bank][piece.offset..end].fill(Class::Data);
+            self.regions[piece.bank].push(Region {
+                bank: piece.bank,
+                start: piece.offset,
+                end,
                 kind: RegionType::Bytes,
                 pair: None,
                 code_targets: false,
@@ -1180,8 +1289,8 @@ impl Analysis {
                 columns: None,
                 comment: None,
             });
+            self.regions[piece.bank].sort_by_key(|r| r.start);
         }
-        self.regions[call.bank].sort_by_key(|r| r.start);
         true
     }
 
@@ -1204,11 +1313,13 @@ impl Analysis {
             return None;
         };
         let len = inspect::operand_size(mode) + 1;
-        if loc.offset + len > end
-            || self.class[loc.bank][loc.offset + 1..loc.offset + len]
+        // Operand bytes, which continue into the next bank of the fixed pair.
+        let operands: Option<Vec<Loc>> = (1..len).map(|n| self.memory.step(loc, n)).collect();
+        let Some(operands) = operands.filter(|operands| {
+            operands
                 .iter()
-                .any(|c| *c != Class::Unknown)
-        {
+                .all(|l| self.class[l.bank][l.offset] == Class::Unknown)
+        }) else {
             self.issue(
                 IssueKind::Overlap,
                 Some(loc),
@@ -1219,8 +1330,8 @@ impl Analysis {
                 issue.spans = vec![(loc.offset, len.min(end - loc.offset))];
             }
             return None;
-        }
-        let byte = |i: usize| u32::from(self.memory.byte(loc.at(loc.offset + i)));
+        };
+        let byte = |i: usize| u32::from(self.memory.byte(operands[i - 1]));
         let operand = match len {
             2 => byte(1),
             3 => byte(1) | byte(2) << 8,
@@ -1238,13 +1349,15 @@ impl Analysis {
             value,
         };
         self.class[loc.bank][loc.offset] = Class::Insn;
-        self.class[loc.bank][loc.offset + 1..loc.offset + len].fill(Class::Operand);
+        for l in &operands {
+            self.class[l.bank][l.offset] = Class::Operand;
+        }
         self.insns.insert(loc, insn);
         let before = self.issues.len();
         self.reference(loc, insn);
         for issue in &mut self.issues[before..] {
             if issue.spans == [(loc.offset, 1)] {
-                issue.spans = vec![(loc.offset, len)];
+                issue.spans = vec![(loc.offset, len.min(end - loc.offset))];
             }
         }
         Some(insn)
@@ -1455,14 +1568,13 @@ impl Analysis {
         if self.in_word(loc) {
             return Some(loc.at(loc.offset - 1));
         }
-        (loc.offset.saturating_sub(2)..loc.offset)
-            .rev()
-            .map(|o| loc.at(o))
-            .find(|l| {
-                self.insns
-                    .get(l)
-                    .is_some_and(|i| l.offset + i.len > loc.offset)
-            })
+        (1..=2).find_map(|n| {
+            let start = self.memory.back(loc, n)?;
+            self.insns
+                .get(&start)
+                .is_some_and(|i| i.len > n)
+                .then_some(start)
+        })
     }
 
     /// Whether `loc` is the second byte of a word in a words or pointers region.
@@ -1482,7 +1594,11 @@ impl Analysis {
         }
         let start = self.containing(loc)?;
         let label = self.labels.get(&start)?.first()?;
-        Some(format!("{}+{}", label.name, loc.offset - start.offset))
+        Some(format!(
+            "{}+{}",
+            label.name,
+            self.memory.address(loc) - self.memory.address(start)
+        ))
     }
 
     /// The name of a value outside the ROM, from the symbols.
@@ -1544,7 +1660,7 @@ impl Analysis {
                     Mnemonic::Jmp | Mnemonic::Rts | Mnemonic::Rti | Mnemonic::Brk
                 );
                 if !stops {
-                    let mut next = loc.offset + insn.len;
+                    let mut advance = insn.len;
                     if insn.mnemonic == Mnemonic::Jsr {
                         let routine = self
                             .flow_target(loc)
@@ -1553,17 +1669,10 @@ impl Analysis {
                         if routine.no_return {
                             continue;
                         }
-                        next += routine.inline_bytes;
+                        advance += routine.inline_bytes;
                     }
-                    let bank = &self.memory.banks[loc.bank];
-                    if next < bank.end {
-                        stack.push(loc.at(next));
-                    } else if let Resolved::Rom(n) =
-                        self.memory.resolve(Some(loc.bank), bank.org + next as u32)
-                    {
-                        // As traced, code continues into the bank holding the next address.
-                        stack.push(n);
-                    }
+                    // As traced, code continues into the next bank.
+                    stack.extend(self.next_code(loc, advance));
                 }
             }
             body.sort();

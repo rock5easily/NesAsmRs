@@ -433,6 +433,11 @@ fn disassemble_rejects_bad_requests() {
             "E_DISASM",
             "Invalid name '9'",
         ),
+        (
+            json!({"inline":{"rom":"old/game.nes","options":{"mapper4_fixed_prg_16k":true}}}),
+            "E_DISASM",
+            "options.mapper4_fixed_prg_16k applies only to mapper 4 (MMC3); the ROM uses mapper 0",
+        ),
     ] {
         let r = c.call("disassemble", arguments.clone());
         assert_eq!(r["isError"], true, "{arguments}: {r}");
@@ -607,4 +612,80 @@ fn rom_hacks_become_patch_sources() {
     );
     assert_eq!(r["isError"], true, "{r}");
     assert_eq!(r["structuredContent"]["diagnostics"][0]["code"], "E_IO");
+}
+
+#[test]
+fn mapper4_fixed_prg_16k_writes_the_last_two_banks_together() {
+    let mut c = Client::start();
+    // `lda $0390,x` at $DFFE ends in bank 3.
+    let source = concat!(
+        "  .inesprg 2\n  .inesmap 4\n  .bank 2\n  .org $DFFE\nReset:\n  .db $BD, $90\n",
+        "  .bank 3\n  .org $E000\n  .db $03\nLoop:\n  jmp Loop\nNmi:\n  rti\n",
+        "  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"src.asm","sources":{"src.asm":source},"output":"roms/game.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    c.write(
+        "game.disasm.json",
+        r#"{"rom": "roms/game.nes",
+            "options": {"split_banks": true, "mapper4_fixed_prg_16k": true}}"#,
+    );
+    let r = c.call(
+        "export_disassembly",
+        json!({"annotations":"game.disasm.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    let names = |values: &Value, key: Option<&str>| -> Vec<String> {
+        values
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let path = key.map_or(v, |key| &v[key]).as_str().unwrap();
+                std::path::Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    };
+    let files = names(&report["files"], None);
+    assert_eq!(
+        files,
+        [
+            "game.asm",
+            "game_bank00.asm",
+            "game_bank01.asm",
+            "game_bank02_03.asm"
+        ]
+    );
+    assert_eq!(names(&report["artifacts"], Some("path")), files);
+    let main = std::fs::read_to_string(c.root.join("roms/game.asm"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        main.contains("\t.catbank $02\n\t.include \"roms/game_bank02_03.asm\"\n"),
+        "{main}"
+    );
+    let pair = std::fs::read_to_string(c.root.join("roms/game_bank02_03.asm"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        pair.contains("\tlda $0390,x\n; Bank 3 starts at $E000, inside the instruction above\n"),
+        "{pair}"
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"roms/game.asm","output":"rebuilt.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        std::fs::read(c.root.join("rebuilt.nes")).unwrap(),
+        std::fs::read(c.root.join("roms/game.nes")).unwrap()
+    );
 }

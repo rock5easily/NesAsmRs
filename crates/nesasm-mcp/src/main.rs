@@ -222,8 +222,9 @@ struct ExportInput {
     inline: Option<DisasmConfig>,
     /// Main source file to write (.asm) within the root and outside hidden
     /// directories; defaults to the ROM path with .asm. Bank files
-    /// (<stem>_bankXX.asm, XX the bank in uppercase hexadecimal) and the CHR
-    /// file (<stem>.chr) use its stem.
+    /// (<stem>_bankXX.asm, XX the bank in uppercase hexadecimal;
+    /// <stem>_bankXX_YY.asm for the last two PRG banks with
+    /// options.mapper4_fixed_prg_16k) and the CHR file (<stem>.chr) use its stem.
     output: Option<PathBuf>,
 }
 
@@ -1208,7 +1209,7 @@ impl Server {
         let summary = Self::disasm_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Write the source that disassemble generates (.asm, plus <stem>_bankXX.asm files with XX the bank in uppercase hexadecimal for large ROMs, and <stem>.chr for CHR ROM), only if it reassembles to the same ROM. Existing files are replaced only if they are generated sources not edited since (a bank file only by the file of the same bank, unless the replaced main source included it); unedited bank files the replaced main source included and the new one does not are removed.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    #[tool(description="Write the source that disassemble generates (.asm, plus <stem>_bankXX.asm files with XX the bank in uppercase hexadecimal for large ROMs, or <stem>_bankXX_YY.asm for the last two PRG banks with options.mapper4_fixed_prg_16k, and <stem>.chr for CHR ROM), only if it reassembles to the same ROM. Existing files are replaced only if they are generated sources not edited since (a bank file only by the file of the same bank, unless the replaced main source included it); unedited bank files the replaced main source included and the new one does not are removed.",output_schema=schema::<DisasmReport>(),annotations(read_only_hint=false,destructive_hint=true))]
     async fn export_disassembly(
         &self,
         Parameters(input): Parameters<ExportInput>,

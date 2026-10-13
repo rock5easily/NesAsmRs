@@ -190,6 +190,27 @@ fn catbank_rs_and_autozp_operands() {
 }
 
 #[test]
+fn catbank_continues_an_instruction_into_the_next_bank() {
+    let t = Temp::new();
+    // `lda $0390,x` at $DFFE ends at $E000 in bank 1, where the code goes on.
+    let text = concat!(
+        "  .catbank 0\n  .bank 0\n  .org $DFFE\n",
+        "Start:\n  lda $0390,x\nInner = Start+2\nNext:\n  beq Next\n  .dw Inner, Next\n",
+    );
+    let r = t.run(text);
+    assert!(r.success, "{:?}", r.diagnostics);
+    assert_eq!(
+        &r.binary[0x1ffe..0x2007],
+        [0xbd, 0x90, 0x03, 0xf0, 0xfe, 0x00, 0xe0, 0x01, 0xe0]
+    );
+    // Without CATBANK, the instruction does not fit in bank 0.
+    t.fails(
+        &text.replace("  .catbank 0\n", ""),
+        "Bank overflow, offset > $1FFF",
+    );
+}
+
+#[test]
 fn ines_header_fields_and_limits() {
     let t = Temp::new();
     let r = t.run("  .inesprg 2\n  .ineschr 1\n  .inesmap $a5\n  .inesmir 9\n  .db 0\n");

@@ -30,8 +30,8 @@ then writes each changed range over it with `.bank` and `.org`, so the
 source reassembles to the hack when the base ROM is present. The header comes
 from the hack. A bank without changes has no lines (and, when the source is
 split, no bank file). An expanded ROM whose CHR banks moved after new PRG banks
-includes the base in one `.incbin` per run of banks that keep their order. No
-`.catbank` is needed: `.incbin` continues into the next banks by itself. `disassemble` returns the changed ranges as
+includes the base in one `.incbin` per run of banks that keep their order. The base
+needs no `.catbank`: `.incbin` continues into the next banks by itself. `disassemble` returns the changed ranges as
 `diffs` (the first 20; select with `offset` and `limit`), each with:
 
 - `changed_bytes` and the `code_bytes`, `data_bytes` and `unknown_bytes` of
@@ -50,9 +50,48 @@ labels in unchanged ranges that the source uses are defined as constants
 (`L_E00B = $E00B`). Issues are reported only within the changed ranges.
 PRG banks are matched with the base's PRG banks in order, and CHR banks with
 its CHR banks, so an expanded ROM lines up; banks the base lacks are
-disassembled whole. Changed CHR banks are written whole. The base must have
+disassembled whole. Changed CHR banks are written whole, in the main file
+after the base ROM's `.incbin`: `.bank`, `.org $0000`, then
+`.incbin "<stem>.chr", offset, size` (or `.db` lines with `chr: "db"`), so a
+split source has no bank files of CHR banks. The `.chr` file holds the changed
+CHR banks in order, and `offset` is the position in it. The base must have
 the same format as `rom` (`.nes` or whole-bank `.bin`), without a trainer;
 fragments (`load_address`) cannot have a base.
+
+## Mapper 4 fixed PRG banks
+
+MMC3 games usually keep the last two 8 KiB PRG banks at $C000-$DFFF and
+$E000-$FFFF. With `options.mapper4_fixed_prg_16k: true`, the analysis treats
+these two banks as one range, $C000-$FFFF:
+
+- Instructions may cross $DFFF/$E000. They are decoded, traced and written as
+  one instruction, whose source line holds all its bytes. Branches, calls,
+  references and routines continue across the boundary, and each of the two
+  banks resolves addresses in the other before other banks.
+- The source writes `.catbank XX` (XX the second-to-last bank in hexadecimal)
+  before the second-to-last bank, so the assembler continues it into the last
+  bank. No `.bank` or `.org` is written inside an instruction: where the last
+  bank starts inside one, the line `; Bank NN starts at $E000, inside the
+  instruction above` marks it; otherwise the last bank starts with `.bank` and
+  `.org $E000` as usual. Bank numbers stay those of the 8 KiB banks.
+- With `split_banks`, both banks are written to `<stem>_bankXX_YY.asm`
+  (`_bank1E_1F.asm` for banks 30 and 31), which the main file includes after
+  `.catbank XX`. Without `split_banks`, `.catbank XX` precedes the
+  second-to-last bank's `.bank` line.
+- In a ROM hack, a change in either part of an instruction across the
+  boundary widens the ranges of both banks to the whole instruction, and the
+  range of the last bank continues it without `.org`. The file of the two
+  banks is written when either of them has changes.
+- The ROM must be an iNES ROM of mapper 4 with at least two whole PRG banks;
+  otherwise the option is an error. `banks` may only give the two banks $C000
+  and $E000. Annotation ranges (`regions`, `patches`) still lie within one
+  bank.
+- The option only states where the two banks are. The disassembler does not
+  model PRG mode 1 (the second-to-last bank at $8000) or mode changes while
+  the game runs; writes to the mapper registers remain `mapper_write` issues.
+- Without the option (the default), each bank is analysed and written on its
+  own, and an instruction across $DFFF/$E000 is an `overlap` issue whose
+  bytes are data.
 
 ## Annotation file
 
@@ -97,7 +136,9 @@ fragments (`load_address`) cannot have a base.
   (default 8), `address_comments` (append `; $C000`), `auto_ram_labels`
   (`zp_10`, `ram_0300`), `nes_registers` (PPUCTRL ... JOY2, default true),
   `chr` (`incbin`, default, or `db`), `split_banks` (one file per bank; by
-  default only when the source would exceed 512 KiB).
+  default only when the source would exceed 512 KiB), `mapper4_fixed_prg_16k`
+  (mapper 4: the last two PRG banks as one range at $C000-$FFFF, see above;
+  default false).
 
 Names use letters, digits and `_`, do not start with a digit and are at most
 64 characters. `A`, `X`, `Y`, expression function names and assembler symbols
@@ -124,7 +165,9 @@ are reserved.
 - Paths in `.include` and `.incbin` are relative to the project root.
 - Bank files are `<stem>_bankXX.asm`, with the bank number in two uppercase
   hexadecimal digits (`_bank0A.asm` for bank 10, `_bank3F.asm` for bank 63),
-  included from the main file. Older versions used decimal (`_bank10.asm` for
+  included from the main file; with `mapper4_fixed_prg_16k`, the last two PRG
+  banks share `<stem>_bankXX_YY.asm`. A ROM hack writes its changed CHR banks
+  in the main file. Older versions used decimal (`_bank10.asm` for
   bank 10), so an old name may now name another bank.
 - The first line of each file is `; Generated by nesasm disassembler; checksum ...`.
   `export_disassembly` replaces an existing file only if it is such a file
@@ -134,8 +177,10 @@ are reserved.
   is a bank file that the replaced main file includes: the whole set is
   generated again, so it is replaced whatever its bank. Unedited bank files
   the replaced main file includes that the new source does not (old decimal
-  names, banks a ROM hack no longer changes) are removed and reported as
-  `removed`; edited ones are kept. Without the old main file, an old name that
+  names, banks a ROM hack no longer changes, the CHR bank files of a ROM hack
+  from older versions, the files of the two banks that
+  `mapper4_fixed_prg_16k` combines) are removed and reported as `removed`;
+  edited ones are kept. Without the old main file, an old name that
   now names another bank is an error, and nothing is written. The main file
   also records the checksum of the `.chr` file, which is replaced only together
   with an unedited main file and only if it was not changed either. It writes
@@ -152,7 +197,8 @@ are reserved.
 `header` (fields NESASM cannot reproduce: NES 2.0 bytes, trainer, size
 mismatch), `invalid_opcode` (flow reaches a byte that is not an NMOS 6502
 instruction: wrong flow or data), `overlap` (code enters the middle of an
-instruction, as in BIT skip tricks), `code_data_conflict` (code reaches a data
+instruction, as in BIT skip tricks, or an instruction would cross the end of a
+bank; see `mapper4_fixed_prg_16k`), `code_data_conflict` (code reaches a data
 region), `indirect_jump` (`JMP [ptr]`: describe the targets with a pointer
 table or entry points), `unresolved_bank` (add `references`), `outside_rom`
 (code in RAM or SRAM is called), `flow_leaves_rom` (code runs off a bank),
