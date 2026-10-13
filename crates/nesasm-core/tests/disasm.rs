@@ -2191,6 +2191,152 @@ const SWITCHED_BANKS: &str = concat!(
 );
 
 #[test]
+fn returned_register_values_resolve_banks_without_guessing_at_joins() {
+    let reset = concat!(
+        "  lda #$02\n  jsr RestoreA\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "RestoreA:\n  pha\n  lda #$04\n  pla\n  rts\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["\tjsr sub_02_8000"]);
+    assert!(d.text().contains("\t.db $A9, $04, $60"), "{}", d.text());
+
+    // Two returns disagree about A: neither bank is safe to choose.
+    let reset = reset.replace(
+        "  pha\n  lda #$04\n  pla\n  rts",
+        "  lda $0300\n  beq Two\n  lda #$04\n  rts\nTwo:\n  lda #$02\n  rts",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, &reset),
+        &DisasmConfig::default(),
+    );
+    assert!(!issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert!(!d.text().contains("sub_02_8000:"), "{}", d.text());
+    assert!(!d.text().contains("sub_04_8000:"), "{}", d.text());
+}
+
+#[test]
+fn stack_writes_and_call_return_bytes_do_not_preserve_old_register_values() {
+    for body in [
+        "  pha\n  ldx #$FC\n  lda #$04\n  sta $0100,x\n  pla\n",
+        "  pha\n  ldx #$FC\n  lda #$04\n  sta $0900,x\n  pla\n",
+        "  pha\n  ldx $0300\n  lda #$04\n  sta $0080,x\n  pla\n",
+        "  pha\n  lda #$04\n  sta [$00],y\n  pla\n",
+        "  lda $01FE\n",
+    ] {
+        // At SP=$FF, JSR writes $01FE/$01FF and PHA then writes $01FC.
+        // The first two stores replace PHA's byte (including its RAM mirror).
+        let reset = format!(
+            "  ldx #$FF\n  txs\n  lda #$02\n  sta $01FE\n  jsr Restore\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\nRestore:\n{body}  rts\n"
+        );
+        let d = round_trip(
+            &switching_rom(SWITCHED_BANKS, &reset),
+            &DisasmConfig::default(),
+        );
+        assert!(!issues(&d, IssueKind::UnresolvedBank).is_empty(), "{body}");
+        assert!(!d.text().contains("sub_02_8000:"), "{body}\n{}", d.text());
+    }
+    // A nested callee can also replace a byte its caller pushed.
+    let reset = concat!(
+        "  lda #$02\n  jsr Restore\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Restore:\n  pha\n  jsr Overwrite\n  pla\n  rts\n",
+        "Overwrite:\n  lda #$04\n  sta $01FC\n  rts\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert!(!d.text().contains("sub_02_8000:"), "{}", d.text());
+}
+
+#[test]
+fn summaries_follow_known_indirect_tail_jumps() {
+    let reset = concat!(
+        "  lda #$02\n  jsr SwitchSeq\n  jsr Tail\n  jsr $8000\n  jmp Halt\n",
+        "Tail:\n  lda #LOW(Body)\n  sta <$00\n  lda #HIGH(Body)\n  sta <$01\n  jmp [$0000]\n",
+        "Body:\n  rts\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert!(issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(&d, &["\tjsr sub_02_8000", "\tjmp [$0000]"]);
+    // An unknown byte prevents the summary from claiming the bank survives.
+    let reset = reset.replace("lda #HIGH(Body)", "lda $0300");
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, &reset),
+        &DisasmConfig::default(),
+    );
+    assert!(!issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert!(!d.text().contains("sub_02_8000:"), "{}", d.text());
+}
+
+#[test]
+fn constant_indexed_reads_follow_code_and_expand_operand_only_diffs() {
+    let rom = nrom(concat!(
+        "Reset:\n  ldx #$01\n  jsr KeepX\n  lda Lo,x\n  sta <$FF\n  lda Hi,x\n  sta <$00\n",
+        "  ldx #$01\n  lda <$FE,x\n  sta <$02\n  lda <$FF,x\n  sta <$03\n  jmp [$0002]\n",
+        "KeepX:\n  txa\n  pha\n  ldx #$07\n  pla\n  tax\n  rts\n",
+        "Lo:\n  .db 0, LOW(Target)\nHi:\n  .db 0, HIGH(Target)\n",
+        "Target:\n  and #$F0\n  rts\nNmi:\n  rti\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_lines(&d, &["\tand #$F0"]);
+    assert!(issues(&d, IssueKind::IndirectJump).is_empty());
+    // The low/high tables are read as data, never traced as instructions.
+    assert!(d.text().contains("\t.db $00,"), "{}", d.text());
+    let mut changed = rom.clone();
+    let operand = rom
+        .windows(3)
+        .position(|b| b == [0x29, 0xf0, 0x60])
+        .unwrap()
+        + 1;
+    changed[operand] = 0xfc;
+    let t = Temp::new();
+    fs::write(t.0.join("base.nes"), &rom).unwrap();
+    let d = disasm::disassemble(
+        &changed,
+        Some(&rom),
+        &config(r#"{"base":"base.nes"}"#),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .unwrap();
+    assert_lines(&d, &["\tand #$FC"]);
+    assert_eq!(d.summary().diff.unwrap().changed_bytes, 1);
+    assert!(d.verify(&t.0, Some(&t.0), &NEVER).matched);
+}
+
+#[test]
+fn indirect_indexed_reads_require_known_pointers_and_indices() {
+    let code = concat!(
+        "Reset:\n  lda #LOW(Table)\n  sta <$FF\n  lda #HIGH(Table)\n  sta <$00\n",
+        "  ldy #$01\n  jsr KeepY\n  lda [$FF],y\n  sta <$02\n  iny\n  lda [$FF],y\n  sta <$03\n",
+        "  ldx #$01\n  jmp [$0002]\nKeepY:\n  rts\n",
+        "Table:\n  .db 0, LOW(Target), HIGH(Target)\n",
+        "Target:\n  and #$F0\n  rts\nNmi:\n  rti\n",
+    );
+    let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert_lines(&d, &["\tand #$F0"]);
+    assert!(issues(&d, IssueKind::IndirectJump).is_empty());
+    // ($FE,X) with X=1 uses the same $FF/$00 pointer, then reads Table+1.
+    let indexed = code
+        .replace("lda #LOW(Table)", "lda #LOW(Table+1)")
+        .replace("  ldy #$01", "  ldx #$01\n  ldy #$00")
+        .replace("lda [$FF],y\n  sta <$02", "lda [$FE,x]\n  sta <$02");
+    let d = round_trip(&nrom(&indexed), &DisasmConfig::default());
+    assert_lines(&d, &["\tand #$F0"]);
+    // Unknown Y must not select an entry, even though the table is in ROM.
+    let unknown = code.replace("ldy #$01", "ldy $0300");
+    let d = round_trip(&nrom(&unknown), &DisasmConfig::default());
+    assert!(!d.text().contains("\tand #$F0"), "{}", d.text());
+    assert!(!issues(&d, IssueKind::IndirectJump).is_empty());
+}
+
+#[test]
 fn calls_after_a_bank_switch_go_to_the_switched_bank() {
     // Bank 2 through a routine taking A; bank 4 by writing the registers;
     // bank 0 through a routine reading $F5 and $F6.
@@ -2809,10 +2955,10 @@ fn routines_switching_banks_from_ram_can_be_annotated() {
 }
 
 #[test]
-fn values_pushed_before_a_loop_are_kept_through_it() {
+fn saved_stack_values_survive_a_loop_only_when_calls_can_be_followed() {
     // Restore saves $F5/$F6, loops around calls that cannot be followed
     // (pushing $10 around it), restores them and goes on into Switch.
-    let rom = assemble(concat!(
+    let source = concat!(
         "  .inesprg 4\n  .inesmap 4\n",
         "  .bank 2\n  .org $8000\n  lda #$02\n  rts\n",
         "  .bank 7\n  .org $E000\nReset:\n  lda #$02\n  sta <$F5\n  jsr Restore\n  jsr $8000\n",
@@ -2824,16 +2970,18 @@ fn values_pushed_before_a_loop_are_kept_through_it() {
         "Switch:\n  lda #$06\n  sta $8000\n  lda <$F5\n  sta $8001\n",
         "  lda #$07\n  sta $8000\n  lda <$F6\n  sta $8001\n  rts\n",
         "Nmi:\n  rti\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
-    ));
+    );
+    let rom = assemble(source);
     let d = round_trip(
         &rom,
         &config(r#"{"entry_points": [{"address": "$E02F", "switch_banks": ["$F5", "$F6"]}]}"#),
     );
-    assert!(
-        issues(&d, IssueKind::BankSwitch).is_empty(),
-        "{:?}",
-        d.issues()
-    );
+    // Yield's unknown target may write the saved stack values: it cannot
+    // prove the original bank is restored when the loop finishes.
+    assert!(!issues(&d, IssueKind::UnresolvedBank).is_empty());
+    assert!(!d.text().contains("sub_02_8000:"), "{}", d.text());
+    let known = assemble(&source.replace("Yield:\n  jmp [$0010]", "Yield:\n  rts"));
+    let d = round_trip(&known, &DisasmConfig::default());
     assert!(
         issues(&d, IssueKind::UnresolvedBank).is_empty(),
         "{:?}",

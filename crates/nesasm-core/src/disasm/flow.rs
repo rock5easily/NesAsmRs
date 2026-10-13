@@ -25,6 +25,10 @@ fn tracked(address: u32) -> bool {
     address < 0x800 || (0x6000..0x8000).contains(&address)
 }
 
+fn stack_address(address: u32) -> bool {
+    address < 0x2000 && (0x100..0x200).contains(&(address & 0x7ff))
+}
+
 /// A value at the start of a summarised routine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Input {
@@ -153,6 +157,8 @@ impl State {
             x: Sym::Input(Input::X, 0),
             y: Sym::Input(Input::Y, 0),
             entry_memory: true,
+            // The JSR wrote return bytes at unknown positions in this page.
+            lost: vec![(0x100, 0x1ff)],
             windows: windows.map(|w| w.map(Sym::Const)),
             ..Self::default()
         }
@@ -257,6 +263,8 @@ impl State {
     }
 
     fn push(&mut self, value: Sym) {
+        // SP is not tracked, so this write may replace any remembered byte.
+        self.clobber(0x100, 0x1ff);
         if value.is_return() {
             self.return_used = true;
         }
@@ -388,6 +396,7 @@ impl State {
         self.y = Sym::Unknown;
         self.carry = None;
         self.clobber_all();
+        self.forget_stack();
         self.select = Some(Sym::Unknown);
         self.windows = [Some(Sym::Unknown); 2];
     }
@@ -410,6 +419,9 @@ impl State {
 
     /// Applies the effects of a call to a routine that returns.
     pub fn apply(&mut self, summary: &Summary) {
+        // The hardware JSR wrote return bytes, even for an annotated callee.
+        self.clobber(0x100, 0x1ff);
+        let registers = summary.registers.map(|v| self.substitute(v));
         let windows = summary.windows.map(|w| w.map(|v| self.substitute(v)));
         let select = summary.select.map(|v| self.substitute(v));
         let memory: Vec<(u16, Sym)> = summary
@@ -417,12 +429,11 @@ impl State {
             .iter()
             .map(|(a, v)| (*a, self.substitute(*v)))
             .collect();
-        self.a = Sym::Unknown;
-        self.x = Sym::Unknown;
-        self.y = Sym::Unknown;
+        [self.a, self.x, self.y] = registers;
         self.carry = None;
         if summary.forgets_memory {
             self.clobber_all();
+            self.forget_stack();
         }
         for (low, high) in &summary.lost {
             self.clobber(u32::from(*low), u32::from(*high));
@@ -475,6 +486,13 @@ impl State {
         let mut effect = Effect::default();
         let direct = matches!(insn.mode, Mode::Zp | Mode::Abs);
         let address = insn.value;
+        let read = |state: &Self, address: u32| {
+            if tracked(address) {
+                state.read(address)
+            } else {
+                rom_byte(address).map_or(Sym::Unknown, Sym::Const)
+            }
+        };
         let load = |state: &Self| match insn.mode {
             Mode::Imm => Sym::Const(address as u8),
             Mode::Zp => state.read(address),
@@ -484,6 +502,33 @@ impl State {
             Mode::Zi | Mode::Zix | Mode::Ziy if state.pointer_is_return(insn) => {
                 Sym::Input(Input::AfterCall, 0)
             }
+            Mode::Zpx | Mode::Zpy | Mode::Ax | Mode::Ay => {
+                let index = if matches!(insn.mode, Mode::Zpy | Mode::Ay) {
+                    state.y
+                } else {
+                    state.x
+                };
+                index.constant().map_or(Sym::Unknown, |i| {
+                    let mask = if matches!(insn.mode, Mode::Zpx | Mode::Zpy) {
+                        0xff
+                    } else {
+                        0xffff
+                    };
+                    read(state, (address + u32::from(i)) & mask)
+                })
+            }
+            Mode::Zi | Mode::Zix | Mode::Ziy => state
+                .pointer(insn)
+                .and_then(|p| state.zp_word(p))
+                .and_then(|p| {
+                    let index = if insn.mode == Mode::Ziy {
+                        state.y.constant()?
+                    } else {
+                        0
+                    };
+                    Some(read(state, (u32::from(p) + u32::from(index)) & 0xffff))
+                })
+                .unwrap_or(Sym::Unknown),
             _ => Sym::Unknown,
         };
         match insn.mnemonic {
@@ -611,6 +656,23 @@ impl State {
                 .map(|(p, y)| (p + u32::from(y)) & 0xffff),
             _ => None,
         };
+        let writes_stack = match address {
+            Some(address) => stack_address(address),
+            None if matches!(insn.mode, Mode::Zpx | Mode::Zpy) => false,
+            None if matches!(insn.mode, Mode::Ax | Mode::Ay)
+                || (insn.mode == Mode::Ziy && pointer.is_some()) =>
+            {
+                let low = pointer.unwrap_or(base);
+                let high = low + 0xff;
+                [0x100, 0x900, 0x1100, 0x1900]
+                    .iter()
+                    .any(|start| low <= start + 0xff && high >= *start)
+            }
+            None => true,
+        };
+        if writes_stack {
+            self.forget_stack();
+        }
         match (address, insn.mode) {
             (Some(address), _) if tracked(address) => {
                 self.write(address, value);
@@ -656,6 +718,12 @@ impl State {
             }
         }
         effect
+    }
+
+    /// A store may have replaced a saved value or a return address.
+    fn forget_stack(&mut self) {
+        self.stack.clear();
+        self.stack_lost = true;
     }
 
     /// The zero page pointer an indirect instruction uses, when known.
@@ -776,6 +844,8 @@ fn shift(mnemonic: Mnemonic, a: u8, carry: Option<bool>) -> (Option<u8>, Option<
 /// What a call to a routine does, in terms of the state at the call.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Summary {
+    /// A, X and Y on return, in terms of the caller's inputs.
+    registers: [Sym; 3],
     /// The banks at $8000 and $A000 on return; `None`: unchanged.
     windows: [Option<Sym>; 2],
     select: Option<Sym>,
@@ -1048,7 +1118,12 @@ impl Summaries {
                         // through the return address.
                         let (low, high) = State::jump_bytes(insn.value);
                         let after_call = [low, high].iter().any(|a| state.read(*a).is_after_call());
-                        if state.return_used {
+                        if let Some(target) = state.jump_word(insn.value).and_then(|address| {
+                            code.target(loc, u32::from(address), current(&state))
+                        }) {
+                            loc = target;
+                            continue;
+                        } else if state.return_used {
                             summary.takes_return = true;
                             summary.dispatch |= after_call;
                         } else {
@@ -1100,6 +1175,9 @@ impl Summaries {
         let Some(first) = exits.first() else {
             return Ok(summary);
         };
+        summary.registers = exits.iter().fold([first.a, first.x, first.y], |acc, e| {
+            [acc[0].meet(e.a), acc[1].meet(e.x), acc[2].meet(e.y)]
+        });
         summary.windows = [0, 1].map(|w| {
             exits
                 .iter()
