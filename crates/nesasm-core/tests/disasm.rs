@@ -3933,7 +3933,7 @@ fn issue_ids_name_the_kind_and_place() {
         ids(&d),
         [
             "mapper_write:1:$E000",
-            "invalid_opcode:1:$E008",
+            "invalid_opcode:1:$E008:from=1:$E005",
             "unknown_range:1:$E008",
             "unknown_range:1:$E00A",
         ]
@@ -3945,7 +3945,11 @@ fn issue_ids_name_the_kind_and_place() {
             r#"{"labels": [{"address": "$E008", "name": "Bad"}], "options": {"uppercase": true}}"#,
         ),
     );
-    assert!(ids(&d).contains(&"invalid_opcode:1:$E008"), "{:?}", ids(&d));
+    assert!(
+        ids(&d).contains(&"invalid_opcode:1:$E008:from=1:$E005"),
+        "{:?}",
+        ids(&d)
+    );
     // Header issues all name $0000; a topic tells them apart.
     let mut rom = rom;
     rom[8] = 1;
@@ -3973,7 +3977,7 @@ fn issue_ids_name_the_kind_and_place() {
 }
 
 #[test]
-fn issue_ids_number_issues_of_one_kind_at_one_place() {
+fn issue_ids_name_the_path_to_the_place() {
     // Two paths enter the middle of the instruction at $E00E.
     let rom = nrom(concat!(
         "Reset:\n  jsr Two\n  lda $0300\n  beq Other\n  jmp Two+1\nOther:\n  jmp Two+1\n",
@@ -3986,7 +3990,10 @@ fn issue_ids_number_issues_of_one_kind_at_one_place() {
         .collect();
     assert_eq!(
         overlaps,
-        ["overlap:1:$E00F", "overlap:1:$E00F#2"],
+        [
+            "overlap:1:$E00F:from=1:$E008",
+            "overlap:1:$E00F:from=1:$E00B"
+        ],
         "{:?}",
         d.issues()
             .iter()
@@ -3996,6 +4003,53 @@ fn issue_ids_number_issues_of_one_kind_at_one_place() {
     let all = ids(&d);
     let unique: std::collections::BTreeSet<&&str> = all.iter().collect();
     assert_eq!(unique.len(), all.len());
+    // Without the entry point that also reaches the bad byte, the issue the
+    // branch reaches keeps its id.
+    let rom = nrom(concat!(
+        "Reset:\n  sta $8000\n  lda #0\n  beq Bad\n  rts\n",
+        "Bad:\n  .db $02\nNmi:\n  rti\n",
+    ));
+    let with = round_trip(&rom, &config(r#"{"entry_points": [{"address": "$E008"}]}"#));
+    let without = round_trip(&rom, &DisasmConfig::default());
+    let c = disasm::compare_issues(with.issues(), without.issues());
+    let names =
+        |issues: &[disasm::Issue]| -> Vec<String> { issues.iter().map(|i| i.id.clone()).collect() };
+    assert_eq!(names(&c.resolved), ["invalid_opcode:1:$E008"]);
+    assert!(c.introduced.is_empty() && c.changed.is_empty(), "{c:?}");
+}
+
+#[test]
+fn narrowed_unknown_ranges_are_changed_issues() {
+    let rom = nrom(concat!(
+        "Reset:\n  jmp Reset\nLoose:\n  .db 1, 2, 3, 4, 5\nNmi:\n  rti\n",
+    ));
+    let before = round_trip(&rom, &DisasmConfig::default());
+    let after = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E003", "length": 1}]}"#),
+    );
+    let c = disasm::compare_issues(before.issues(), after.issues());
+    assert!(c.resolved.is_empty() && c.introduced.is_empty(), "{c:?}");
+    assert_eq!(c.changed.len(), 1);
+    assert_eq!(c.changed[0].issue.id, "unknown_range:1:$E004");
+    assert_eq!(
+        c.changed[0].previous_id.as_deref(),
+        Some("unknown_range:1:$E003")
+    );
+    assert_eq!(
+        c.changed[0].previous_message,
+        "$E003-$E007 (5 bytes) is not reached by code nor described by a region"
+    );
+    let json = serde_json::to_value(&c.changed[0]).unwrap();
+    assert_eq!(json["previous_id"], "unknown_range:1:$E003");
+    // Described whole, it is resolved.
+    let all = round_trip(
+        &rom,
+        &config(r#"{"regions": [{"start": "$E003", "length": 5}]}"#),
+    );
+    let c = disasm::compare_issues(before.issues(), all.issues());
+    assert_eq!(c.resolved.len(), 1);
+    assert!(c.changed.is_empty());
 }
 
 #[test]

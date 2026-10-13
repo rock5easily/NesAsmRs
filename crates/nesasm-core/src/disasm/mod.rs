@@ -93,9 +93,11 @@ pub enum IssueKind {
 pub struct Issue {
     /// Identifies the issue across analyses of the ROM: its kind, bank and
     /// address (`"unresolved_bank:30:$DEB1"`, `"-"` without a bank), a
-    /// topic for header issues (`"header:-:$0000:trainer"`), and `#2`, `#3`
-    /// for further issues of the kind at the same place, in report order.
-    /// It does not depend on the message.
+    /// topic for header issues (`"header:-:$0000:trainer"`), and for
+    /// `overlap`, `invalid_opcode` and `code_data_conflict` the instruction
+    /// whose path reached the place (`"invalid_opcode:1:$E008:from=1:$E005"`;
+    /// none from an entry point or vector). It does not depend on the
+    /// message.
     pub id: String,
     pub kind: IssueKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +121,11 @@ pub struct Issue {
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub(crate) topic: Option<&'static str>,
+    /// The bank and address of the instruction whose path reached the
+    /// issue, for issues reported per path.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) via: Option<(usize, u32)>,
 }
 
 /// An issue reported in both analyses with another message.
@@ -128,6 +135,10 @@ pub struct ChangedIssue {
     #[serde(flatten)]
     pub issue: Issue,
     pub previous_message: String,
+    /// The id the issue had, when it changed: an unknown range that
+    /// annotations narrowed starts elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_id: Option<String>,
 }
 
 /// How the issues of two analyses differ, matched by id.
@@ -139,6 +150,8 @@ pub struct IssueComparison {
     /// Issues only the second analysis reports.
     pub introduced: Vec<Issue>,
     /// Issues both report, with different messages (as in the second).
+    /// Unknown ranges of a bank that overlap are the same issue, which
+    /// annotations narrowed or split.
     pub changed: Vec<ChangedIssue>,
 }
 
@@ -152,31 +165,59 @@ pub fn compare_issues(before: &[Issue], after: &[Issue]) -> IssueComparison {
             .collect()
     };
     let (old, new) = (ids(before), ids(after));
+    // An unknown range without its id that overlaps one without its id in
+    // the other analysis.
+    fn overlapping<'a>(
+        issue: &Issue,
+        others: &'a [Issue],
+        ids: &BTreeMap<String, usize>,
+    ) -> Option<&'a Issue> {
+        if issue.kind != IssueKind::UnknownRange {
+            return None;
+        }
+        others.iter().find(|other| {
+            other.kind == IssueKind::UnknownRange
+                && other.bank == issue.bank
+                && !ids.contains_key(&other.id)
+                && issue.spans.iter().any(|(start, length)| {
+                    other
+                        .spans
+                        .iter()
+                        .any(|(s, l)| *start < s + l && *s < start + length)
+                })
+        })
+    }
     IssueComparison {
         resolved: before
             .iter()
-            .filter(|i| !new.contains_key(&i.id))
+            .filter(|i| !new.contains_key(&i.id) && overlapping(i, after, &old).is_none())
             .cloned()
             .collect(),
         introduced: after
             .iter()
-            .filter(|i| !old.contains_key(&i.id))
+            .filter(|i| !old.contains_key(&i.id) && overlapping(i, before, &new).is_none())
             .cloned()
             .collect(),
         changed: after
             .iter()
             .filter_map(|issue| {
-                let previous = &before[*old.get(&issue.id)?];
+                let previous = match old.get(&issue.id) {
+                    Some(index) => &before[*index],
+                    None => overlapping(issue, before, &new)?,
+                };
                 (previous.message != issue.message).then(|| ChangedIssue {
                     issue: issue.clone(),
                     previous_message: previous.message.clone(),
+                    previous_id: (previous.id != issue.id).then(|| previous.id.clone()),
                 })
             })
             .collect(),
     }
 }
 
-/// Gives each issue its id (see [`Issue::id`]).
+/// Gives each issue its id (see [`Issue::id`]). Two issues of a kind at one
+/// place from one path are not expected; should they occur, the further
+/// ones get `#2`, `#3` in report order.
 fn assign_ids(issues: &mut [Issue]) {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for issue in issues {
@@ -188,6 +229,9 @@ fn assign_ids(issues: &mut [Issue]) {
         let mut id = format!("{kind}:{bank}:{}", issue.address);
         if let Some(topic) = issue.topic {
             id = format!("{id}:{topic}");
+        }
+        if let Some((bank, address)) = issue.via {
+            id = format!("{id}:from={bank}:{}", Address(address));
         }
         let count = seen.entry(id.clone()).or_default();
         *count += 1;

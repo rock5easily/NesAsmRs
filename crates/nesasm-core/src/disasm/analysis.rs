@@ -844,7 +844,16 @@ impl Analysis {
             spans: loc.map(|l| (l.offset, 1)).into_iter().collect(),
             fix: None,
             topic: None,
+            via: None,
         });
+    }
+
+    /// Records the instruction whose path reached the last issue, for its id.
+    fn via(&mut self, from: Option<Loc>) {
+        let via = from.map(|f| (f.bank, self.memory.address(f)));
+        if let Some(issue) = self.issues.last_mut() {
+            issue.via = via;
+        }
     }
 
     /// A header issue: they all name $0000, so `topic` tells them apart.
@@ -1876,6 +1885,7 @@ impl Analysis {
                         address,
                         format!("Code{source} enters the middle of an instruction at ${address:04X} (a skip trick, or a wrong entry)"),
                     );
+                    self.via(from);
                     return;
                 }
                 Class::Data => {
@@ -1891,6 +1901,7 @@ impl Analysis {
                             "Code{source} reaches ${address:04X}, which a region describes as data"
                         ),
                     );
+                    self.via(from);
                     return;
                 }
             }
@@ -2353,6 +2364,7 @@ impl Analysis {
                 address,
                 format!("${code:02X} at ${address:04X}{source} is not an NMOS 6502 instruction; the flow may be wrong, or this is data"),
             );
+            self.via(from);
             return None;
         };
         let len = inspect::operand_size(mode) + 1;
@@ -2369,6 +2381,7 @@ impl Analysis {
                 address,
                 format!("The instruction at ${address:04X}{source} would overlap other code, data or the end of the bank"),
             );
+            self.via(from);
             if let Some(issue) = self.issues.last_mut() {
                 issue.spans = vec![(loc.offset, len.min(end - loc.offset))];
             }

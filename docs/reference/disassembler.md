@@ -427,11 +427,15 @@ not reported). 65C02-only encodings are treated as data.
 Each issue has an `id` that identifies it across analyses of the ROM: its
 kind, bank (`-` without one) and address, such as `unresolved_bank:30:$DEB1`;
 header issues, which all name $0000, add a topic (`header:-:$0000:trainer`,
-also `nes2`, `size` and `partial_bank`). Further issues of the same kind at
-the same place, which come from different paths, add `#2`, `#3` in the order
-they are reported. The id does not depend on the message, the path that
-reached the place or the annotations, so an issue keeps it while other
-annotations change; in a ROM hack it is the id of the whole ROM's analysis.
+also `nes2`, `size` and `partial_bank`). `overlap`, `invalid_opcode` and
+`code_data_conflict`, reported for each path that reaches the place, add the
+instruction the path came from (`invalid_opcode:1:$E008:from=1:$E005`; nothing
+for an entry point or vector). The id does not depend on the message or on
+annotations elsewhere, so an issue keeps it while other annotations change;
+in a ROM hack it is the id of the whole ROM's analysis. An `unknown_range` is
+named by its first address: when annotations describe part of it, the rest
+starts elsewhere, and comparisons treat unknown ranges of a bank that overlap
+as the same issue, changed (with its `previous_id`).
 
 Issues whose settlement the analysis can shape have `suggestions`, each one
 alternative: `description`, the `operations` to give `annotate` together,
