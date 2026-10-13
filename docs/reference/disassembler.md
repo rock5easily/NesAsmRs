@@ -6,6 +6,14 @@ known about the ROM; edit it and disassemble again until the source reads well.
 
 ## Workflow
 
+The server does not invoke an LLM. A person or an LLM client interprets the
+reports and source evidence, then supplies annotations for the next analysis.
+The MCP tools do not edit annotation files: edit them with a separate file
+editor, or pass the same config as `inline` instead of `annotations` and save
+it separately. Paths in the config, including `rom` and `base`, are relative
+to the server root, even when the annotation file is in a subdirectory.
+For a detailed Japanese guide, see [MCP and LLM workflow](../disassembly-workflow.md).
+
 1. Create an annotation file in the project root, for example
    `game.disasm.json` containing `{"rom": "old/game.nes"}`.
 2. Call `disassemble` with `"annotations": "game.disasm.json"`. Read the
@@ -16,6 +24,15 @@ known about the ROM; edit it and disassemble again until the source reads well.
 4. Repeat 2-3. Then call `export_disassembly`; it writes the source only if it
    reassembles to the same ROM. Check it with `check` (`options.raw` for
    `.bin` ROMs).
+
+Keep the initial annotations and report as a baseline. Each iteration should
+record the evidence for new entries, bank references and bounded data tables,
+then check newly reached code against known data and conflicts. Untraced bytes
+emitted as `.db` are unknown, not necessarily confirmed data. Do not force
+whole unknown ranges to `code` or infer quality from code-byte counts alone.
+Byte-exact reassembly checks reproducibility, not the correctness of the
+code/data classification. Export to a fresh path, assemble to a different
+path from either input ROM, and compare the whole files, including the header.
 
 Addresses in annotations and queries are numbers or strings such as `"$C000"`
 or `"0xC000"`. Reports show them as `"$C000"`. `bank` may be omitted when only
