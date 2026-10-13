@@ -52,9 +52,10 @@ PRG banks are matched with the base's PRG banks in order, and CHR banks with
 its CHR banks, so an expanded ROM lines up; banks the base lacks are
 disassembled whole. Changed CHR banks are written whole, in the main file
 after the base ROM's `.incbin`: `.bank`, `.org $0000`, then
-`.incbin "<stem>.chr", offset, size` (or `.db` lines with `chr: "db"`), so a
-split source has no bank files of CHR banks. The `.chr` file holds the changed
-CHR banks in order, and `offset` is the position in it. The base must have
+`.incbin "<stem>.chr", offset, size`, so a split source has no bank files of
+CHR banks. The `.chr` file holds the changed CHR banks in order as raw data
+(edit it with a CHR tool), and `offset` is the position in it. `chr: "db"`
+does not apply with `base` and is an error. The base must have
 the same format as `rom` (`.nes` or whole-bank `.bin`), without a trainer;
 fragments (`load_address`) cannot have a base.
 
@@ -135,8 +136,9 @@ these two banks as one range, $C000-$FFFF:
 - `options`: `uppercase` (mnemonics, default false), `data_per_line`
   (default 8), `address_comments` (append `; $C000`), `auto_ram_labels`
   (`zp_10`, `ram_0300`), `nes_registers` (PPUCTRL ... JOY2, default true),
-  `chr` (`incbin`, default, or `db`), `split_banks` (one file per bank; by
-  default only when the source would exceed 512 KiB), `mapper4_fixed_prg_16k`
+  `chr` (`incbin`, default, or `db`; with `base`, only `incbin`),
+  `split_banks` (one file per bank; by default only when the source would
+  exceed 512 KiB), `mapper4_fixed_prg_16k`
   (mapper 4: the last two PRG banks as one range at $C000-$FFFF, see above;
   default false).
 

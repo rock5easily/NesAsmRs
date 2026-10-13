@@ -330,6 +330,13 @@ pub fn disassemble(
             ))]);
         }
     }
+    // A ROM hack includes its changed CHR banks from the CHR file, which
+    // CHR editors change; `.db` lines would be edited rarely.
+    if config.base.is_some() && config.options.chr == ChrMode::Db {
+        return Err(vec![error(
+            "options.chr \"db\" does not apply with base: changed CHR banks are included from the CHR file",
+        )]);
+    }
     let mut analysis = Analysis::run(rom_file, config, cancel).map_err(errors)?;
     let patches = match (base_file, &config.base) {
         (Some(base), Some(_)) => Some(Patches::new(&analysis, base, config).map_err(errors)?),
