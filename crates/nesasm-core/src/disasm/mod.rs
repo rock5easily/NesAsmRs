@@ -529,7 +529,7 @@ pub fn disassemble(
     let patches = match (base_file, &config.base) {
         (Some(base), Some(_)) => Some(Patches::new(&analysis, base, config).map_err(errors)?),
         (None, None) => {
-            if !config.patches.is_empty() {
+            if config.patches.iter().any(|p| config.applies(p)) {
                 return Err(vec![error("patches applies only with base")]);
             }
             None

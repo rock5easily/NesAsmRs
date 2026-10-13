@@ -4411,3 +4411,32 @@ fn evidence_added_by_operations_is_within_the_limits() {
         ["In the changed annotations: references[0]: evidence has 65 items; at most 64"]
     );
 }
+
+#[test]
+fn skipped_hypotheses_shape_nothing() {
+    // A hypothetical patch is no patch: no base is needed.
+    let rom = nrom("Reset:\n  jmp Reset\nNmi:\n  rti\n");
+    round_trip(
+        &rom,
+        &config(
+            r#"{"patches": [{"start": "$E000", "length": 1, "status": "hypothesis", "evidence": ["x"]}]}"#,
+        ),
+    );
+    // Suggestions do not build on an entry point the analysis skipped.
+    let print = concat!(
+        "Print:\n  pla\n  sta <$02\n  pla\n  sta <$03\n  ldy #$01\n  lda [$02],y\n  sta $0300\n",
+        "  lda <$02\n  clc\n  adc #$02\n  sta <$02\n  lda <$03\n  adc #$00\n  pha\n  lda <$02\n  pha\n  rts\n",
+    );
+    let rom = nrom(&format!(
+        "Reset:\n  jsr Print\n  .db $A9, $07\n  jmp Reset\n{print}Nmi:\n  rti\n"
+    ));
+    let c = config(
+        r#"{"entry_points": [{"address": "$E008", "name": "Print", "status": "hypothesis", "evidence": ["called from RESET"]}]}"#,
+    );
+    let d = round_trip(&rom, &c);
+    let found = suggestions(&d, IssueKind::ReturnAddress);
+    assert_eq!(
+        found[0][1]["operations"][0]["item"],
+        serde_json::json!({"bank": 1, "address": "$E008", "no_return": true})
+    );
+}

@@ -736,7 +736,7 @@ pub(crate) fn suggestions(
         let mut fields = config
             .entry_points
             .iter()
-            .find(|e| memory.locate(e.bank, e.address).ok() == Some(routine))
+            .find(|e| config.applies(*e) && memory.locate(e.bank, e.address).ok() == Some(routine))
             .and_then(|e| to_value(e).as_object().cloned())
             .unwrap_or_default();
         fields.insert("bank".into(), json!(routine.bank));
