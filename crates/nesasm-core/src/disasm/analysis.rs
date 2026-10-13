@@ -177,17 +177,22 @@ impl Memory {
                     end: chunk.len(),
                 });
             }
-            for layout in &config.banks {
+            for (i, layout) in config.banks.iter().enumerate() {
                 let org = layout.org.0;
                 if org % BANK_SIZE as u32 != 0 || org > 0xe000 {
                     return Err(format!(
-                        "Bank {} org {} must be a multiple of $2000 up to $E000",
+                        "banks[{i}]: Bank {} org {} must be a multiple of $2000 up to $E000",
                         layout.bank, layout.org
                     ));
                 }
                 match banks.get_mut(layout.bank) {
                     Some(bank) if !bank.chr => bank.org = org,
-                    _ => return Err(format!("Bank {} is not a PRG bank of the ROM", layout.bank)),
+                    _ => {
+                        return Err(format!(
+                            "banks[{i}]: Bank {} is not a PRG bank of the ROM",
+                            layout.bank
+                        ));
+                    }
                 }
             }
         }
@@ -415,7 +420,7 @@ fn fixed_pair(
             banks[first + 1].end
         ));
     }
-    for layout in &config.banks {
+    for (i, layout) in config.banks.iter().enumerate() {
         let fixed = match layout.bank {
             b if b == first => 0xc000,
             b if b == first + 1 => 0xe000,
@@ -423,7 +428,7 @@ fn fixed_pair(
         };
         if layout.org.0 != fixed {
             return Err(format!(
-                "banks gives bank {} org {}, but {OPTION} places it at {}",
+                "banks[{i}]: banks gives bank {} org {}, but {OPTION} places it at {}",
                 layout.bank,
                 layout.org,
                 Address(fixed)
@@ -476,9 +481,17 @@ pub(crate) struct Region {
     /// For pointer and low byte tables: offset of the table of the bank
     /// switched in for each entry.
     pub bank_table: Option<usize>,
+    /// The index of the annotation that describes the region.
+    pub index: Option<usize>,
 }
 
 impl Region {
+    /// How errors name the region: by the index of its annotation.
+    fn name(&self) -> String {
+        self.index
+            .map_or_else(|| "regions".to_owned(), |i| format!("regions[{i}]"))
+    }
+
     fn new(bank: usize, start: usize, end: usize, kind: RegionType) -> Self {
         Self {
             bank,
@@ -491,6 +504,7 @@ impl Region {
             columns: None,
             comment: None,
             bank_table: None,
+            index: None,
         }
     }
 }
@@ -741,6 +755,8 @@ pub(crate) struct Analysis {
     /// the instruction that completed the pointer, and the low and high
     /// byte tables with their index register.
     table_pointers: BTreeMap<u32, (Loc, Source, Source)>,
+    /// The annotation that gives each user name, for errors.
+    user_names: HashMap<String, String>,
 }
 
 impl Analysis {
@@ -827,6 +843,7 @@ impl Analysis {
             jump_issues: Vec::new(),
             switch_hints: BTreeMap::new(),
             table_pointers: BTreeMap::new(),
+            user_names: HashMap::new(),
         };
         analysis.apply(config)?;
         analysis.check_header();
@@ -880,23 +897,21 @@ impl Analysis {
         let mut names: HashMap<String, String> = HashMap::new();
         let mut claim = |name: &str, what: String, errors: &mut Vec<String>| {
             if let Err(e) = config::check_name(name) {
-                errors.push(e);
+                errors.push(format!("{what}: {e}"));
             } else if let Some(other) = names.insert(name.to_owned(), what.clone()) {
                 errors.push(format!("Name '{name}' is used by {other} and {what}"));
             }
         };
-        for entry in &config.entry_points {
+        for (i, entry) in config.entry_points.iter().enumerate() {
+            let what = format!("entry_points[{i}] {}", entry.address);
             if entry.inline_bytes > BANK_SIZE {
-                errors.push(format!(
-                    "entry_points {}: inline_bytes must be at most {BANK_SIZE}",
-                    entry.address
-                ));
+                errors.push(format!("{what}: inline_bytes must be at most {BANK_SIZE}"));
                 continue;
             }
             match self.memory.locate(entry.bank, entry.address) {
                 Ok(loc) => {
                     if let Some(name) = &entry.name {
-                        claim(name, format!("entry point {}", entry.address), &mut errors);
+                        claim(name, what.clone(), &mut errors);
                         self.add_label(loc, name, entry.comment.clone());
                     } else if let Some(comment) = &entry.comment {
                         self.comment(loc, comment, CommentPosition::Above);
@@ -904,16 +919,14 @@ impl Analysis {
                     let mut switch_banks = None;
                     if entry.switch_banks.is_some() && entry.keeps_banks {
                         errors.push(format!(
-                            "entry_points {}: give switch_banks or keeps_banks, not both",
-                            entry.address
+                            "{what}: give switch_banks or keeps_banks, not both"
                         ));
                     }
                     if let Some(banks) = entry.switch_banks {
                         for address in banks.iter().flatten() {
                             if !(address.0 < 0x800 || (0x6000..0x8000).contains(&address.0)) {
                                 errors.push(format!(
-                                    "entry_points {}: switch_banks {address} is not RAM ($0000-$07FF, $6000-$7FFF)",
-                                    entry.address
+                                    "{what}: switch_banks {address} is not RAM ($0000-$07FF, $6000-$7FFF)"
                                 ));
                             }
                         }
@@ -931,36 +944,37 @@ impl Analysis {
                     self.queue(loc, None, State::default());
                     self.want(loc, Want::Call);
                 }
-                Err(e) => errors.push(format!("entry_points {}: {e}", entry.address)),
+                Err(e) => errors.push(format!("{what}: {e}")),
             }
         }
-        for label in &config.labels {
+        for (i, label) in config.labels.iter().enumerate() {
+            let what = format!("labels[{i}] {} ({})", label.address, label.name);
             match self.memory.locate(label.bank, label.address) {
                 Ok(loc) => {
-                    claim(&label.name, format!("label {}", label.address), &mut errors);
+                    claim(&label.name, what, &mut errors);
                     self.add_label(loc, &label.name, label.comment.clone());
                 }
-                Err(e) => errors.push(format!("labels {} ({}): {e}", label.address, label.name)),
+                Err(e) => errors.push(format!("{what}: {e}")),
             }
         }
-        for symbol in &config.symbols {
-            claim(
-                &symbol.name,
-                format!("symbol {}", symbol.value),
-                &mut errors,
-            );
+        for (i, symbol) in config.symbols.iter().enumerate() {
+            let what = format!("symbols[{i}] {} ({})", symbol.value, symbol.name);
+            claim(&symbol.name, what.clone(), &mut errors);
             if symbol.value.0 > 0xffff {
                 errors.push(format!(
-                    "Symbol {} value {} exceeds $FFFF",
+                    "{what}: Symbol {} value {} exceeds $FFFF",
                     symbol.name, symbol.value
                 ));
             }
             if symbol.size == Some(0) {
-                errors.push(format!("Symbol {} size must be at least 1", symbol.name));
+                errors.push(format!(
+                    "{what}: Symbol {} size must be at least 1",
+                    symbol.name
+                ));
             }
             if u64::from(symbol.value.0) + u64::from(symbol.size.unwrap_or(1)) > 0x10000 {
                 errors.push(format!(
-                    "Symbol {} covers addresses past $FFFF",
+                    "{what}: Symbol {} covers addresses past $FFFF",
                     symbol.name
                 ));
                 continue;
@@ -986,27 +1000,28 @@ impl Analysis {
                 }
             }
         }
-        for comment in &config.comments {
+        self.user_names = names;
+        for (i, comment) in config.comments.iter().enumerate() {
             match self.memory.locate(comment.bank, comment.address) {
                 Ok(loc) => self.comment(loc, &comment.text, comment.position),
-                Err(e) => errors.push(format!("comments {}: {e}", comment.address)),
+                Err(e) => errors.push(format!("comments[{i}] {}: {e}", comment.address)),
             }
         }
-        for operand in &config.operands {
+        for (i, operand) in config.operands.iter().enumerate() {
             match self.memory.locate(operand.bank, operand.address) {
                 Ok(_) if operand.expr.trim().is_empty() || operand.expr.contains(['\n', ';']) => {
                     errors.push(format!(
-                        "operands {}: the expression must be one line without a comment",
+                        "operands[{i}] {}: the expression must be one line without a comment",
                         operand.address
                     ));
                 }
                 Ok(loc) => {
                     self.operands.insert(loc, operand.expr.trim().to_owned());
                 }
-                Err(e) => errors.push(format!("operands {}: {e}", operand.address)),
+                Err(e) => errors.push(format!("operands[{i}] {}: {e}", operand.address)),
             }
         }
-        for reference in &config.references {
+        for (i, reference) in config.references.iter().enumerate() {
             match self.memory.locate(reference.bank, reference.address) {
                 Ok(loc)
                     if self
@@ -1018,10 +1033,10 @@ impl Analysis {
                     self.references.insert(loc, reference.target_bank);
                 }
                 Ok(_) => errors.push(format!(
-                    "references {}: bank {} is not a PRG bank of the ROM",
+                    "references[{i}] {}: bank {} is not a PRG bank of the ROM",
                     reference.address, reference.target_bank
                 )),
-                Err(e) => errors.push(format!("references {}: {e}", reference.address)),
+                Err(e) => errors.push(format!("references[{i}] {}: {e}", reference.address)),
             }
         }
         self.apply_regions(config, &mut errors);
@@ -1033,8 +1048,8 @@ impl Analysis {
     }
 
     fn apply_regions(&mut self, config: &DisasmConfig, errors: &mut Vec<String>) {
-        for def in &config.regions {
-            let what = format!("regions {}", def.start);
+        for (i, def) in config.regions.iter().enumerate() {
+            let what = format!("regions[{i}] {}", def.start);
             let (loc, end) = match self.memory.span(def.bank, def.start, def.end, def.length) {
                 Ok(span) => span,
                 Err(e) => {
@@ -1101,6 +1116,7 @@ impl Analysis {
                 columns: def.columns,
                 comment: def.comment.clone(),
                 bank_table,
+                index: Some(i),
                 ..Region::new(loc.bank, loc.offset, end, def.kind)
             });
         }
@@ -1110,7 +1126,9 @@ impl Analysis {
                 if pair[1].start < pair[0].end {
                     let org = self.memory.banks[bank].org;
                     errors.push(format!(
-                        "Regions at ${:04X} and ${:04X} in bank {bank} overlap",
+                        "{} and {}: Regions at ${:04X} and ${:04X} in bank {bank} overlap",
+                        pair[0].name(),
+                        pair[1].name(),
                         org + pair[0].start as u32,
                         org + pair[1].start as u32
                     ));
@@ -1129,7 +1147,8 @@ impl Analysis {
                 });
                 if matching.is_none() {
                     errors.push(format!(
-                        "regions ${:04X}: pair must be the start of a high_bytes region of the same length",
+                        "{} ${:04X}: pair must be the start of a high_bytes region of the same length",
+                        low.name(),
                         org + low.start as u32
                     ));
                 }
@@ -1141,7 +1160,8 @@ impl Analysis {
                 {
                     let org = self.memory.banks[high.bank].org;
                     errors.push(format!(
-                        "regions ${:04X}: no low_bytes region names this high_bytes table as its pair",
+                        "{} ${:04X}: no low_bytes region names this high_bytes table as its pair",
+                        high.name(),
                         org + high.start as u32
                     ));
                 }
@@ -2515,6 +2535,13 @@ impl Analysis {
 
     /// Gives every wanted address a name: annotations first, then vectors,
     /// then automatic names.
+    /// `"labels[3] $C00B (Wait): "`: the annotation that gives `name`.
+    fn given(&self, name: &str) -> String {
+        self.user_names
+            .get(name)
+            .map_or(String::new(), |what| format!("{what}: "))
+    }
+
     fn name_labels(&mut self) -> Result<(), Vec<String>> {
         // Code targets inside an instruction are written as `label+n`, so the
         // instruction needs a label.
@@ -2576,7 +2603,8 @@ impl Analysis {
             };
             if user.contains(&name) {
                 errors.push(format!(
-                    "Name '{name}' is also the automatic label of ${address:04X} in bank {}; choose another name",
+                    "{}Name '{name}' is also the automatic label of ${address:04X} in bank {}; choose another name",
+                    self.given(&name),
                     loc.bank
                 ));
             }
@@ -2607,7 +2635,8 @@ impl Analysis {
                 };
                 if user.contains(&name) {
                     errors.push(format!(
-                        "Name '{name}' is also an automatic RAM name; choose another name"
+                        "{}Name '{name}' is also an automatic RAM name; choose another name",
+                        self.given(&name)
                     ));
                 }
                 self.symbols.push(SymbolEntry {

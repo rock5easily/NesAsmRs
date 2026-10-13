@@ -141,14 +141,14 @@ impl Patches {
             }
         }
         let mut errors = Vec::new();
-        for def in &config.patches {
+        for (i, def) in config.patches.iter().enumerate() {
             match memory.span(def.bank, def.start, def.end, def.length) {
                 Ok((loc, end)) => ranges[loc.bank].push(PatchRange {
                     start: loc.offset,
                     end,
                     comment: def.comment.clone(),
                 }),
-                Err(e) => errors.push(format!("patches {}: {e}", def.start)),
+                Err(e) => errors.push(format!("patches[{i}] {}: {e}", def.start)),
             }
         }
         if !errors.is_empty() {

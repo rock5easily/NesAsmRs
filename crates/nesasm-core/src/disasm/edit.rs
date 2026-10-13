@@ -203,8 +203,11 @@ trait Entry: Clone + Serialize + DeserializeOwned {
     /// The bank and address in the ROM the entry names, if any.
     fn location(&mut self) -> Option<(&mut Option<usize>, Address)>;
     fn key(&self) -> Key;
-    /// Where the entry goes in the written file.
+    /// Where the entry goes in the written file; entries with the same place
+    /// keep their order (the sort is stable).
     fn order(&self) -> (Option<usize>, u32, String);
+    /// Whether the list is put in the order of `order`.
+    const SORTED: bool = true;
     fn check(&self) -> Result<(), String> {
         Ok(())
     }
@@ -234,11 +237,15 @@ impl Entry for LabelDef {
         Key::Name(self.name.clone())
     }
     fn order(&self) -> (Option<usize>, u32, String) {
-        (self.bank, self.address.0, self.name.clone())
+        // Labels at one address keep their order: the first names the place.
+        (self.bank, self.address.0, String::new())
     }
 }
 
 impl Entry for SymbolDef {
+    // The first symbol whose range holds a value names it, also when the
+    // ranges of symbols of other values overlap: their order is kept.
+    const SORTED: bool = false;
     fn location(&mut self) -> Option<(&mut Option<usize>, Address)> {
         None
     }
@@ -246,7 +253,7 @@ impl Entry for SymbolDef {
         Key::Name(self.name.clone())
     }
     fn order(&self) -> (Option<usize>, u32, String) {
-        (None, self.value.0, self.name.clone())
+        (None, self.value.0, String::new())
     }
 }
 
@@ -369,6 +376,8 @@ fn upsert<T: Entry>(
     item.check()?;
     normalize(&mut item, memory)?;
     let key = item.key();
+    // In the place of the first entry it replaces, as order can matter.
+    let place = list.iter().position(|entry| key.names(&entry.key()));
     let mut previous = Vec::new();
     list.retain(|entry| {
         let same = key.names(&entry.key());
@@ -377,7 +386,7 @@ fn upsert<T: Entry>(
         }
         !same
     });
-    list.push(item);
+    list.insert(place.unwrap_or(list.len()), item);
     Ok(previous)
 }
 
@@ -454,8 +463,11 @@ fn duplicates<T: Entry>(kind: AnnotationKind, list: &[T], errors: &mut Vec<Strin
     }
 }
 
+/// Puts `list` in canonical order, unless the order of its entries matters.
 fn sort<T: Entry>(list: &mut [T]) {
-    list.sort_by_key(|entry| entry.order());
+    if T::SORTED {
+        list.sort_by_key(|entry| entry.order());
+    }
 }
 
 /// Runs `$body` with `$list` bound to the list of `$kind` in `$config`
@@ -590,10 +602,12 @@ pub fn apply_operations(
     for index in (0..operations.len()).filter(|i| layout(&operations[*i])) {
         apply(&mut config, index, None);
     }
+    // Layout errors name banks entries by their index in canonical order.
+    sort(&mut config.banks);
     let memory = match Memory::new(rom_file, &config) {
         Ok(memory) => memory,
         Err(e) => {
-            errors.push(e);
+            errors.push(format!("In the changed annotations: {e}"));
             return Err(errors);
         }
     };

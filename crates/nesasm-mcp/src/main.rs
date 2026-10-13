@@ -351,11 +351,16 @@ struct DisasmReport {
     ram: Option<Page<RamUse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     baseline: Option<BaselineReport>,
+    /// Digests of the files read and the server version, to record with
+    /// the results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inputs: Option<Inputs>,
 }
 
 /// The analysis with the baseline annotations, compared with this one.
 #[derive(Serialize, JsonSchema)]
 struct BaselineReport {
+    inputs: Inputs,
     summary: Summary,
     /// Issues the baseline reports and these annotations do not.
     issues_resolved: Page<Issue>,
@@ -913,6 +918,22 @@ impl Server {
 struct Loaded {
     disassembly: Disassembly,
     rom: PathBuf,
+    inputs: Inputs,
+}
+
+/// What an analysis read, to record with its results.
+#[derive(Clone, Serialize, JsonSchema)]
+struct Inputs {
+    /// SHA-256 of the ROM file.
+    rom_sha256: String,
+    /// SHA-256 of the base ROM file of a ROM hack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_sha256: Option<String>,
+    /// SHA-256 of the annotation file, or for inline annotations of their
+    /// canonical text (as annotate would write them).
+    annotations_sha256: String,
+    /// The version of nesasm-mcp.
+    server_version: String,
 }
 
 /// The ROM files annotations name: the ROM's resolved path and bytes, and
@@ -932,12 +953,12 @@ impl Server {
         output: Option<&Path>,
         cancel: &AtomicBool,
     ) -> Result<Loaded, Vec<Diagnostic>> {
-        let (config, location) = match (annotations, inline) {
+        let (config, location, text) = match (annotations, inline) {
             (Some(path), None) => {
-                let (config, _) = Self::read_annotations(root, path)?;
-                (config, SourceLocation::file(path))
+                let (config, bytes) = Self::read_annotations(root, path)?;
+                (config, SourceLocation::file(path), bytes)
             }
-            (None, Some(config)) => (config.clone(), SourceLocation::default()),
+            (None, Some(config)) => (config.clone(), SourceLocation::default(), Vec::new()),
             _ => {
                 return Err(vec![error(
                     DiagnosticCode::Disasm,
@@ -947,9 +968,25 @@ impl Server {
         };
         let rom = Self::read_rom(root, &config, &location)?;
         let disassembly = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        // Inline annotations as annotate would write them: canonical, each
+        // entry with its bank.
+        let text = if annotations.is_some() {
+            text
+        } else {
+            let normalized = disasm::apply_operations(&config, &rom.bytes, &[])
+                .map_or_else(|_| config.clone(), |(config, _)| config);
+            disasm::canonical_json(&normalized).into_bytes()
+        };
+        let inputs = Inputs {
+            rom_sha256: disasm::sha256_hex(&rom.bytes),
+            base_sha256: rom.base.as_deref().map(disasm::sha256_hex),
+            annotations_sha256: disasm::sha256_hex(&text),
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
         Ok(Loaded {
             disassembly,
             rom: rom.path,
+            inputs,
         })
     }
 
@@ -1051,6 +1088,7 @@ impl Server {
             success: true,
             summary: Some(d.summary()),
             verification: Some(d.verify(root, Some(root), cancel)),
+            inputs: Some(loaded.inputs.clone()),
             files: d.files().iter().map(|(p, _)| p.clone()).collect(),
             ..DisasmReport::default()
         };
@@ -1137,12 +1175,14 @@ impl Server {
                 cancel,
             ) {
                 Ok(baseline) => {
-                    if baseline.rom != loaded.rom {
+                    let (now, then) = (&loaded.inputs, &baseline.inputs);
+                    if (&now.rom_sha256, &now.base_sha256) != (&then.rom_sha256, &then.base_sha256)
+                    {
                         report.diagnostics.push(Diagnostic {
                             severity: Severity::Warning,
                             ..error(
                                 DiagnosticCode::Disasm,
-                                "The baseline annotations name another ROM; issues are compared by kind and place only",
+                                "The baseline annotations name another ROM or base ROM (see inputs); issues are compared by kind and place only",
                             )
                         });
                     }
@@ -1150,6 +1190,7 @@ impl Server {
                     let (issues_resolved, issues_introduced, issues_changed) =
                         issue_pages(base.issues(), d.issues(), query.offset, query.limit);
                     report.baseline = Some(BaselineReport {
+                        inputs: baseline.inputs.clone(),
                         summary: base.summary(),
                         issues_resolved,
                         issues_introduced,
@@ -1189,6 +1230,7 @@ impl Server {
         let d = &loaded.disassembly;
         let verification = d.verify(root, Some(root), cancel);
         let mut report = DisasmReport {
+            inputs: Some(loaded.inputs.clone()),
             summary: Some(d.summary()),
             files: d.files().iter().map(|(p, _)| p.clone()).collect(),
             ..DisasmReport::default()
@@ -1318,7 +1360,21 @@ impl Server {
         let (config, applied) = disasm::apply_operations(&original, &rom.bytes, &input.operations)
             .map_err(with_location)?;
         report.applied = applied;
-        let after = Self::disassemble_with(root, &config, &rom, output, &location, cancel)?;
+        let after = match Self::disassemble_with(root, &config, &rom, output, &location, cancel) {
+            Ok(after) => after,
+            Err(diagnostics) => {
+                // The errors name entries by their index in the changed
+                // annotations, which are in canonical order: return them.
+                report.annotations = serde_json::from_str(&disasm::canonical_json(&config)).ok();
+                return Err(diagnostics
+                    .into_iter()
+                    .map(|d| Diagnostic {
+                        message: format!("In the changed annotations: {}", d.message),
+                        ..d
+                    })
+                    .collect());
+            }
+        };
         let verification = after.verify(root, Some(root), cancel);
         let matched = verification.matched;
         report.verification = Some(verification);
@@ -1461,6 +1517,18 @@ impl Server {
 
     fn disasm_summary(report: &DisasmReport) -> String {
         let mut text = Vec::new();
+        if let Some(inputs) = &report.inputs {
+            text.push(format!(
+                "Inputs: ROM sha256 {}{}, annotations sha256 {}, nesasm-mcp {}",
+                inputs.rom_sha256,
+                inputs
+                    .base_sha256
+                    .as_ref()
+                    .map_or(String::new(), |b| format!(", base sha256 {b}")),
+                inputs.annotations_sha256,
+                inputs.server_version
+            ));
+        }
         if let Some(summary) = &report.summary {
             let prg = summary.banks.iter().filter(|b| !b.chr).count();
             text.push(format!(

@@ -525,7 +525,23 @@ fn annotation_errors_name_the_entry() {
     for (json, message) in [
         (
             r#"{"labels": [{"address": "$E000", "name": "9lives"}]}"#,
-            "Invalid name '9lives'",
+            "labels[0] $E000 (9lives): Invalid name '9lives'",
+        ),
+        (
+            r#"{"labels": [{"address": "$E000", "name": "ok"}, {"address": "$1234", "name": "a2"}]}"#,
+            "labels[1] $1234 (a2): No PRG bank holds $1234",
+        ),
+        (
+            r#"{"regions": [{"start": "$E000", "length": 1}, {"start": "$E001", "length": 1, "type": "high_bytes"}]}"#,
+            "regions[1] $E001: no low_bytes region names this high_bytes table as its pair",
+        ),
+        (
+            r#"{"comments": [{"address": "$1234", "text": "x"}]}"#,
+            "comments[0] $1234: No PRG bank holds $1234",
+        ),
+        (
+            r#"{"references": [{"address": "$E000", "target_bank": 9}]}"#,
+            "references[0] $E000: bank 9 is not a PRG bank of the ROM",
         ),
         (
             r#"{"labels": [{"address": "$E000", "name": "x"}]}"#,
@@ -533,31 +549,31 @@ fn annotation_errors_name_the_entry() {
         ),
         (
             r#"{"labels": [{"address": "$E000", "name": "a1"}], "symbols": [{"name": "a1", "value": 0}]}"#,
-            "Name 'a1' is used by label $E000 and symbol $0000",
+            "Name 'a1' is used by labels[0] $E000 (a1) and symbols[0] $0000 (a1)",
         ),
         (
             r#"{"labels": [{"address": "$1234", "name": "a1"}]}"#,
-            "labels $1234 (a1): No PRG bank holds $1234",
+            "labels[0] $1234 (a1): No PRG bank holds $1234",
         ),
         (
             r#"{"labels": [{"bank": 0, "address": "$E000", "name": "a1"}]}"#,
-            "labels $E000 (a1): Bank 0 ($C000-$DFFF) does not hold $E000",
+            "labels[0] $E000 (a1): Bank 0 ($C000-$DFFF) does not hold $E000",
         ),
         (
             r#"{"regions": [{"start": "$E000", "length": 4}, {"start": "$E002", "length": 4}]}"#,
-            "Regions at $E000 and $E002 in bank 1 overlap",
+            "regions[0] and regions[1]: Regions at $E000 and $E002 in bank 1 overlap",
         ),
         (
             r#"{"regions": [{"start": "$E000", "length": 2, "type": "low_bytes"}]}"#,
-            "regions $E000: low_bytes needs pair (the high_bytes table)",
+            "regions[0] $E000: low_bytes needs pair (the high_bytes table)",
         ),
         (
             r#"{"regions": [{"start": "$FFFF", "length": 2}]}"#,
-            "regions $FFFF: the range runs past the end of bank 1 ($FFFF)",
+            "regions[0] $FFFF: the range runs past the end of bank 1 ($FFFF)",
         ),
         (
             r#"{"banks": [{"bank": 0, "org": "$9000"}]}"#,
-            "Bank 0 org $9000 must be a multiple of $2000 up to $E000",
+            "banks[0]: Bank 0 org $9000 must be a multiple of $2000 up to $E000",
         ),
         (
             r#"{"load_address": "$8000"}"#,
@@ -565,7 +581,7 @@ fn annotation_errors_name_the_entry() {
         ),
         (
             r#"{"operands": [{"address": "$E000", "expr": " "}]}"#,
-            "operands $E000: the expression must be one line without a comment",
+            "operands[0] $E000: the expression must be one line without a comment",
         ),
     ] {
         let e = disasm::disassemble(&rom, None, &config(json), Path::new("out.asm"), &NEVER)
@@ -1148,7 +1164,7 @@ fn rom_hack_annotation_errors() {
         &hack,
         Some(&base),
         r#"{"base": "base.nes", "patches": [{"start": "$1000", "length": 1}]}"#,
-        "patches $1000: No PRG bank holds $1000",
+        "patches[0] $1000: No PRG bank holds $1000",
     );
 }
 
@@ -1184,15 +1200,15 @@ fn huge_annotation_values_are_errors() {
     for (json, message) in [
         (
             r#"{"regions": [{"start": "$E000", "end": "$FFFFFFFF"}]}"#,
-            "regions $E000: the range runs past the end of bank 1 ($FFFF)",
+            "regions[0] $E000: the range runs past the end of bank 1 ($FFFF)",
         ),
         (
             r#"{"entry_points": [{"address": "$E004", "inline_bytes": 18446744073709551615}]}"#,
-            "entry_points $E004: inline_bytes must be at most 8192",
+            "entry_points[0] $E004: inline_bytes must be at most 8192",
         ),
         (
             r#"{"symbols": [{"name": "buf", "value": 1, "size": 4294967295}]}"#,
-            "Symbol buf covers addresses past $FFFF",
+            "symbols[0] $0001 (buf): Symbol buf covers addresses past $FFFF",
         ),
     ] {
         let e = disasm::disassemble(&rom, None, &config(json), Path::new("out.asm"), &NEVER)
@@ -1935,12 +1951,12 @@ fn mapper4_fixed_prg_16k_needs_a_mapper_4_rom_and_agreeing_banks() {
     fails(
         &rom,
         &banks(r#"{"bank": 2, "org": "$8000"}"#),
-        "banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000",
+        "banks[0]: banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000",
     );
     fails(
         &rom,
         &banks(r#"{"bank": 3, "org": "$A000"}"#),
-        "banks gives bank 3 org $A000, but options.mapper4_fixed_prg_16k places it at $E000",
+        "banks[0]: banks gives bank 3 org $A000, but options.mapper4_fixed_prg_16k places it at $E000",
     );
     // The windows the option sets may also be given.
     round_trip(
@@ -2679,7 +2695,7 @@ fn bank_tables_give_the_bank_of_each_entry() {
         .expect("bank_table on bytes should fail");
     assert_eq!(
         e[0].message,
-        "regions $E018: bank_table applies only to pointers and low_bytes"
+        "regions[0] $E018: bank_table applies only to pointers and low_bytes"
     );
 }
 
@@ -2950,7 +2966,7 @@ fn routines_switching_banks_from_ram_can_be_annotated() {
     .expect("switch_banks outside RAM should fail");
     assert_eq!(
         e[0].message,
-        "entry_points $E00D: switch_banks $8000 is not RAM ($0000-$07FF, $6000-$7FFF)"
+        "entry_points[0] $E00D: switch_banks $8000 is not RAM ($0000-$07FF, $6000-$7FFF)"
     );
 }
 
@@ -3287,7 +3303,7 @@ fn routines_keeping_the_banks_can_be_annotated() {
     .expect("switch_banks with keeps_banks should fail");
     assert_eq!(
         e[0].message,
-        "entry_points $E00D: give switch_banks or keeps_banks, not both"
+        "entry_points[0] $E00D: give switch_banks or keeps_banks, not both"
     );
 }
 
@@ -4122,4 +4138,81 @@ fn issues_are_compared_by_id() {
     // Nothing differs from itself.
     let same = disasm::compare_issues(after.issues(), after.issues());
     assert!(same.resolved.is_empty() && same.introduced.is_empty() && same.changed.is_empty());
+}
+
+#[test]
+fn names_taken_by_automatic_names_name_their_entry() {
+    let rom = nrom("Reset:\n  lda <$20\n  jmp Next\nNext:\n  jmp Reset\nNmi:\n  rti\n");
+    for (json, message) in [
+        (
+            r#"{"labels": [{"address": "$E000", "name": "Start"}, {"address": "$E002", "name": "L_E005"}]}"#,
+            "labels[1] $E002 (L_E005): Name 'L_E005' is also the automatic label of $E005 in bank 1; choose another name",
+        ),
+        (
+            r#"{"symbols": [{"name": "zp_20", "value": "$30"}], "options": {"auto_ram_labels": true}}"#,
+            "symbols[0] $0030 (zp_20): Name 'zp_20' is also an automatic RAM name; choose another name",
+        ),
+    ] {
+        let e = disasm::disassemble(&rom, None, &config(json), Path::new("out.asm"), &NEVER)
+            .err()
+            .unwrap_or_else(|| panic!("{json} should fail"));
+        assert!(
+            e.iter().any(|d| d.message == message),
+            "{json}: {:?}",
+            e.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn canonical_order_keeps_the_order_of_names_for_one_place() {
+    let rom = nrom("Reset:\n  jmp Reset\nNmi:\n  rti\n");
+    for (first, second) in [("Zulu", "Alpha"), ("Alpha", "Zulu")] {
+        let original = config(&format!(
+            r#"{{"labels": [{{"address": "$E000", "name": "{first}"}}, {{"address": "$E000", "name": "{second}"}}],
+                "symbols": [{{"name": "{first}_v", "value": "$10"}}, {{"name": "{second}_v", "value": "$10"}}]}}"#
+        ));
+        let changed = apply(&rom, &original, serde_json::json!([]));
+        let labels: Vec<&str> = changed.labels.iter().map(|l| l.name.as_str()).collect();
+        let symbols: Vec<&str> = changed.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(labels, [first, second]);
+        assert_eq!(symbols, [format!("{first}_v"), format!("{second}_v")]);
+    }
+    // Symbols keep their order also across values, as their ranges may
+    // overlap; one replaced stays in its place.
+    let original = config(
+        r#"{"symbols": [{"name": "Higher", "value": "$30", "size": 32}, {"name": "Lower", "value": "$20", "size": 64}]}"#,
+    );
+    let changed = apply(
+        &rom,
+        &original,
+        serde_json::json!([
+            {"op": "upsert", "kind": "symbols", "item": {"name": "Higher", "value": "$30", "size": 32, "comment": "first"}},
+        ]),
+    );
+    let symbols: Vec<(&str, Option<&str>)> = changed
+        .symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.comment.as_deref()))
+        .collect();
+    assert_eq!(symbols, [("Higher", Some("first")), ("Lower", None)]);
+}
+
+#[test]
+fn layout_errors_of_operations_name_the_changed_banks() {
+    let rom = mmc3_rom(false);
+    let original = config(&format!(
+        r#"{{"banks": [{{"bank": 2, "org": "$C000"}}, {{"bank": 3, "org": "$E000"}}], "options": {{{FIXED_PAIR}}}}}"#
+    ));
+    // The upserted bank moves to the end, then back to its place by bank.
+    assert_eq!(
+        apply_errors(
+            &rom,
+            &original,
+            serde_json::json!([{"op": "upsert", "kind": "banks", "item": {"bank": 2, "org": "$8000"}}]),
+        ),
+        [
+            "In the changed annotations: banks[0]: banks gives bank 2 org $8000, but options.mapper4_fixed_prg_16k places it at $C000"
+        ]
+    );
 }

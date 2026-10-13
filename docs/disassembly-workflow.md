@@ -128,6 +128,8 @@ mapper番号だけで実行中の配置が固定だとは判断しません。
 不一致なら、その原因を確認してから注釈の範囲を広げます。
 
 保存する内容は、入力のハッシュ、実行時の注釈全文、サーバーの版、ツールの引数、応答です。
+入力のハッシュとサーバーの版は、`disassemble`／`export_disassembly` の応答の `inputs`
+（ROM・ベースROM・注釈ファイルのSHA-256、`server_version`）にあります。
 集計はPRGとCHRを分け、`summary.instructions`、ラベル・ルーチン数、PRGの
 `code_bytes`／`data_bytes`／`unknown_bytes`、issuesの種類別件数を記録します。
 未分類バイト数を「未解析命令数」とは呼びません。
