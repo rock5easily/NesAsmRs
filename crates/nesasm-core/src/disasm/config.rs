@@ -146,6 +146,10 @@ pub struct EntryPoint {
     /// at $8000 and the one in the second at $A000 (`null`: not switched),
     /// and changes no other RAM the caller knows.
     pub switch_banks: Option<[Option<Address>; 2]>,
+    /// The routine returns with the PRG banks it was called with (such as
+    /// a thread yield that other threads' bank switches run during).
+    #[serde(default)]
+    pub keeps_banks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -360,6 +360,15 @@ impl State {
         self.apply(&known);
     }
 
+    /// After a call to a routine that does not return (as far as it can be
+    /// followed): nothing is known but the windows it wrote.
+    pub fn forget_after(&mut self, summary: &Summary) {
+        self.forget();
+        for (w, switched) in summary.switched.iter().enumerate() {
+            self.switched[w] |= switched;
+        }
+    }
+
     /// After a call whose effects are unknown.
     pub fn forget(&mut self) {
         self.a = Sym::Unknown;
@@ -773,6 +782,18 @@ pub(crate) struct Summary {
 }
 
 impl Summary {
+    /// A routine that returns with the banks it was called with
+    /// (`keeps_banks`); what else it does is not known.
+    fn keeping() -> Self {
+        Self {
+            select: Some(Sym::Unknown),
+            forgets_memory: true,
+            returns: true,
+            returns_known: true,
+            ..Self::default()
+        }
+    }
+
     /// A routine that switches in the banks held in RAM (`switch_banks`).
     fn switching(banks: [Option<u16>; 2]) -> Self {
         Self {
@@ -811,6 +832,8 @@ pub(crate) trait Code {
     fn annotated(&self, loc: Loc) -> Option<(bool, usize)>;
     /// `switch_banks` of an annotated entry point.
     fn switches(&self, loc: Loc) -> Option<[Option<u16>; 2]>;
+    /// `keeps_banks` of an annotated entry point.
+    fn keeps(&self, loc: Loc) -> bool;
     /// The window ($8000 = 0, $A000 = 1) of a bank that is switched.
     fn window_of(&self, bank: usize) -> Option<usize>;
     /// The PRG bank a mapper bank number selects.
@@ -839,6 +862,9 @@ impl Summaries {
         if let Some(banks) = code.switches(entry) {
             return Arc::new(Summary::switching(banks));
         }
+        if code.keeps(entry) {
+            return Arc::new(Summary::keeping());
+        }
         let key = (entry, windows);
         if let Some(summary) = self.memo.get(&key) {
             return summary.clone();
@@ -847,13 +873,14 @@ impl Summaries {
             return Arc::new(Summary::unknown());
         }
         self.active.push(key);
-        let mut summary = self
-            .explore(code, entry, windows, false)
-            .unwrap_or_else(|| self.fallback(code, key));
+        let mut summary = match self.explore(code, entry, windows, false) {
+            Ok(summary) => summary,
+            Err(switched) => self.fallback(code, key, switched),
+        };
         // Advice only: the banks the routine switches in if the code it
         // cannot follow changed nothing.
         if summary.windows.contains(&Some(Sym::Unknown))
-            && let Some(hopeful) = self.explore(code, entry, windows, true)
+            && let Ok(hopeful) = self.explore(code, entry, windows, true)
         {
             let hint = hopeful.windows.map(|w| match w {
                 Some(Sym::Input(Input::Mem(a), 0)) => Some(a),
@@ -876,7 +903,7 @@ impl Summaries {
         entry: Loc,
         windows: [Option<u8>; 2],
         hopeful: bool,
-    ) -> Option<Summary> {
+    ) -> Result<Summary, [bool; 2]> {
         let current = |state: &State| -> [Option<u8>; 2] {
             [0, 1].map(|w| match state.windows[w] {
                 Some(v) => v.constant(),
@@ -897,7 +924,8 @@ impl Summaries {
             loop {
                 steps += 1;
                 if steps > MAX_SUMMARY_STEPS {
-                    return None;
+                    // Too many paths: the banks written so far still count.
+                    return Err(switched);
                 }
                 if let Some(before) = seen.get(&loc) {
                     let met = state.meet(before);
@@ -1028,10 +1056,10 @@ impl Summaries {
             summary.windows = unknown.windows;
             summary.select = unknown.select;
             summary.forgets_memory = true;
-            return Some(summary);
+            return Ok(summary);
         }
         let Some(first) = exits.first() else {
-            return Some(summary);
+            return Ok(summary);
         };
         summary.windows = [0, 1].map(|w| {
             exits
@@ -1056,28 +1084,26 @@ impl Summaries {
         written.sort_unstable();
         written.dedup();
         for address in written {
-            let value = |e: &State| {
-                e.memory
-                    .iter()
-                    .find(|(a, _)| *a == address)
-                    .map(|(_, v)| *v)
-            };
-            let first_value = value(first);
-            match first_value {
-                Some(v) if exits.iter().all(|e| value(e) == Some(v)) && v != Sym::Unknown => {
-                    summary.memory.push((address, v));
-                }
+            // The value each exit reads (not written: the one at the start).
+            let value = first.read(u32::from(address));
+            let same = exits.iter().all(|e| e.read(u32::from(address)) == value);
+            match value {
+                // Left as it was.
+                Sym::Input(Input::Mem(a), 0) if same && a == address => {}
+                Sym::Unknown => summary.changed.push(address),
+                v if same => summary.memory.push((address, v)),
                 _ => summary.changed.push(address),
             }
         }
-        Some(summary)
+        Ok(summary)
     }
 
     /// For a routine with too many paths: it leaves the banks alone if no
     /// code it reaches writes to the mapper or jumps where the scan cannot
     /// follow.
-    fn fallback(&mut self, code: &impl Code, key: Key) -> Summary {
-        if self.mapper_free(code, key) {
+    /// `switched`: the windows the paths followed wrote.
+    fn fallback(&mut self, code: &impl Code, key: Key, switched: [bool; 2]) -> Summary {
+        let mut summary = if self.mapper_free(code, key) {
             Summary {
                 forgets_memory: true,
                 returns: true,
@@ -1085,7 +1111,9 @@ impl Summaries {
             }
         } else {
             Summary::unknown()
-        }
+        };
+        summary.switched = switched;
+        summary
     }
 
     fn mapper_free(&mut self, code: &impl Code, key: Key) -> bool {

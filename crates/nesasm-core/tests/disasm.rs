@@ -3031,3 +3031,114 @@ fn jump_tables_after_a_jsr_need_the_return_address_unchanged() {
     assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
     assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
 }
+
+#[test]
+fn switch_banks_of_unknown_ram_keep_the_bank_the_caller_runs_in() {
+    // Switch is annotated. Called from bank 0, it switches in the bank in
+    // $F5, which is not known here: like any call whose bank is not known,
+    // it is taken to keep bank 0 at $8000 (a convention).
+    let reset = "  lda #$00
+  sta <$F5
+  jsr Switch
+  jsr $8000
+";
+    let annotations =
+        config(r#"{"entry_points": [{"address": "$E013", "switch_banks": ["$F5", "$F6"]}]}"#);
+    let banks = "  .bank 0
+  .org $8000
+  lda $0300
+  sta <$F5
+  jsr Switch
+  lda #$33
+  rts
+";
+    let d = round_trip(&switching_rom(banks, reset), &annotations);
+    assert_lines(&d, &["sub_00_8000:", "	jsr sub_E013", "	lda #$33"]);
+    // A bank known to be another is not.
+    let banks = banks.replace("lda $0300", "lda #$02");
+    let d = round_trip(&switching_rom(&banks, reset), &annotations);
+    assert!(!d.text().contains("	lda #$33"), "{}", d.text());
+}
+
+#[test]
+fn calls_that_switch_the_bank_and_do_not_return_end_the_trace() {
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel2\n  .db $A9, $33, $60\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Sel2:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\nHang:\n  jmp Hang\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+}
+
+#[test]
+fn routines_with_too_many_paths_keep_the_banks_they_write() {
+    // Sel3 switches bank 2 in, then has more paths than a summary follows.
+    let mut reset = String::from(concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Sel3:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+    ));
+    for _ in 0..2100 {
+        reset.push_str("  bne *+2\n");
+    }
+    reset.push_str("  rts\n");
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel3\n  .db $A9, $33, $60\n";
+    let d = round_trip(&switching_rom(banks, &reset), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+}
+
+#[test]
+fn unresolved_stored_pointers_are_not_reported_as_followed() {
+    // Banks 1 and 3 both hold $E100; the store is in bank 2.
+    let rom = assemble(concat!(
+        "  .inesprg 2\n  .inesmap 4\n  .bank 1\n  .org $E000\n  .ds 256\n  lda #$01\n  rts\n",
+        "  .bank 2\n  .org $C000\nReset:\n  lda #$00\n  sta <$10\n  lda #$E1\n  sta <$11\n",
+        "  jsr Run\nHalt:\n  jmp Halt\nRun:\n  jmp [$0010]\nNmi:\n  rti\n",
+        "  .bank 3\n  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    ));
+    let d = round_trip(&rom, &config(r#"{"banks": [{"bank": 1, "org": "$E000"}]}"#));
+    let jumps = issues(&d, IssueKind::IndirectJump);
+    assert_eq!(jumps.len(), 1);
+    assert!(!jumps[0].contains("followed"), "{jumps:?}");
+}
+
+#[test]
+fn routines_keeping_the_banks_can_be_annotated() {
+    // Yield switches bank 4 in at $8000 and back (Restore4 cannot be
+    // followed): after it, bank 0's code goes on only if Yield is annotated.
+    let banks = "  .bank 0\n  .org $8000\n  jsr Yield\n  lda #$33\n  rts\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Yield:\n  lda #$06\n  sta $8000\n  lda #$04\n  sta $8001\n  jmp [$0010]\n",
+    );
+    let rom = switching_rom(banks, reset);
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+    let d = round_trip(
+        &rom,
+        &config(r#"{"entry_points": [{"address": "$E00D", "keeps_banks": true}]}"#),
+    );
+    assert_lines(&d, &["sub_00_8000:", "\tjsr sub_E00D", "\tlda #$33"]);
+    let e = disasm::disassemble(
+        &rom,
+        None,
+        &config(r#"{"entry_points": [{"address": "$E00D", "keeps_banks": true, "switch_banks": ["$F5", null]}]}"#),
+        Path::new("out.asm"),
+        &NEVER,
+    )
+    .err()
+    .expect("switch_banks with keeps_banks should fail");
+    assert_eq!(
+        e[0].message,
+        "entry_points $E00D: give switch_banks or keeps_banks, not both"
+    );
+}

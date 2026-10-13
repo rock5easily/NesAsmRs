@@ -644,6 +644,7 @@ struct Routine {
     no_return: bool,
     inline_bytes: usize,
     switch_banks: Option<[Option<u16>; 2]>,
+    keeps_banks: bool,
 }
 
 /// A named address outside the ROM, emitted as `NAME = $xxxx`.
@@ -851,6 +852,12 @@ impl Analysis {
                         self.comment(loc, comment, CommentPosition::Above);
                     }
                     let mut switch_banks = None;
+                    if entry.switch_banks.is_some() && entry.keeps_banks {
+                        errors.push(format!(
+                            "entry_points {}: give switch_banks or keeps_banks, not both",
+                            entry.address
+                        ));
+                    }
                     if let Some(banks) = entry.switch_banks {
                         for address in banks.iter().flatten() {
                             if !(address.0 < 0x800 || (0x6000..0x8000).contains(&address.0)) {
@@ -868,6 +875,7 @@ impl Analysis {
                             no_return: entry.no_return,
                             inline_bytes: entry.inline_bytes,
                             switch_banks,
+                            keeps_banks: entry.keeps_banks,
                         },
                     );
                     self.queue(loc, None, State::default());
@@ -1377,9 +1385,9 @@ impl Analysis {
             if window_index(address).is_some() {
                 continue;
             }
-            self.followed_pointers.insert((store, vector));
             let target = self.target_of(store, address);
             if let Target::Rom(loc) = target {
+                self.followed_pointers.insert((store, vector));
                 self.queue(loc, Some(store), State::default());
                 self.want(loc, Want::Jump);
                 self.refs.push(Ref {
@@ -2019,7 +2027,8 @@ impl Analysis {
         self.calls.insert(loc, inline);
         match &summary {
             Some(s) if s.returns => state.apply(s),
-            _ => state.forget(),
+            Some(s) => state.forget_after(s),
+            None => state.forget(),
         }
         inline
     }
@@ -2791,6 +2800,10 @@ impl flow::Code for Analysis {
 
     fn switches(&self, loc: Loc) -> Option<[Option<u16>; 2]> {
         self.entries.get(&loc).and_then(|r| r.switch_banks)
+    }
+
+    fn keeps(&self, loc: Loc) -> bool {
+        self.entries.get(&loc).is_some_and(|r| r.keeps_banks)
     }
 
     fn window_of(&self, bank: usize) -> Option<usize> {

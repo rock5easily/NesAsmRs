@@ -139,7 +139,7 @@ From these values it also follows:
   `adjust: -1` for RTS jumps).
 
 Annotations take precedence: `references` over the banks a path knows,
-`entry_points` with `no_return`, `inline_bytes` or `switch_banks` over what a
+`entry_points` with `no_return`, `inline_bytes`, `switch_banks` or `keeps_banks` over what a
 routine is found to do, and regions over jump tables found after a JSR.
 Writes to $8000-$FFFF are mapper registers: their operands are numbers
 (`sta $8000`), and the `mapper_write` issue explains the MMC3 registers.
@@ -192,15 +192,20 @@ these two banks as one range, $C000-$FFFF:
   (multiples of $2000 up to $E000). By default the last two PRG banks are at
   $C000/$E000 and the others alternate $8000/$A000; a single bank is at $E000.
   CHR banks follow the PRG banks.
-- `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes", "switch_banks"}]`.
+- `entry_points`: `[{"address", "bank", "name", "comment", "no_return", "inline_bytes", "switch_banks", "keeps_banks"}]`.
   Code is traced from the interrupt vectors and these addresses. `no_return`:
   a JSR to the routine does not return. `inline_bytes`: bytes of inline
   arguments after each JSR to it, emitted as data (or as the regions that
   describe them). `switch_banks`: `["$F5", "$F6"]`, the RAM addresses holding
   the PRG banks the routine switches in at $8000 and $A000 (`null` for a
   window it leaves); a call to the routine, or code going on into it, then
-  switches those banks in and changes no other RAM the caller knows. The
-  addresses must be RAM ($0000-$07FF, $6000-$7FFF).
+  switches those banks in and changes no other RAM the caller knows. If the
+  value in the RAM is not known at the call, the bank there is not known,
+  and code calling it from that window is taken to keep its own bank (the
+  convention for calls above). The addresses must be RAM ($0000-$07FF, $6000-$7FFF). `keeps_banks: true`: the
+  routine returns with the banks it was called with (such as a thread yield,
+  during which other code switches banks); nothing else about it is assumed.
+  An entry point gives `switch_banks` or `keeps_banks`, not both.
 - `labels`: `[{"address", "bank", "name", "comment"}]`, names of ROM
   addresses. The comment is placed above the label.
 - `symbols`: `[{"name", "value", "size", "comment"}]`, names of RAM, I/O and
