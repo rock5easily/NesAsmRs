@@ -732,6 +732,7 @@ classDiagram
         disassemble(rom_file, base_file, config, source, cancel)
         is_unedited_source(text)
         compare_issues(before, after)
+        DisasmConfig::with_hypotheses()
         apply_operations(config, rom_file, operations)
         canonical_json(config)
         sha256_hex(data)

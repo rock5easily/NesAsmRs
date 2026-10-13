@@ -5,7 +5,7 @@
 use super::analysis::{Analysis, Fix, Loc, Memory};
 use super::config::{
     Address, BankLayout, CommentDef, CommentPosition, DisasmConfig, DisasmOptions, EntryPoint,
-    LabelDef, OperandDef, PatchDef, ReferenceDef, RegionDef, SymbolDef,
+    LabelDef, OperandDef, PatchDef, Provenance, ReferenceDef, RegionDef, SymbolDef,
 };
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
@@ -143,6 +143,10 @@ pub fn requires_evidence(operation: &Operation) -> bool {
         item.get(name)
             .is_some_and(|v| v != &json!(false) && v != &json!(0))
     };
+    // A hypothesis needs a reason too.
+    if item.get("status") == Some(&json!("hypothesis")) {
+        return true;
+    }
     match operation.kind {
         AnnotationKind::References => true,
         AnnotationKind::EntryPoints => {
@@ -199,7 +203,7 @@ impl std::fmt::Display for Key {
 }
 
 /// An entry of one of the annotation lists.
-trait Entry: Clone + Serialize + DeserializeOwned {
+trait Entry: Clone + Serialize + DeserializeOwned + Provenance {
     /// The bank and address in the ROM the entry names, if any.
     fn location(&mut self) -> Option<(&mut Option<usize>, Address)>;
     fn key(&self) -> Key;
@@ -367,6 +371,7 @@ fn upsert<T: Entry>(
     list: &mut Vec<T>,
     item: &Value,
     memory: Option<&Memory>,
+    evidence: Option<&str>,
 ) -> Result<Vec<Value>, String> {
     let fields = item.as_object().ok_or("item must be an object")?;
     if let Some((name, _)) = fields.iter().find(|(_, v)| v.is_null()) {
@@ -375,6 +380,12 @@ fn upsert<T: Entry>(
     let mut item: T = serde_json::from_value(item.clone()).map_err(|e| e.to_string())?;
     item.check()?;
     normalize(&mut item, memory)?;
+    // The operation's evidence is added to what the item gives.
+    if let Some(text) = evidence.map(str::trim).filter(|t| !t.is_empty())
+        && !item.evidence().iter().any(|e| e == text)
+    {
+        item.evidence_mut().push(text.to_owned());
+    }
     let key = item.key();
     // In the place of the first entry it replaces, as order can matter.
     let place = list.iter().position(|entry| key.names(&entry.key()));
@@ -553,6 +564,11 @@ pub fn apply_operations(
     rom_file: &[u8],
     operations: &[Operation],
 ) -> Result<(DisasmConfig, Vec<Applied>), Vec<String>> {
+    // The annotations as given: their indices are those of the file.
+    let errors = config.check_format();
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     let mut config = config.clone();
     let mut applied = Vec::new();
     let mut errors = Vec::new();
@@ -560,11 +576,15 @@ pub fn apply_operations(
     let mut apply = |config: &mut DisasmConfig, index: usize, memory: Option<&Memory>| {
         let operation = &operations[index];
         let kind = operation.kind;
+        let given = |text: &str| !text.trim().is_empty();
         let missing_evidence = requires_evidence(operation)
-            && operation
-                .evidence
-                .as_deref()
-                .is_none_or(|e| e.trim().is_empty());
+            && !operation.evidence.as_deref().is_some_and(given)
+            && !operation
+                .item
+                .as_ref()
+                .and_then(|item| item.get("evidence"))
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|e| e.as_str().is_some_and(given)));
         let result = match (operation.op, kind, &operation.item, &operation.key) {
             (OperationKind::Set, AnnotationKind::Options, Some(item), None) => {
                 set_options(&mut config.options, item)
@@ -578,7 +598,7 @@ pub fn apply_operations(
                 Err("this entry overrides what the analysis finds: give evidence".into())
             }
             (OperationKind::Upsert, _, Some(item), None) => {
-                with_list!(config, kind, list => upsert(list, item, memory))
+                with_list!(config, kind, list => upsert(list, item, memory, operation.evidence.as_deref()))
             }
             (OperationKind::Upsert, _, _, _) => {
                 Err("upsert takes item (the whole entry), not key".into())
@@ -603,6 +623,7 @@ pub fn apply_operations(
         apply(&mut config, index, None);
     }
     // Layout errors name banks entries by their index in canonical order.
+    // Entries take the banks of the layout that is applied.
     sort(&mut config.banks);
     let memory = match Memory::new(rom_file, &config) {
         Ok(memory) => memory,
@@ -627,6 +648,10 @@ pub fn apply_operations(
             duplicates(kind, list, &mut errors);
             sort(list);
         });
+    }
+    // Evidence added by the operations is within the limits too.
+    for error in config.check_format() {
+        errors.push(format!("In the changed annotations: {error}"));
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -657,6 +682,9 @@ pub fn canonical_json(config: &DisasmConfig) -> String {
         "  \"rom\": {}",
         text(config.rom.to_string_lossy().as_ref())
     )];
+    if config.needs_format_2() {
+        fields.push(format!("  \"format_version\": {}", super::FORMAT_VERSION));
+    }
     if let Some(address) = config.load_address {
         fields.push(format!("  \"load_address\": {}", text(&address)));
     }
@@ -708,7 +736,7 @@ pub(crate) fn suggestions(
         let mut fields = config
             .entry_points
             .iter()
-            .find(|e| memory.locate(e.bank, e.address).ok() == Some(routine))
+            .find(|e| config.applies(*e) && memory.locate(e.bank, e.address).ok() == Some(routine))
             .and_then(|e| to_value(e).as_object().cloned())
             .unwrap_or_default();
         fields.insert("bank".into(), json!(routine.bank));

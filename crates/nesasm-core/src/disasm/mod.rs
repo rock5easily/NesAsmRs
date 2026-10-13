@@ -15,7 +15,8 @@ mod render;
 
 pub use config::{
     Address, BankLayout, ChrMode, CommentDef, CommentPosition, DisasmConfig, DisasmOptions,
-    EntryPoint, LabelDef, OperandDef, PatchDef, ReferenceDef, RegionDef, RegionType, SymbolDef,
+    EntryPoint, FORMAT_VERSION, LabelDef, MAX_EVIDENCE, MAX_EVIDENCE_TEXT, OperandDef, PatchDef,
+    ReferenceDef, RegionDef, RegionType, Status, SymbolDef,
 };
 pub use edit::{
     AnnotationKind, Applied, EntryKey, Operation, OperationKind, Suggestion, apply_operations,
@@ -511,6 +512,12 @@ pub fn disassemble(
             ))]);
         }
     }
+    let errors_of_format = config.check_format();
+    if !errors_of_format.is_empty() {
+        return Err(errors(errors_of_format));
+    }
+    // Hypotheses are skipped where the annotations are applied, unless the
+    // caller asks for them (`DisasmConfig::with_hypotheses`).
     // A ROM hack includes its CHR ROM from the CHR file, which
     // CHR editors change; `.db` lines would be edited rarely.
     if config.base.is_some() && config.options.chr == ChrMode::Db {
@@ -522,7 +529,7 @@ pub fn disassemble(
     let patches = match (base_file, &config.base) {
         (Some(base), Some(_)) => Some(Patches::new(&analysis, base, config).map_err(errors)?),
         (None, None) => {
-            if !config.patches.is_empty() {
+            if config.patches.iter().any(|p| config.applies(p)) {
                 return Err(vec![error("patches applies only with base")]);
             }
             None
