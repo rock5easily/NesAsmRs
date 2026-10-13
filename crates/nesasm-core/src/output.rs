@@ -20,6 +20,8 @@ pub enum ArtifactKind {
     Source,
     /// CHR data included by a generated source.
     Chr,
+    /// An annotation file written by `annotate`.
+    Annotations,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -138,6 +140,102 @@ fn check_not_hidden(path: &Path, root: &Path) -> Result<(), String> {
         return Err("Output path must not contain hidden files or directories".into());
     }
     Ok(())
+}
+
+/// The name an annotation file written by [`write_annotations`] ends with.
+const ANNOTATIONS_SUFFIX: &str = ".disasm.json";
+/// The name of the log [`append_annotation_log`] writes beside it ends with.
+const ANNOTATION_LOG_SUFFIX: &str = ".disasm.log.jsonl";
+
+fn has_suffix(path: &Path, suffix: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.len() > suffix.len() && n.to_ascii_lowercase().ends_with(suffix))
+}
+
+/// The log of the annotation file `annotations`: `game.disasm.log.jsonl`
+/// beside `game.disasm.json`.
+pub fn annotation_log_path(annotations: &Path) -> Option<PathBuf> {
+    let name = annotations.file_name()?.to_str()?;
+    has_suffix(annotations, ANNOTATIONS_SUFFIX).then(|| {
+        let stem = &name[..name.len() - ANNOTATIONS_SUFFIX.len()];
+        annotations.with_file_name(format!("{stem}{ANNOTATION_LOG_SUFFIX}"))
+    })
+}
+
+/// Resolves a file to write within `root` whose name ends with `suffix`
+/// (also after following links), outside hidden directories.
+fn rooted_file(path: &Path, root: &Path, suffix: &str) -> Result<PathBuf, String> {
+    if !has_suffix(path, suffix) {
+        return Err(format!("The file name must end with {suffix}"));
+    }
+    let resolved = resolve_path(path, root, Some(root))?;
+    check_not_hidden(&resolved, root)?;
+    if !has_suffix(&resolved, suffix) {
+        return Err(format!("{} does not end with {suffix}", resolved.display()));
+    }
+    if resolved.is_dir() {
+        return Err(format!(
+            "Output path is a directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Writes the annotation file `path` (relative to `root`, ending in
+/// `.disasm.json`, outside hidden directories) as one change. With
+/// `expected`, the file must exist and its contents have that SHA-256
+/// digest, so changes made since it was read are not lost; without it, the
+/// file must not exist.
+pub fn write_annotations(
+    path: &Path,
+    root: &Path,
+    text: &str,
+    expected: Option<&str>,
+) -> Result<Artifact, String> {
+    let resolved = rooted_file(path, root, ANNOTATIONS_SUFFIX)?;
+    match (fs::read(&resolved), expected) {
+        (Ok(current), Some(expected)) => {
+            if !crate::disasm::sha256_hex(&current).eq_ignore_ascii_case(expected) {
+                return Err(format!(
+                    "{} changed since it was read (its SHA-256 is not expected_sha256); read it again",
+                    path.display()
+                ));
+            }
+        }
+        (Ok(_), None) => return Err(format!("{} exists", path.display())),
+        (Err(e), None) if e.kind() == io::ErrorKind::NotFound => {}
+        (Err(e), _) => return Err(format!("{}: {e}", path.display())),
+    }
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let staged = StagedArtifact::write(ArtifactKind::Annotations, resolved, text.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let (mut artifacts, _) = commit_all(vec![staged], &mut |from, to| fs::rename(from, to))?;
+    Ok(artifacts.remove(0))
+}
+
+/// Appends `line` to the log of the annotation file `annotations` (see
+/// [`annotation_log_path`]), creating it if needed, and returns its path.
+pub fn append_annotation_log(
+    annotations: &Path,
+    root: &Path,
+    line: &str,
+) -> Result<PathBuf, String> {
+    let log = annotation_log_path(annotations)
+        .ok_or_else(|| format!("The file name must end with {ANNOTATIONS_SUFFIX}"))?;
+    let resolved = rooted_file(&log, root, ANNOTATION_LOG_SUFFIX)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&resolved)
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    Ok(log)
 }
 
 /// What [`export_disassembly`] wrote and removed.

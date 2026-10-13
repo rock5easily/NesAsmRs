@@ -311,6 +311,32 @@ MCPの解析結果をLLMが読み、根拠付きの注釈を追加して再解�
 - 注釈の誤り（不正な名前、名前の重複、範囲の重なり、存在しないバンクなど）は
   `E_DISASM`（`DiagnosticCode::Disasm`）の診断としてまとめて返します。
 
+- 課題のうち注釈での解決の形を解析で決められるもの（`unresolved_bank`、`bank_switch`、
+  `return_address`、`jump_table`、表を介した `indirect_jump`）は、`suggestions` に `annotate` の操作の形で
+  修正案を持ちます。案は選択肢ごとに分かれ、解析で決められない値（表の長さなど）は null のまま
+  `needs` に挙げます。既存のエントリポイントの名前やコメントは修正案でも保ちます。
+
+MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`／`remove`／`set`）で変更します。
+処理は `nesasm_core::disasm::apply_operations`（操作の適用、各項目のバンクの補完、キーの重複の検出、
+正規の順序への並べ替え）と `canonical_json`（正規の書式）で行い、書き込みは
+`write_annotations`／`append_annotation_log`（`output.rs`）に限ります。
+- `upsert` は項目全体を受け取り、同じキーの項目を置き換えます（フィールド単位のマージはしません）。
+  キーは `entry_points`・`operands`・`references` が (bank, address)、`regions`・`patches` が (bank, start)、
+  `comments` が (bank, address, position)、`labels`・`symbols` が name、`banks` が bank です。
+  従来の注釈では同じ位置の項目が後勝ちで上書きされたり（`entry_points`・`operands`・`references`・
+  `banks`）、追加されたり（`comments`）しましたが、`annotate` は重複を誤りとし、`remove` で解消させます。
+- `banks`・`options` の操作を先に適用し、その配置で各項目のアドレスを保持するバンクを補完します。
+  バンクを1つに決められない項目の追加は誤りです。
+- 推定より優先される項目（`references`、`no_return`／`inline_bytes`／`switch_banks`／`keeps_banks`
+  付きの `entry_points`、`code` 領域、`code_targets` 付きの表）は `evidence` が必須です。
+  根拠は注釈の形式を変えずに、隣の `<名前>.disasm.log.jsonl` へ操作・更新前後のSHA-256・集計とともに
+  追記します。
+- 書き込むのは、全操作を適用でき、注釈が有効で、往復検証が一致し（`require_match`、既定true）、
+  ファイルのSHA-256が `expected_sha256` と一致する（読んだ後に変更されていない）場合だけです。
+  SHA-256は依存クレートを増やさないよう `disasm::sha256_hex` で計算します。
+  書き込みは一時ファイルからのrenameで、失敗時は何も変えません。`dry_run` と `inline` は書き込みません。
+- 応答は更新前後の要約、往復検証、解消・新規のissue（種類・bank・アドレスで照合）を返します。
+
 MCPの `disassemble` は書き込みを行わず、要約・課題（既定20件）・往復検証の結果と、要求に応じて
 アドレス範囲のソース行（バイト列付き、既定200行・最大2000行）、名前またはアドレスへの相互参照、
 ルーチン（呼び出し元の数、呼び出し先、読み書きするRAM）、RAMごとの読み書き回数を返します。

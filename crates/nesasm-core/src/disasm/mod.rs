@@ -8,6 +8,7 @@
 
 mod analysis;
 pub mod config;
+mod edit;
 mod flow;
 mod patch;
 mod render;
@@ -16,10 +17,14 @@ pub use config::{
     Address, BankLayout, ChrMode, CommentDef, CommentPosition, DisasmConfig, DisasmOptions,
     EntryPoint, LabelDef, OperandDef, PatchDef, ReferenceDef, RegionDef, RegionType, SymbolDef,
 };
+pub use edit::{
+    AnnotationKind, Applied, EntryKey, Operation, OperationKind, Suggestion, apply_operations,
+    canonical_json, requires_evidence, sha256_hex,
+};
 
 use crate::state::BANK_SIZE;
 use crate::{AssembleOptions, AssembleRequest, Diagnostic, DiagnosticCode, SourceLocation};
-use analysis::{Analysis, Class, Loc, Target};
+use analysis::{Analysis, Class, Fix, Loc, Target};
 use patch::Patches;
 use render::Rendered;
 pub(crate) use render::Role as SourceRole;
@@ -91,10 +96,19 @@ pub struct Issue {
     pub bank: Option<usize>,
     pub address: Address,
     pub message: String,
+    /// Alternative ways to settle the issue in the annotations, as
+    /// operations for `annotate`. They are proposals to confirm with
+    /// evidence, never applied by themselves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<Suggestion>,
     /// Offsets and lengths in the bank of the bytes concerned.
     #[serde(skip)]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub(crate) spans: Vec<(usize, usize)>,
+    /// What the suggestions are made from.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) fix: Option<Fix>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -369,6 +383,19 @@ pub fn disassemble(
             }),
             _ => true,
         });
+    }
+    let suggestions: Vec<Vec<Suggestion>> = analysis
+        .issues
+        .iter()
+        .map(|issue| {
+            issue
+                .fix
+                .as_ref()
+                .map_or_else(Vec::new, |fix| edit::suggestions(&analysis, config, fix))
+        })
+        .collect();
+    for (issue, suggestions) in analysis.issues.iter_mut().zip(suggestions) {
+        issue.suggestions = suggestions;
     }
     let rendered = render::render(
         &analysis,

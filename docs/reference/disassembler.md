@@ -2,25 +2,29 @@
 
 The MCP tools `disassemble` and `export_disassembly` turn a ROM into NESASM
 source that reassembles to the same bytes. An annotation file records what is
-known about the ROM; edit it and disassemble again until the source reads well.
+known about the ROM; change it with `annotate` and disassemble again until the
+source reads well.
 
 ## Workflow
 
 The server does not invoke an LLM. A person or an LLM client interprets the
 reports and source evidence, then supplies annotations for the next analysis.
-The MCP tools do not edit annotation files: edit them with a separate file
-editor, or pass the same config as `inline` instead of `annotations` and save
-it separately. Paths in the config, including `rom` and `base`, are relative
-to the server root, even when the annotation file is in a subdirectory.
+`annotate` applies them to the annotation file (see
+[Changing annotations](#changing-annotations)); the file can also be edited by
+hand, or the config passed as `inline` instead of `annotations`. Paths in the
+config, including `rom` and `base`, are relative to the server root, even when
+the annotation file is in a subdirectory.
 For a detailed Japanese guide, see [MCP and LLM workflow](../disassembly-workflow.md).
 
 1. Create an annotation file in the project root, for example
-   `game.disasm.json` containing `{"rom": "old/game.nes"}`.
+   `game.disasm.json` containing `{"rom": "old/game.nes"}` (or with
+   `annotate` and `create`).
 2. Call `disassemble` with `"annotations": "game.disasm.json"`. Read the
    summary, the issues and `verification`, and look at ranges with `view`,
    `xrefs`, `routines` and `ram`.
 3. Compare with the author's notes and specifications. Record names, data
-   ranges and comments in the annotation file; settle the issues.
+   ranges and comments with `annotate`, with the evidence for them; settle
+   the issues (their `suggestions` are operations for `annotate`).
 4. Repeat 2-3. Then call `export_disassembly`; it writes the source only if it
    reassembles to the same ROM. Check it with `check` (`options.raw` for
    `.bin` ROMs).
@@ -208,6 +212,74 @@ these two banks as one range, $C000-$FFFF:
   own, and an instruction across $DFFF/$E000 is an `overlap` issue whose
   bytes are data.
 
+## Changing annotations
+
+`annotate` changes an annotation file by operations, checks the result and
+writes it as one change:
+
+```json
+{
+  "annotations": "game.disasm.json",
+  "expected_sha256": "<sha256 of the file as read>",
+  "operations": [
+    {"op": "upsert", "kind": "references",
+     "item": {"bank": 30, "address": "$DEB1", "target_bank": 27},
+     "evidence": "A=$1B before the call; the switch routine restores the bank on every return"},
+    {"op": "remove", "kind": "labels", "key": {"name": "OldName"}},
+    {"op": "set", "kind": "options", "item": {"address_comments": true}}
+  ]
+}
+```
+
+- `upsert` adds `item`, a whole entry with the fields of the annotation file,
+  and replaces the entries with the same key. It does not merge fields: the
+  result reports the entries it replaced (`applied[].previous`) to change and
+  send again. Keys: `entry_points`, `operands`, `references`: bank and
+  address; `regions`, `patches`: bank and start; `comments`: bank, address
+  and position; `labels`, `symbols`: name; `banks`: bank. An item cannot
+  leave a field null (fill in what a suggestion `needs`), and regions and
+  patches give `end` or `length`.
+- `remove` removes every entry that `key` (`bank`, `address` or `start`,
+  `name`, `position`) names, and fails if none does. A comment key without
+  `position` names both positions.
+- `set` (kind `options`) changes the fields of `options` that `item` gives;
+  null returns a field to its default. `rom`, `base` and `load_address` are
+  not changed by operations: another ROM is another annotation file.
+- Operations apply in order, those on `banks` and `options` first, as the
+  bank of the other entries depends on them. An address without `bank` must
+  be held by one bank of the resulting layout. The result is checked as a
+  whole: duplicate keys (also ones the file already had), overlapping
+  regions and the other annotation errors fail, naming the operation where
+  they come from one.
+- `evidence` is required for entries that override what the analysis finds:
+  `references`, `entry_points` with `no_return`, `inline_bytes`,
+  `switch_banks` or `keeps_banks`, and `regions` of type `code` or with
+  `code_targets`.
+- The file is written only if the operations apply, the annotations are
+  valid, the source reassembles to the same ROM (`require_match`, default
+  true) and the file's SHA-256 is still `expected_sha256` (the `sha256` of
+  the previous `annotate`, or `sha256_before`, which every result for an
+  existing file gives). With `create` (`rom`, and `base` or `load_address`)
+  the file must not exist. `dry_run` writes nothing.
+- The file is written in canonical form: `rom`, `load_address`, `base`,
+  `options`, then the lists (`banks`, `entry_points`, `labels`, `symbols`,
+  `regions`, `comments`, `operands`, `references`, `patches`) with one entry
+  per line, ordered by bank and address (symbols by value), each naming its
+  bank, addresses as `"$C000"` and fields at their default values left out.
+  `reformatted` tells that a file was not in that form before.
+- Each write appends a line to `<name>.disasm.log.jsonl` beside the file: the
+  time, the operations with their evidence, the SHA-256 before and after, and
+  PRG totals (instructions, code, data and unknown bytes, issues) before and
+  after. The result gives the same `log_entry`, also for a dry run or
+  `inline` annotations (then nothing is written and the changed
+  `annotations` are returned).
+- The result also gives the summaries before and after, `verification`, and
+  the issues resolved and introduced, matched by kind, bank and address (an
+  issue whose message changed at the same place is neither).
+
+Only files named `*.disasm.json` inside the root and outside hidden
+directories are written (also after following links), with their log.
+
 ## Annotation file
 
 - `rom`: the ROM file relative to the root: `.nes` (iNES) or a raw `.bin`.
@@ -349,6 +421,18 @@ for a bank switched in where the layout does not place it), `outside_rom`
 `mapper_write` (a write to $8000-$FFFF, usually bank switching; MMC3 writes
 are explained), and `unknown_range` (bytes not described; padding runs are
 not reported). 65C02-only encodings are treated as data.
+
+Issues whose settlement the analysis can shape have `suggestions`, each one
+alternative: `description`, the `operations` to give `annotate` together,
+`needs` (fields left null that the analysis cannot determine, such as a
+table's `length`) and `evidence_required`. `unresolved_bank` suggests a
+`banks` entry, or a `references` entry per bank holding the address;
+`bank_switch` the routine's `switch_banks`; `return_address` its
+`inline_bytes` or `no_return`; `jump_table` a `pointers` region; and
+`indirect_jump` through tables a `pointers` region, or `low_bytes` and
+`high_bytes` regions. Entry points keep what the annotations give them (a
+name, a comment). Suggestions are proposals from the code paths that can be
+followed; confirm them before applying them.
 
 ## Limits
 

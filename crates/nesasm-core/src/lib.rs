@@ -11,8 +11,8 @@ mod state;
 
 pub use engine::{assemble, assemble_with_cancel};
 pub use output::{
-    Artifact, ArtifactKind, DisassemblyExport, export_disassembly, write_artifacts,
-    write_disassembly,
+    Artifact, ArtifactKind, DisassemblyExport, annotation_log_path, append_annotation_log,
+    export_disassembly, write_annotations, write_artifacts, write_disassembly,
 };
 pub use source::{relative_to_root, resolve_path};
 

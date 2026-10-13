@@ -156,6 +156,9 @@ cargo llvm-cov -p nesasm-core --locked --summary-only
   `.` で始まるファイル・ディレクトリを含むパスには書き込みません。
 - `export_disassembly` が書き込めるのは `.asm`（とバンクファイル）と同じ名前の `.chr` だけで、
   往復検証が一致した場合に限ります。既存ファイルは、生成後に編集されていない生成ファイルだけを上書きします。
+- `annotate` が書き込めるのは `*.disasm.json` の注釈ファイル（リンクの先も同じ名前の形式）と、
+  隣の `*.disasm.log.jsonl` への追記だけです。既存の注釈ファイルは、`expected_sha256` が現在の内容と
+  一致し、往復検証が一致した（`require_match: false` を除く）場合に限り上書きします。
 - stdoutはMCP通信専用です。ログなどを出力しないでください。
 - 1回のアセンブルには時間制限（既定30秒、`E_TIMEOUT`）があります。
 
