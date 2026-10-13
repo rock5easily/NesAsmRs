@@ -706,6 +706,8 @@ pub(crate) struct Analysis {
     /// writing instruction, the address and the banks switched in.
     stored_pointers: BTreeMap<u32, Vec<StoredPointer>>,
     followed_pointers: HashSet<(Loc, u32)>,
+    /// Stored pointers looked at (followed or not).
+    considered_pointers: HashSet<(Loc, u32)>,
     tables: Vec<JumpTable>,
     /// Issues of indirect JMPs, with their pointer.
     jump_issues: Vec<(usize, u32)>,
@@ -797,6 +799,7 @@ impl Analysis {
             data_pointers: HashSet::new(),
             stored_pointers: BTreeMap::new(),
             followed_pointers: HashSet::new(),
+            considered_pointers: HashSet::new(),
             tables: Vec::new(),
             jump_issues: Vec::new(),
             switch_hints: BTreeMap::new(),
@@ -1361,19 +1364,20 @@ impl Analysis {
             for &(store, address, windows) in
                 self.stored_pointers.get(&vector).into_iter().flatten()
             {
-                if !self.followed_pointers.contains(&(store, vector)) {
+                if !self.considered_pointers.contains(&(store, vector)) {
                     found.push((store, vector, address, windows));
                 }
             }
         }
         let any = !found.is_empty();
         for (store, vector, address, _) in found {
-            self.followed_pointers.insert((store, vector));
+            self.considered_pointers.insert((store, vector));
             // The jump comes later, elsewhere: the banks switched in at
             // $8000/$A000 then are not known.
             if window_index(address).is_some() {
                 continue;
             }
+            self.followed_pointers.insert((store, vector));
             let target = self.target_of(store, address);
             if let Target::Rom(loc) = target {
                 self.queue(loc, Some(store), State::default());

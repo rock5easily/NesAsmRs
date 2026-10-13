@@ -416,6 +416,7 @@ impl State {
             if value.is_some() {
                 self.windows[w] = value;
             }
+            self.switched[w] |= summary.switched[w];
         }
         if select.is_some() {
             self.select = select;
@@ -562,7 +563,10 @@ impl State {
             _ => None,
         };
         // A pointer through which the instruction writes, when known.
-        let pointer = self.pointer(insn).and_then(|p| self.word(p)).map(u32::from);
+        let pointer = self
+            .pointer(insn)
+            .and_then(|p| self.zp_word(p))
+            .map(u32::from);
         let address = match (insn.mode, index.and_then(Sym::constant)) {
             (Mode::Zp | Mode::Abs, _) => Some(base),
             (Mode::Zpx | Mode::Zpy, Some(i)) => Some((base + u32::from(i)) & 0xff),
@@ -632,11 +636,24 @@ impl State {
         }
     }
 
-    /// Whether the pointer an indirect instruction uses holds the return
-    /// address (both bytes pulled from below the routine's pushes).
+    /// The known value of the zero page pointer at `address` (its high byte
+    /// wraps to $00).
+    fn zp_word(&self, address: u32) -> Option<u16> {
+        let low = self.read(address).constant()?;
+        let high = self.read((address + 1) & 0xff).constant()?;
+        Some(u16::from_le_bytes([low, high]))
+    }
+
+    /// Whether an indirect instruction reads the bytes after the JSR: `[ptr],y`
+    /// through a pointer holding the return address as pulled (unchanged),
+    /// with Y not known or reaching the first word after it.
     fn pointer_is_return(&self, insn: Insn) -> bool {
-        self.pointer(insn)
-            .is_some_and(|p| self.read(p).is_return() && self.read((p + 1) & 0xff).is_return())
+        insn.mode == Mode::Ziy
+            && self.y.constant().is_none_or(|y| y == 1 || y == 2)
+            && self.pointer(insn).is_some_and(|p| {
+                self.read(p) == Sym::Input(Input::Return(0), 0)
+                    && self.read((p + 1) & 0xff) == Sym::Input(Input::Return(1), 0)
+            })
     }
 
     /// An MMC3 write to $8000-$9FFF (at `address` if it is known): bank
@@ -746,6 +763,9 @@ pub(crate) struct Summary {
     /// Some path jumps through a pointer after taking its return address:
     /// a jump table follows each JSR.
     pub dispatch: bool,
+    /// The routine (or one it calls) writes the bank of a window to the
+    /// mapper on some path.
+    switched: [bool; 2],
     /// The banks after a call are not known, but every path that can be
     /// followed switches in the banks held in these RAM addresses ($8000,
     /// $A000): the annotation `switch_banks` would say so.
@@ -864,6 +884,7 @@ impl Summaries {
             })
         };
         let mut steps = 0;
+        let mut switched = [false; 2];
         let mut exits: Vec<State> = Vec::new();
         let mut unknown_exit = false;
         let mut summary = Summary::default();
@@ -886,6 +907,9 @@ impl Summaries {
                     state = met;
                 }
                 seen.insert(loc, state.clone());
+                for (any, w) in switched.iter_mut().zip(state.switched) {
+                    *any |= w;
+                }
                 // Code that switched another bank (or an unknown one) into
                 // the window it runs in goes on elsewhere.
                 if let Some(w) = code.window_of(loc.bank) {
@@ -997,6 +1021,7 @@ impl Summaries {
             }
         }
         summary.returns = unknown_exit || !exits.is_empty();
+        summary.switched = switched;
         summary.returns_known = !exits.is_empty();
         if unknown_exit && !hopeful {
             let unknown = Summary::unknown();

@@ -79,9 +79,12 @@ nothing is inferred from it:
 - The PRG banks at $8000 and $A000. In a switched bank ($8000/$A000 window of
   the layout), code runs with its own bank switched in; code that writes
   another bank, or one that is not known, into its own window is not
-  followed further. A call that leaves the bank of the caller's window
-  unknown is taken to keep it (code does not switch its own bank out
-  through a call unless the new bank is known). On mapper 4
+  followed further, nor is code after a call to a routine that writes the
+  bank of that window to the mapper itself (or through the routines it
+  calls) unless the bank it leaves is known. A call whose effects are not
+  known, and a write through a pointer that is not known, are taken to
+  leave the bank the code runs in (a convention: code does not switch its
+  own bank out that way). On mapper 4
   (MMC3), writes of known values to the bank select ($8000) and bank data
   ($8001) registers switch R6 ($8000) and R7 ($A000) in PRG mode 0; a bank
   select for PRG mode 1 or of an unknown value, and any other write to the

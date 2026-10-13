@@ -2966,6 +2966,10 @@ fn stored_pointers_into_switched_banks_are_not_followed() {
     );
     let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
     assert!(d.text().contains("\t.db $A9, $00, $60"), "{}", d.text());
+    // Nor reported as followed.
+    let jumps = issues(&d, IssueKind::IndirectJump);
+    assert_eq!(jumps.len(), 1);
+    assert!(!jumps[0].contains("followed"), "{jumps:?}");
 }
 
 #[test]
@@ -2978,5 +2982,52 @@ fn pushed_addresses_need_a_routine_that_returns() {
         "  .org $E110\n  lda #$07\n  rts\n",
     );
     let d = round_trip(&nrom(code), &DisasmConfig::default());
+    assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
+}
+
+#[test]
+fn calls_to_routines_that_switch_the_callers_bank_end_the_trace() {
+    // Sel2 writes R6 = 2 itself, then jumps where it cannot be followed:
+    // the code after the JSR in bank 0 may run in another bank.
+    let banks = "  .bank 0\n  .org $8000\n  jsr Sel2\n  .db $A9, $33, $60\n";
+    let reset = concat!(
+        "  lda #$00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n  jmp Halt\n",
+        "Sel2:\n  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n  jmp [$0010]\n",
+    );
+    let d = round_trip(&switching_rom(banks, reset), &DisasmConfig::default());
+    assert_lines(
+        &d,
+        &["sub_00_8000:", "\tjsr sub_E00D", "\t.db $A9, $33, $60"],
+    );
+}
+
+#[test]
+fn zero_page_pointers_wrap_around_ff() {
+    // The pointer at $FF has its high byte at $00: [$FF],y writes $8001.
+    let reset = concat!(
+        "  lda #$06\n  sta $8000\n  lda #$02\n  sta $8001\n",
+        "  lda #$01\n  sta <$FF\n  lda #$80\n  sta <$00\n  lda #$00\n  sta $0100\n",
+        "  ldy #$00\n  lda #$04\n  sta [$FF],y\n  jsr $8000\n",
+    );
+    let d = round_trip(
+        &switching_rom(SWITCHED_BANKS, reset),
+        &DisasmConfig::default(),
+    );
+    assert_lines(&d, &["sub_04_8000:", "\tjsr sub_04_8000"]);
+}
+
+#[test]
+fn jump_tables_after_a_jsr_need_the_return_address_unchanged() {
+    // Skip moves the return address past two bytes of arguments before
+    // reading the table: the table does not start right after the JSR.
+    let rom = nrom(concat!(
+        "Reset:\n  jsr Skip\n  .db $10, $E1\n  .dw Handler\nHandler:\n  jmp Handler\n",
+        "Skip:\n  pla\n  sta <$C1\n  pla\n  sta <$C2\n  inc <$C1\n  inc <$C1\n",
+        "  ldy #$01\n  lda [$C1],y\n  sta <$10\n  iny\n  lda [$C1],y\n  sta <$11\n  jmp [$0010]\n",
+        "Nmi:\n  rti\n  .org $E110\n  lda #$07\n  rts\n",
+    ));
+    let d = round_trip(&rom, &DisasmConfig::default());
+    assert!(issues(&d, IssueKind::JumpTable).is_empty());
+    assert_eq!(issues(&d, IssueKind::ReturnAddress).len(), 1);
     assert!(!d.text().contains("\tlda #$07"), "{}", d.text());
 }
