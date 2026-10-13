@@ -309,7 +309,9 @@ MCPの解析結果をLLMが読み、根拠付きの注釈を追加して再解�
   バイト数、ベース側が同じ値の連続（空き領域）だったか、ラベル、ルーチン、範囲外からの参照
   （フックしたJSR・JMPなど）、先頭のバイト列を返し、AIがソースにする範囲を判断する材料にします。
 - 注釈の誤り（不正な名前、名前の重複、範囲の重なり、存在しないバンクなど）は
-  `E_DISASM`（`DiagnosticCode::Disasm`）の診断としてまとめて返します。
+  `E_DISASM`（`DiagnosticCode::Disasm`）の診断としてまとめて返します。メッセージは項目を
+  ファイル中の一覧と位置で示し（`labels[3] $C00B (Wait): ...`、`regions[0] and regions[1]: ...`、
+  `banks[2]: ...`）、項目の多い注釈でも該当箇所を探せるようにします。
 
 - 課題のうち注釈での解決の形を解析で決められるもの（`unresolved_bank`、`bank_switch`、
   `return_address`、`jump_table`、表を介した `indirect_jump`）は、`suggestions` に `annotate` の操作の形で
@@ -348,6 +350,13 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
 引き継ぐ範囲は変化として、共有する変化前の範囲すべての `id` を `previous_ids` に入れます（分割・結合）。
 ROM Hackでは差分範囲で絞る前のROM全体の解析で付けます。`disasm::compare_issues` が2つの解析の課題を
 `id` で照合し、MCPの `annotate` と `disassemble` の `baseline`（以前の注釈との比較）が使います。
+
+MCPの `disassemble`／`export_disassembly` は、読み込んだROM・ベースROM・注釈ファイル（`inline` では
+`annotate` が書く正規の書式のテキスト）のSHA-256とサーバーの版を `inputs` で返します。
+`baseline` のROMの不一致もパスではなくこのハッシュで判断します。
+解析結果のキャッシュは設けていません。512 KiBのMMC3 ROM（追跡した命令74,561、ルーチン7,442）で
+releaseビルドの `disassemble` が約0.9秒、`annotate`（2回の解析と往復検証）が約1.4秒で、
+時間制限（既定30秒）に対して十分に短いためです。
 
 MCPの `disassemble` は書き込みを行わず、要約・課題（既定20件）・往復検証の結果と、要求に応じて
 アドレス範囲のソース行（バイト列付き、既定200行・最大2000行）、名前またはアドレスへの相互参照、

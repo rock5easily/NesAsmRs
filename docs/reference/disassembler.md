@@ -348,6 +348,11 @@ Names use letters, digits and `_`, do not start with a digit and are at most
 64 characters. `A`, `X`, `Y`, expression function names and assembler symbols
 are reserved.
 
+Errors in the annotations name the entry by its list and index in the file,
+then its address (and name): `labels[3] $C00B (Wait): Bank 0 ($8000-$9FFF)
+does not hold $C00B`, `regions[0] and regions[1]: Regions at $E000 and $E002
+in bank 1 overlap`, `banks[2]: Bank 9 is not a PRG bank of the ROM`.
+
 ## Generated source
 
 - Automatic labels: `sub_C123` (JSR targets), `L_C123` (jumps and branches),
@@ -477,8 +482,13 @@ it reads and writes; a routine is followed for up to 16384 instructions and
 marked `truncated` beyond. `ram` lists addresses outside the ROM with read
 and write counts and every routine that accesses them.
 
+`disassemble` and `export_disassembly` report their `inputs`: the SHA-256 of
+the ROM, of the base ROM and of the annotation file (for inline annotations,
+of their canonical text, as `annotate` would write them), and the server
+version, to record with the results.
+
 `baseline` (`annotations` or `inline`, with `offset` and `limit`) analyses
 other annotations of the ROM, such as a copy of an earlier version, and
-returns their `summary` and the issues resolved, introduced and changed
-since, matched by `id`. A baseline that cannot be analysed fails the request;
-one that names another ROM is a warning.
+returns their `inputs`, `summary` and the issues resolved, introduced and
+changed since, matched by `id`. A baseline that cannot be analysed fails the
+request; one whose ROM or base ROM has other contents is a warning.

@@ -1048,3 +1048,74 @@ fn disassemble_compares_with_baseline_annotations() {
     assert!(message.starts_with("Baseline: "), "{r}");
     assert!(r["structuredContent"].get("baseline").is_none(), "{r}");
 }
+
+#[test]
+fn disassembly_reports_name_their_inputs() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let annotations = r#"{"rom": "old/loose.nes"}"#;
+    c.write("loose.disasm.json", annotations);
+    let rom = std::fs::read(c.root.join("old/loose.nes")).unwrap();
+    let rom_sha = nesasm_core::disasm::sha256_hex(&rom);
+    let r = c.call("disassemble", json!({"annotations":"loose.disasm.json"}));
+    assert_eq!(r["isError"], false, "{r}");
+    let inputs = &r["structuredContent"]["inputs"];
+    assert_eq!(inputs["rom_sha256"], rom_sha.as_str());
+    assert_eq!(
+        inputs["annotations_sha256"],
+        nesasm_core::disasm::sha256_hex(annotations.as_bytes()).as_str()
+    );
+    assert_eq!(inputs["server_version"], env!("CARGO_PKG_VERSION"));
+    assert!(inputs.get("base_sha256").is_none(), "{r}");
+    let line = format!(
+        "Inputs: ROM sha256 {rom_sha}, annotations sha256 {}, nesasm-mcp {}",
+        nesasm_core::disasm::sha256_hex(annotations.as_bytes()),
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(
+        Client::text(&r).lines().any(|l| l == line),
+        "{}",
+        Client::text(&r)
+    );
+    // Inline annotations: the digest of their canonical text.
+    let inline: nesasm_core::disasm::DisasmConfig =
+        serde_json::from_str(r#"{"rom": "old/loose.nes", "options": {"uppercase": true}}"#)
+            .unwrap();
+    let r = c.call(
+        "export_disassembly",
+        json!({"inline":{"rom":"old/loose.nes","options":{"uppercase":true}},"output":"out/loose.asm"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        r["structuredContent"]["inputs"]["annotations_sha256"],
+        nesasm_core::disasm::sha256_hex(nesasm_core::disasm::canonical_json(&inline).as_bytes())
+            .as_str()
+    );
+    // A baseline for another ROM is compared with a warning.
+    let mut other = rom.clone();
+    let last = other.len() - 7;
+    other[last] ^= 0xFF;
+    c.write("old/other.nes", &other);
+    let r = c.call(
+        "disassemble",
+        json!({"annotations":"loose.disasm.json","baseline":{"inline":{"rom":"old/other.nes"}}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["diagnostics"][0]["severity"], "warning");
+    assert!(
+        Client::messages(&r).contains("another ROM or base ROM"),
+        "{r}"
+    );
+    assert_eq!(
+        report["baseline"]["inputs"]["rom_sha256"],
+        nesasm_core::disasm::sha256_hex(&other).as_str()
+    );
+    // The same ROM under another name is no warning.
+    c.write("old/copy.nes", &rom);
+    let r = c.call(
+        "disassemble",
+        json!({"annotations":"loose.disasm.json","baseline":{"inline":{"rom":"old/copy.nes"}}}),
+    );
+    assert_eq!(r["structuredContent"]["diagnostics"], json!([]), "{r}");
+}
