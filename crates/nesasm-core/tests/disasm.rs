@@ -424,27 +424,45 @@ fn fragments_are_placed_at_their_load_address() {
 #[test]
 fn chr_banks_are_included_or_written_as_data() {
     let mut rom = nrom("Reset:\nNmi:\n  rti");
-    let chr: Vec<u8> = (0..8192u32).map(|i| (i / 3) as u8).collect();
-    rom[5] = 1;
+    let chr: Vec<u8> = (0..16384u32).map(|i| (i / 3) as u8).collect();
+    rom[5] = 2;
     rom.extend(&chr);
-    let d = round_trip(&rom, &DisasmConfig::default());
-    assert_lines(
-        &d,
-        &[
-            "\t.ineschr 1",
-            "\t.bank 2",
-            "\t.incbin \"out.chr\", 0, 8192",
-        ],
-    );
-    let (path, data) = d.chr_file().unwrap();
-    assert_eq!((path, data), (Path::new("out.chr"), chr.as_slice()));
+    // The whole CHR ROM is included once at the end of the main file, also
+    // when the source is split.
+    for json in [r#"{}"#, r#"{"options": {"split_banks": true}}"#] {
+        let d = round_trip(&rom, &config(json));
+        assert!(
+            d.text()
+                .ends_with("\n\n\t.bank 2\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+            "{}",
+            d.text()
+        );
+        assert!(!d.text().contains("\t.bank 3"), "{}", d.text());
+        assert!(
+            d.files()[1..]
+                .iter()
+                .all(|(_, text)| !text.contains("incbin")),
+            "{:?}",
+            d.files()
+        );
+        let (path, data) = d.chr_file().unwrap();
+        assert_eq!((path, data), (Path::new("out.chr"), chr.as_slice()));
+    }
+    // As data, each CHR bank is a bank of its own.
     let d = round_trip(
         &rom,
         &config(r#"{"options": {"chr": "db", "data_per_line": 4}}"#),
     );
     assert_lines(
         &d,
-        &["\t.bank 2", "\t.org $0000", "\t.db $00, $00, $00, $01"],
+        &[
+            "\t.bank 2",
+            "\t.org $0000",
+            "\t.db $00, $00, $00, $01",
+            "\t.bank 3",
+            "\t.org $0000",
+            "\t.db $AA, $AB, $AB, $AB",
+        ],
     );
     assert!(d.chr_file().is_none());
 }

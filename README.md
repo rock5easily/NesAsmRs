@@ -52,7 +52,7 @@ MCPクライアントの設定例（実行ファイルとプロジェクトの�
   差分だけを逆アセンブルして上書きするソースを生成します。
 - `export_disassembly`: 元のROMと一致することを確かめたうえで、生成したソース（`.asm`、
   大きなROMではバンクごとの `<stem>_bankXX.asm`（XXは大文字2桁の16進数）、CHR ROMの `.chr`）を
-  書き込みます。命令とディレクティブはタブ1個で字下げします。ROM HackではCHR全体を `.chr` に抽出し、
+  書き込みます。命令とディレクティブはタブ1個で字下げします。CHR全体は（ROM Hackでも）`.chr` に抽出し、
   メインファイルの末尾で1回読み込みます。mapper 4では注釈の `options.mapper4_fixed_prg_16k` で最終2個のPRGバンクを
   $C000-$FFFF の連続した範囲として解析し、`<stem>_bankXX_YY.asm` にまとめて出力できます。
 - `annotate`: 逆アセンブルの注釈ファイル（`*.disasm.json`）を、項目の追加・置換（`upsert`）、

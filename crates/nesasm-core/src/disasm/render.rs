@@ -206,10 +206,10 @@ pub(crate) fn render(
     let mut body = std::mem::take(&mut w.lines);
     let chr_path = super::chr_path(source);
     let chr = w.chr_banks(&quoted_path(&chr_path));
-    // A ROM hack includes its CHR ROM at the end of the main file; there
-    // are no bank files of CHR banks.
+    // An included CHR ROM is at the end of the main file; there are no bank
+    // files of CHR banks unless they are written as data.
     let mut chr_lines = std::mem::take(&mut w.lines);
-    if patches.is_none() {
+    if chr.is_none() {
         body.append(&mut chr_lines);
     }
     w.include_base();
@@ -969,11 +969,11 @@ impl Writer<'_> {
             .map(|b| b.index)
             .collect();
         let first = *banks.first()?;
-        let mut file = Vec::new();
-        if self.patches.is_some() {
-            // A ROM hack includes its whole CHR ROM, changed or not, from one
-            // file in the original order (CHR editors read it whole), after
-            // the base ROM's PRG banks.
+        if self.a.options.chr == ChrMode::Incbin {
+            // The whole CHR ROM (of a ROM hack too, changed or not) is
+            // included once from one file in the original order (CHR editors
+            // read it whole), at the end of the main file.
+            let mut file = Vec::new();
             for &index in &banks {
                 let bank = &self.a.memory.banks[index];
                 file.extend_from_slice(&bank.data[bank.start..bank.end]);
@@ -985,64 +985,53 @@ impl Writer<'_> {
             self.push(first, Some(0), file.len(), text);
             return Some(file);
         }
+        // Written as data, each CHR bank is a bank of its own.
+        let a = self.a;
         for index in banks {
-            let bank = &self.a.memory.banks[index];
-            let data = bank.data[bank.start..bank.end].to_vec();
+            let bank = &a.memory.banks[index];
+            let data = &bank.data[bank.start..bank.end];
             self.push(index, None, 0, String::new());
             self.push(index, None, 0, format!("{INDENT}.bank {index}"));
-            match self.a.options.chr {
-                ChrMode::Incbin => {
-                    let text = format!(
-                        "{INDENT}.incbin \"{chr_name}\", {}, {}",
-                        file.len(),
-                        data.len()
-                    );
-                    self.push(index, Some(0), data.len(), text);
+            self.push(index, None, 0, format!("{INDENT}.org $0000"));
+            let mut offset = 0;
+            while offset < data.len() {
+                let run = data[offset..]
+                    .iter()
+                    .take_while(|b| **b == data[offset])
+                    .count();
+                if run >= FILL_RUN {
+                    let text = match data[offset] {
+                        0 => format!("{INDENT}.ds {run}"),
+                        fill => format!("{INDENT}.ds {run}, {}", hex2(u32::from(fill))),
+                    };
+                    self.push(index, Some(offset as u32), run, text);
+                    offset += run;
+                    continue;
                 }
-                ChrMode::Db => {
-                    self.push(index, None, 0, format!("{INDENT}.org $0000"));
-                    let mut offset = 0;
-                    while offset < data.len() {
-                        let run = data[offset..]
+                let count = a.options.data_per_line.min(data.len() - offset);
+                let count = (1..count)
+                    .find(|i| {
+                        data[offset + i..]
                             .iter()
-                            .take_while(|b| **b == data[offset])
-                            .count();
-                        if run >= FILL_RUN {
-                            let text = match data[offset] {
-                                0 => format!("{INDENT}.ds {run}"),
-                                fill => format!("{INDENT}.ds {run}, {}", hex2(u32::from(fill))),
-                            };
-                            self.push(index, Some(offset as u32), run, text);
-                            offset += run;
-                            continue;
-                        }
-                        let count = self.a.options.data_per_line.min(data.len() - offset);
-                        let count = (1..count)
-                            .find(|i| {
-                                data[offset + i..]
-                                    .iter()
-                                    .take_while(|b| **b == data[offset + i])
-                                    .count()
-                                    >= FILL_RUN
-                            })
-                            .unwrap_or(count);
-                        let items: Vec<String> = data[offset..offset + count]
-                            .iter()
-                            .map(|b| hex2(u32::from(*b)))
-                            .collect();
-                        self.push(
-                            index,
-                            Some(offset as u32),
-                            count,
-                            format!("{INDENT}.db {}", items.join(", ")),
-                        );
-                        offset += count;
-                    }
-                }
+                            .take_while(|b| **b == data[offset + i])
+                            .count()
+                            >= FILL_RUN
+                    })
+                    .unwrap_or(count);
+                let items: Vec<String> = data[offset..offset + count]
+                    .iter()
+                    .map(|b| hex2(u32::from(*b)))
+                    .collect();
+                self.push(
+                    index,
+                    Some(offset as u32),
+                    count,
+                    format!("{INDENT}.db {}", items.join(", ")),
+                );
+                offset += count;
             }
-            file.extend(data);
         }
-        (self.a.options.chr == ChrMode::Incbin && !file.is_empty()).then_some(file)
+        None
     }
 }
 
