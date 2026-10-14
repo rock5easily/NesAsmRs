@@ -115,6 +115,33 @@ fn line_map_details() {
 }
 
 #[test]
+fn line_map_banks_of_a_large_incbin() {
+    let mut c = Client::start();
+    c.write("chr.bin", [0x41; 2 * 8192]);
+    let source = concat!(
+        "  .inesprg 1\n  .ineschr 2\n",
+        "  .bank 2\n  .org $0000\n  .incbin \"chr.bin\"\n",
+    );
+    let lines = |c: &mut Client, bank: u8| {
+        let r = c.call(
+            "check",
+            json!({"input":"main.asm","sources":{"main.asm":source},"lines":{"bank":bank}}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        r["structuredContent"]["lines"]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["line"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    // The INCBIN that continues into bank 3 is in both banks.
+    assert_eq!(lines(&mut c, 2), [4, 5]);
+    assert_eq!(lines(&mut c, 3), [5]);
+    assert!(lines(&mut c, 4).is_empty());
+}
+
+#[test]
 fn long_paths_within_the_root() {
     // Existing files whose canonical paths are long, in a directory whose
     // path is not: on Windows, only the files' paths keep the `\\?\` prefix.

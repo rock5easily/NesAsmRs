@@ -182,6 +182,28 @@ pub struct LineRecord {
     pub text: String,
 }
 
+impl LineRecord {
+    /// Offsets of the bytes the line produced in the ROM payload (bank 0 at
+    /// 0); `None` in the ZP and BSS sections. A line that continues past the
+    /// end of its bank (a large INCBIN) reaches into the next banks.
+    pub fn rom_range(&self) -> Option<std::ops::Range<usize>> {
+        let bank_size = state::BANK_SIZE;
+        let start = usize::from(self.bank?) * bank_size + self.address as usize % bank_size;
+        Some(start..start + self.size)
+    }
+
+    /// Whether the line is placed in `bank`: the bank it starts in, or a
+    /// later bank its bytes reach.
+    pub fn in_bank(&self, bank: u8) -> bool {
+        let Some(range) = self.rom_range() else {
+            return false;
+        };
+        let first = range.start / state::BANK_SIZE;
+        let last = range.end.saturating_sub(1).max(range.start) / state::BANK_SIZE;
+        (first..=last).contains(&usize::from(bank))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SourceLocation {

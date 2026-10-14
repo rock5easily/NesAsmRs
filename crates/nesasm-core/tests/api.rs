@@ -453,6 +453,40 @@ fn rom_warnings() {
 }
 
 #[test]
+fn an_incbin_into_many_chr_banks() {
+    let t = Temp::new();
+    // From $0000 in bank 2, the addresses of the twelfth CHR bank (13) are
+    // $E000-$FFFF.
+    t.write("chr.bin", [0x41; 12 * 8192]);
+    let mut request = t.request(Default::default());
+    request.collect_lines = true;
+    t.write(
+        "test.asm",
+        concat!(
+            "  .inesprg 1\n  .ineschr 12\n",
+            "  .bank 1\n  .org $FFFA\n  .dw $E000, $E000, $E000\n",
+            "  .bank 2\n  .org $0000\n  .incbin \"chr.bin\"\n",
+        ),
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    // The line is in each bank its bytes reach.
+    let line = r.lines.iter().find(|l| l.text.contains("incbin")).unwrap();
+    assert_eq!(line.rom_range(), Some(2 * 8192..14 * 8192));
+    let banks: Vec<u8> = (0..16).filter(|b| line.in_bank(*b)).collect();
+    assert_eq!(banks, (2..14).collect::<Vec<u8>>());
+    // CHR banks hold no interrupt vectors.
+    let rom = Rom::from_assembly(&r);
+    let banks: Vec<usize> = rom.vectors().iter().map(|v| v.bank).collect();
+    assert_eq!(banks, [1]);
+    let warnings = rom.warnings();
+    assert!(
+        !warnings.iter().any(|w| w.contains("vector")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn disassembly_names_branches_and_symbols_in_other_banks() {
     let t = Temp::new();
     let r = t.run(concat!(

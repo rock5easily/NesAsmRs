@@ -1016,20 +1016,19 @@ impl Disassembly {
             .unwrap_or_else(|_| working_directory.to_owned());
         let mut mismatches = Vec::new();
         let mut count = 0;
+        // `index` is the offset in the payload of a mismatch in a bank.
         let mut differ =
-            |bank: Option<usize>, address: u32, expected: Option<u8>, actual: Option<u8>| {
+            |index: Option<usize>, address: u32, expected: Option<u8>, actual: Option<u8>| {
                 count += 1;
                 if mismatches.len() < MAX_MISMATCHES {
                     let show = |b: Option<u8>| b.map_or("none".into(), |b| format!("{b:02X}"));
-                    let line = bank.and_then(|bank| {
+                    // A line that continues into the next banks covers
+                    // them too.
+                    let line = index.and_then(|index| {
                         result
                             .lines
                             .iter()
-                            .find(|l| {
-                                l.bank.map(usize::from) == Some(bank)
-                                    && l.address <= address
-                                    && address < l.address + l.size as u32
-                            })
+                            .find(|l| l.rom_range().is_some_and(|r| r.contains(&index)))
                             .map(|l| {
                                 let file = crate::relative_to_root(&l.location.file, &base)
                                     .unwrap_or_else(|| l.location.file.clone());
@@ -1037,7 +1036,7 @@ impl Disassembly {
                             })
                     });
                     mismatches.push(Mismatch {
-                        bank,
+                        bank: index.map(|i| i / BANK_SIZE),
                         address: Address(address),
                         expected: show(expected),
                         actual: show(actual),
@@ -1086,7 +1085,7 @@ impl Disassembly {
                 _ => *e,
             };
             if e != a {
-                differ(Some(bank), address, e, a);
+                differ(Some(index), address, e, a);
             }
         }
         Verification {
