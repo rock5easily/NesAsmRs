@@ -173,7 +173,9 @@ pub struct LineRecord {
     pub called_from: Option<SourceLocation>,
     /// ROM bank; `None` in the ZP and BSS sections.
     pub bank: Option<u8>,
-    /// CPU address before the line.
+    /// CPU address of the line's first byte, or of the position before the
+    /// line if it produced none. A line that starts at the end of a full
+    /// bank has its bytes, and its `bank`, in the next bank.
     pub address: u32,
     /// Bytes produced (the first 64 for larger INCBIN, INCCHR and DS data).
     pub bytes: Vec<u8>,

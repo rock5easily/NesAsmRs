@@ -107,6 +107,8 @@ struct Engine<'a> {
     /// Bytes each executed line advanced in the layout pass, replayed on emit errors.
     line_sizes: Vec<Option<usize>>,
     line_index: usize,
+    /// Where the current line wrote its first byte (after any bank change).
+    first_byte: Option<Position>,
     function_calls: Cell<usize>,
     max_bss: usize,
     max_zp: usize,
@@ -220,6 +222,7 @@ impl<'a> Engine<'a> {
             bank_names: BTreeMap::new(),
             line_sizes: Vec::new(),
             line_index: 0,
+            first_byte: None,
             function_calls: Cell::new(0),
             max_bss: BSS_START + 1,
             max_zp: 1,
@@ -594,6 +597,7 @@ impl<'a> Engine<'a> {
         let start = self.position;
         let section = self.section;
         let rs_before = self.rs;
+        self.first_byte = None;
         let data = self.execute(statement, directive, line);
         // Keep later addresses stable when an emit-pass line fails: advance by the
         // size the layout pass recorded for it instead of emitting nothing.
@@ -648,11 +652,11 @@ impl<'a> Engine<'a> {
     /// Adds `line` to the line map of the result.
     fn record_line(&mut self, line: &Line, start: Position, section: Section, bytes: &[u8]) {
         const SHOWN_BYTES: usize = 64;
-        // At the end of a full bank, the bytes start in the next bank.
-        let bank = if !bytes.is_empty() && start.offset >= BANK_SIZE {
-            start.bank + 1
-        } else {
-            start.bank
+        // A line that starts at the end of a full bank writes its bytes in the
+        // next bank, at the page the emitter moved to.
+        let at = match self.first_byte {
+            Some(first) if !bytes.is_empty() => first,
+            _ => start,
         };
         self.result.lines.push(LineRecord {
             location: line.location(),
@@ -660,9 +664,9 @@ impl<'a> Engine<'a> {
             bank: if section.is_ram() {
                 None
             } else {
-                u8::try_from(bank).ok()
+                u8::try_from(at.bank).ok()
             },
-            address: start.pc() as u32,
+            address: at.pc() as u32,
             bytes: bytes[..bytes.len().min(SHOWN_BYTES)].to_vec(),
             size: bytes.len(),
             text: line.text.clone(),

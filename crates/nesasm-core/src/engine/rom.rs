@@ -118,6 +118,7 @@ impl Engine<'_> {
                 pos.page = next_page(pos.page, buffer);
                 pos.offset = 0;
             }
+            self.first_byte.get_or_insert(pos);
             let chunk = (len - done).min(BANK_SIZE - pos.offset);
             let address = pos.linear();
             if self.pass.is_emitting() && address >= ROM_LIMIT {
