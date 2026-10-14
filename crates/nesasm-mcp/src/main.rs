@@ -2,8 +2,8 @@ use nesasm_core::{
     Artifact, AssembleOptions, AssembleRequest, AssembleResult, BankUsage, Diagnostic,
     DiagnosticCode, LineRecord, ReferenceTopic, Region, Severity, SourceLocation, Symbol,
     disasm::{
-        self, Address, Applied, ChangedIssue, Diff, DisasmConfig, Disassembly, Issue, IssueKind,
-        Operation, RamUse, Routine, SourceLine, Summary, Verification, Xref,
+        self, Address, Applied, ChangedIssue, Diff, DisasmConfig, Disassembly, DynamicReference,
+        Issue, IssueKind, Operation, RamUse, Routine, SourceLine, Summary, Verification, Xref,
     },
     inspect::{Disassembled, HexRow, InesHeader, Rom, Vectors},
 };
@@ -215,6 +215,10 @@ struct DisasmInput {
     output: Option<PathBuf>,
     /// Issues to return (default: the first 20).
     issues: Option<IssueQuery>,
+    /// Data reads confirmed to go through a switchable window
+    /// (references with target_window), which are not issues; returned
+    /// whenever there are any (default: the first 20).
+    dynamic_references: Option<PageQuery>,
     /// For a ROM hack (annotations with `base`): the changed ranges written
     /// as source, with their code/data bytes, labels, routines and references
     /// from outside (default: the first 20).
@@ -311,6 +315,12 @@ struct Page<T> {
     items: Vec<T>,
 }
 
+impl<T> Page<T> {
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
 impl<T: Clone> Page<T> {
     fn of(items: &[T], offset: usize, limit: Option<usize>, default: usize, max: usize) -> Self {
         Self {
@@ -348,6 +358,12 @@ struct DisasmReport {
     removed: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issues: Option<Page<Issue>>,
+    /// Data reads confirmed to go through a switchable window
+    /// (references with target_window): the instruction, the address read,
+    /// the window, the banks it can reach and the evidence. They are not
+    /// unresolved_bank issues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_references: Option<Page<DynamicReference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diffs: Option<Page<Diff>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,6 +396,75 @@ struct BaselineReport {
     issues_introduced: Page<Issue>,
     /// Issues both report, with another message now.
     issues_changed: Page<ChangedIssue>,
+    /// Dynamic references these annotations confirm and the baseline does
+    /// not; an unresolved_bank issue of the baseline settled by one is
+    /// among issues_resolved with the reference's issue_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_references_added: Option<Page<DynamicReference>>,
+    /// Dynamic references the baseline confirms and these annotations do not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_references_removed: Option<Page<DynamicReference>>,
+}
+
+/// Pages of the dynamic references added and removed from `before` to `after`.
+fn dynamic_pages(
+    before: &[DynamicReference],
+    after: &[DynamicReference],
+    offset: usize,
+    limit: Option<usize>,
+) -> (Page<DynamicReference>, Page<DynamicReference>) {
+    let c = disasm::compare_dynamic_references(before, after);
+    (
+        Page::of(&c.added, offset, limit, DEFAULT_ITEM_LIMIT, MAX_ITEM_LIMIT),
+        Page::of(
+            &c.removed,
+            offset,
+            limit,
+            DEFAULT_ITEM_LIMIT,
+            MAX_ITEM_LIMIT,
+        ),
+    )
+}
+
+/// The text line of a dynamic reference.
+fn dynamic_line(r: &DynamicReference) -> String {
+    let banks = r
+        .candidate_banks
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "  bank {} {}: reads {} in the bank switched in at {} (banks {banks}){}",
+        r.bank,
+        r.address,
+        r.target,
+        r.window,
+        if r.traced {
+            ""
+        } else {
+            "; not reached by code"
+        }
+    )
+}
+
+/// Lines for the text summary of the dynamic references added and removed.
+fn dynamic_change_lines(
+    text: &mut Vec<String>,
+    added: Option<&Page<DynamicReference>>,
+    removed: Option<&Page<DynamicReference>>,
+) {
+    for (name, page) in [
+        ("Dynamic references added", added),
+        ("Dynamic references removed", removed),
+    ] {
+        if let Some(page) = page.filter(|p| p.total > 0) {
+            text.push(format!("{name}: {}", page.total));
+            for r in &page.items {
+                text.push(format!("{} (issue {})", dynamic_line(r), r.issue_id));
+            }
+        }
+    }
 }
 
 /// Pages of the issues resolved, introduced and changed from `before` to `after`.
@@ -481,6 +566,14 @@ struct AnnotateReport {
     /// Issues reported before and after, with another message after.
     #[serde(skip_serializing_if = "Option::is_none")]
     issues_changed: Option<Page<ChangedIssue>>,
+    /// Data reads confirmed to go through a switchable window only after
+    /// the change (references with target_window); the unresolved_bank
+    /// issue each settles (issue_id) is among issues_resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_references_added: Option<Page<DynamicReference>>,
+    /// Dynamic references confirmed only before the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_references_removed: Option<Page<DynamicReference>>,
     /// The changed annotations, for inline annotations and dry runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     annotations: Option<serde_json::Value>,
@@ -1147,6 +1240,17 @@ impl Server {
             DEFAULT_ISSUE_LIMIT,
             MAX_ITEM_LIMIT,
         ));
+        let dynamic = d.dynamic_references();
+        if !dynamic.is_empty() || input.dynamic_references.is_some() {
+            let page = input.dynamic_references.clone().unwrap_or_default();
+            report.dynamic_references = Some(Page::of(
+                &dynamic,
+                page.offset,
+                page.limit,
+                DEFAULT_ISSUE_LIMIT,
+                MAX_ITEM_LIMIT,
+            ));
+        }
         if report.summary.as_ref().is_some_and(|s| s.diff.is_some()) {
             let page = input.diffs.clone().unwrap_or_default();
             report.diffs = Some(Page::of(
@@ -1231,12 +1335,22 @@ impl Server {
                     let base = &baseline.disassembly;
                     let (issues_resolved, issues_introduced, issues_changed) =
                         issue_pages(base.issues(), d.issues(), query.offset, query.limit);
+                    let (dynamic_references_added, dynamic_references_removed) = dynamic_pages(
+                        &base.dynamic_references(),
+                        &dynamic,
+                        query.offset,
+                        query.limit,
+                    );
                     report.baseline = Some(BaselineReport {
                         inputs: baseline.inputs.clone(),
                         summary: base.summary(),
                         issues_resolved,
                         issues_introduced,
                         issues_changed,
+                        dynamic_references_added: Some(dynamic_references_added)
+                            .filter(|p| !p.is_empty()),
+                        dynamic_references_removed: Some(dynamic_references_removed)
+                            .filter(|p| !p.is_empty()),
                     });
                 }
                 Err(diagnostics) => {
@@ -1482,6 +1596,17 @@ impl Server {
         report.issues_resolved = Some(resolved);
         report.issues_introduced = Some(introduced);
         report.issues_changed = Some(changed);
+        let dynamic_before = before
+            .as_ref()
+            .map_or_else(Vec::new, Disassembly::dynamic_references);
+        let (added, removed) = dynamic_pages(
+            &dynamic_before,
+            &after.dynamic_references(),
+            page.offset,
+            page.limit,
+        );
+        report.dynamic_references_added = Some(added).filter(|p| !p.is_empty());
+        report.dynamic_references_removed = Some(removed).filter(|p| !p.is_empty());
         let text = disasm::canonical_json(&config);
         let sha256 = disasm::sha256_hex(text.as_bytes());
         report.sha256 = Some(sha256.clone());
@@ -1496,6 +1621,7 @@ impl Server {
                 "data_bytes": prg.clone().map(|b| b.data_bytes).sum::<usize>(),
                 "unknown_bytes": prg.map(|b| b.unknown_bytes).sum::<usize>(),
                 "issues": summary.issues.values().sum::<usize>(),
+                "dynamic_references": summary.dynamic_references,
             })
         };
         let time = std::time::SystemTime::now()
@@ -1574,12 +1700,16 @@ impl Server {
         let totals = |s: &Summary| {
             let prg = s.banks.iter().filter(|b| !b.chr);
             format!(
-                "{} instructions, code {}, data {}, unknown {} bytes, {} issues",
+                "{} instructions, code {}, data {}, unknown {} bytes, {} issues{}",
                 s.instructions,
                 prg.clone().map(|b| b.code_bytes).sum::<usize>(),
                 prg.clone().map(|b| b.data_bytes).sum::<usize>(),
                 prg.map(|b| b.unknown_bytes).sum::<usize>(),
-                s.issues.values().sum::<usize>()
+                s.issues.values().sum::<usize>(),
+                match s.dynamic_references {
+                    0 => String::new(),
+                    n => format!(", {n} dynamic references"),
+                }
             )
         };
         if let Some(before) = &report.summary_before {
@@ -1600,6 +1730,11 @@ impl Server {
             report.issues_resolved.as_ref(),
             report.issues_introduced.as_ref(),
             report.issues_changed.as_ref(),
+        );
+        dynamic_change_lines(
+            &mut text,
+            report.dynamic_references_added.as_ref(),
+            report.dynamic_references_removed.as_ref(),
         );
         if let Some(log) = &report.log {
             text.push(format!("Logged to {}", log.display()));
@@ -1728,6 +1863,11 @@ impl Server {
                 Some(&b.issues_introduced),
                 Some(&b.issues_changed),
             );
+            dynamic_change_lines(
+                &mut text,
+                b.dynamic_references_added.as_ref(),
+                b.dynamic_references_removed.as_ref(),
+            );
         }
         if let Some(page) = report.issues.as_ref().filter(|p| p.total > 0) {
             text.push(heading("Issues", page.total, page.offset, page.items.len()));
@@ -1743,6 +1883,17 @@ impl Server {
                     issue.address,
                     issue.message
                 ));
+            }
+        }
+        if let Some(page) = report.dynamic_references.as_ref().filter(|p| p.total > 0) {
+            text.push(heading(
+                "Dynamic references (confirmed, not issues)",
+                page.total,
+                page.offset,
+                page.items.len(),
+            ));
+            for r in &page.items {
+                text.push(dynamic_line(r));
             }
         }
         if let Some(page) = report.diffs.as_ref().filter(|p| p.total > 0) {

@@ -211,6 +211,34 @@ bankは8 KiB単位の**10進数**です。上のアドレスやbank番号はRock
 また、現在の `banks` は物理バンクごとに一つのorgを指定する方式です。
 同じ物理バンクが複数のCPU窓で使われるケースを、一つの指定で全面的に解決したとは扱いません。
 
+### 実行時に選んだバンクを読む参照
+
+同じ配置のデータが複数のバンクにあり、共通ルーチンが「いま$A000-$BFFFに入っているバンク」を読む場合、
+参照先は意図的に動的です。`target_bank` で一つに固定すると誤りになり、`comments` だけでは未解析の
+`unresolved_bank` と区別できません。実コードで切り替えを確認したら、`target_window` で
+「確認済みの動的参照」として記録します。
+
+例：Rockman5.nes BANK $1E（30）のルーチン$D829は、$F6（$A000窓のバンク要求値）をスタックへ保存し、
+StageDataBank（$27）を$F6へ設定して$FF43（SetPrgBanks。$FF53-$FF5EでMMC3 R7へ$F6を書く）を呼び、
+ステージデータバンクのタイル・属性の表を読んでから、$F6を復元して再び$FF43を呼びます。
+
+```json
+{"op": "upsert", "kind": "references",
+ "item": {"bank": 30, "address": "$D849", "target_window": "$A000"},
+ "evidence": "$D829-$D830でStageDataBank($27)を$F6へ設定しSetPrgBanks($FF43)がR7へ書く。$D89B-$D89Eで復元。全ステージバンクが同じ位置に表を持つ"}
+```
+
+$D84F／$D855／$D85B／$D861（`lda $AE00,y` … `lda $B100,y`）も同じ根拠で追加します。
+
+- 対象は窓の中の絶対アドレスを読む命令だけです。書込み、JSR／JMP、分岐には使えません。
+  `target_bank` と同時には指定できず、根拠が必須で、ファイルには `"format_version": 3` が書かれます。
+- その命令の `unresolved_bank` は消え、`disassemble` の `dynamic_references` に命令位置・読むアドレス・
+  窓・候補バンク・根拠が載ります。注釈していない他の参照は `unresolved_bank` のまま残ります。
+- ソースは `lda $AD00,y ; dynamic: reads the bank switched in at $A000` となり、特定バンクのラベルには
+  置き換えません。読み取った値も定数として扱いません。表のバイトは各バンクで `regions` に記述します。
+- `annotate` の `dynamic_references_added` や `baseline` の比較で、どの `unresolved_bank`（`issue_id`）が
+  動的参照になったかを確認できます。
+
 ### 間接ジャンプと表の例
 
 ポインタの下位・上位バイトをどこから読むか、索引の意味、有効な要素数、
@@ -244,7 +272,7 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
 | 到達するコード入口 | `entry_points`。入口から追える範囲をコードとして扱う |
 | データの範囲と形式 | `regions` の `bytes`／`words`／`text` 等 |
 | ジャンプ表 | `regions` の `pointers`／`low_bytes`／`high_bytes`。コードの飛び先だけ `code_targets: true` |
-| 参照先のバンク | `banks` と、必要な箇所だけ `references` |
+| 参照先のバンク | `banks` と、必要な箇所だけ `references`（実行時に選んだ窓のバンクを読むなら `target_window`） |
 | JSR直後の引数・戻らない呼出し | ルーチンの `entry_points.inline_bytes`／`no_return` |
 
 `switch_banks` は、指定RAMにあるバンクを配置するだけでなく、呼出し元が知るその他のRAMを
@@ -283,7 +311,8 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
   操作の `evidence` か、項目の `evidence` のどちらかに書きます。
 - 操作の `evidence` は項目の `evidence`（文字列の配列）に追加され、注釈ファイルの中で項目と一緒に残ります。
   同じ文は二重に入りません。間違った根拠を消すときは、その文を除いた `evidence` を項目に付けて送ります。
-  根拠を使うファイルには `"format_version": 2` が書かれ、旧版のnesasmでは読めなくなります。
+  根拠を使うファイルには `"format_version": 2`（`target_window` を使うなら3）が書かれ、旧版のnesasmでは
+  読めなくなります。
 - 根拠は、注釈ファイルと同じ場所の `<名前>.disasm.log.jsonl` にも、操作、更新前後のSHA-256、
   命令数とコード／データ／未分類のバイト数、issues数とともに1行ずつ追記されます（履歴）。
   ソースの読者に向けた説明は、別途 `comment`／`comments.text` に書きます。

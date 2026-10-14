@@ -294,6 +294,13 @@ fn structured_content_matches_output_schema() {
     let mut hack = vec![0xea; 0x2000];
     hack.extend(vec![0x60; 0x2000]);
     fs::write(c.root.join("hack.bin"), hack).unwrap();
+    // Six banks: the last one reads $A000, which banks 1 and 3 hold, at
+    // the reset vector ($EAEA).
+    let mut stage = vec![0xea; 6 * 0x2000];
+    stage[5 * 0x2000 + 0xaea..][..3].copy_from_slice(&[0xad, 0x00, 0xa0]);
+    fs::write(c.root.join("stage.bin"), stage).unwrap();
+    let dynamic = json!({"rom":"stage.bin","format_version":3,"references":[
+        {"address":"$EAEA","target_window":"$A000","evidence":["read per stage"]}]});
     let listed = c.request("tools/list", json!({}));
     let schemas: Vec<(String, Value)> = listed["result"]["tools"]
         .as_array()
@@ -331,6 +338,15 @@ fn structured_content_matches_output_schema() {
         ),
         ("disassemble", json!({"inline":{"rom":"missing.bin"}})),
         (
+            "disassemble",
+            json!({"inline":dynamic,"baseline":{"inline":{"rom":"stage.bin"}},"xrefs":["$A000"]}),
+        ),
+        (
+            "annotate",
+            json!({"inline":{"rom":"stage.bin"},"operations":[{"op":"upsert","kind":"references",
+                   "item":dynamic["references"][0]}]}),
+        ),
+        (
             "annotate",
             json!({"inline":{"rom":"game.bin"},"operations":[{"op":"upsert","kind":"labels",
                    "item":{"address":"$E000","name":"Start"}}]}),
@@ -342,6 +358,17 @@ fn structured_content_matches_output_schema() {
     ] {
         let result = c.call(name, arguments.clone());
         let content = result["structuredContent"].as_object().unwrap();
+        // The dynamic reference is reported, so its fields are checked.
+        if arguments["inline"]["rom"] == "stage.bin" {
+            let added = match name {
+                "disassemble" => {
+                    assert_eq!(content["dynamic_references"]["total"], 1, "{result}");
+                    &content["baseline"]["dynamic_references_added"]
+                }
+                _ => &content["dynamic_references_added"],
+            };
+            assert_eq!(added["total"], 1, "{result}");
+        }
         let schema = &schemas.iter().find(|(n, _)| n == name).unwrap().1;
         let mut errors = Vec::new();
         violations(

@@ -4264,14 +4264,14 @@ fn evidence_and_status_need_format_2() {
         )
     );
     // Newer formats are refused with the reason.
-    for version in [0, 3] {
+    for version in [0, 4] {
         let json = format!(r#"{{"format_version": {version}}}"#);
         let e = disasm::disassemble(&rom, None, &config(&json), Path::new("out.asm"), &NEVER)
             .err()
             .unwrap();
         assert!(
             e[0].message.starts_with(&format!(
-                "format_version {version} is not supported: this version of nesasm reads annotations up to format_version 2"
+                "format_version {version} is not supported: this version of nesasm reads annotations up to format_version 3"
             )),
             "{e:?}"
         );
@@ -4456,5 +4456,572 @@ fn skipped_hypotheses_shape_nothing() {
     assert_eq!(
         found[0][1]["operations"][0]["item"],
         serde_json::json!({"bank": 1, "address": "$E008", "no_return": true})
+    );
+}
+
+/// Banks 1, 3 and 5 hold tables of one layout at $AD00-$B000 at $A000
+/// (bytes $n1-$n4 for bank n); banks 0, 2 and 4 code at $8000.
+fn stage_banks() -> String {
+    let mut banks = String::new();
+    for bank in 0..6 {
+        if bank % 2 == 0 {
+            banks += &format!("  .bank {bank}\n  .org $8000\n  lda #${bank:02X}\n  rts\n");
+        } else {
+            banks += &format!(
+                "  .bank {bank}\n  .org $AD00\n  .db ${bank}1\n  .org $AE00\n  .db ${bank}2\n  .org $AF00\n  .db ${bank}3\n  .org $B000\n  .db ${bank}4\n"
+            );
+        }
+    }
+    banks
+}
+
+/// A routine in the fixed bank that switches in the bank held in $27 at
+/// $A000 and reads its tables ($E009, $E00E, $E013), then switches in bank
+/// 3 and reads $B000 ($E01F).
+fn stage_rom() -> Vec<u8> {
+    switching_rom(
+        &stage_banks(),
+        concat!(
+            "  lda <$27\n  sta <$F6\n  jsr Switch\n  ldy #$00\n",
+            "  lda $AD00,y\n  sta <$10\n  lda $AE00,y\n  sta <$11\n  lda $AF00,y\n  sta <$12\n",
+            "  lda #$03\n  sta <$F6\n  jsr Switch\n  lda $B000\n  sta <$13\n",
+        ),
+    )
+}
+
+const STAGE_EVIDENCE: &str =
+    "$E000-$E004 switch in the bank held in $27 at $A000 (MMC3 R7); every stage bank has the table";
+
+fn dynamic_entry(address: &str) -> String {
+    format!(
+        r#"{{"bank": 7, "address": "{address}", "target_window": "$A000", "evidence": ["{STAGE_EVIDENCE}"]}}"#
+    )
+}
+
+#[test]
+fn dynamic_references_read_the_bank_switched_in() {
+    let rom = stage_rom();
+    // Without annotations the reads whose bank is not known are unresolved;
+    // the one after bank 3 is switched in names bank 3.
+    let before = round_trip(&rom, &DisasmConfig::default());
+    let unresolved = |address: &str, target: &str| {
+        format!(
+            "{address} {target} is held by banks 1, 3, 5; add a references entry with target_bank"
+        )
+    };
+    assert_eq!(
+        issues(&before, IssueKind::UnresolvedBank),
+        [
+            unresolved("$E009", "$AD00"),
+            unresolved("$E00E", "$AE00"),
+            unresolved("$E013", "$AF00")
+        ]
+    );
+    assert!(before.dynamic_references().is_empty());
+    assert_lines(
+        &before,
+        &["\tlda $AD00,y", "\tlda $AF00,y", "\tlda D_03_B000"],
+    );
+
+    // Two reads annotated as dynamic, one with a fixed bank, and one whose
+    // bank is known on its path.
+    let annotations = config(&format!(
+        r#"{{"format_version": 3, "references": [{}, {}, {{"bank": 7, "address": "$E013", "target_bank": 5}}, {}]}}"#,
+        dynamic_entry("$E009"),
+        dynamic_entry("$E00E"),
+        dynamic_entry("$E01F"),
+    ));
+    let after = round_trip(&rom, &annotations);
+    assert!(issues(&after, IssueKind::UnresolvedBank).is_empty());
+    assert_lines(
+        &after,
+        &[
+            "\tlda $AD00,y ; dynamic: reads the bank switched in at $A000",
+            "\tlda $AE00,y ; dynamic: reads the bank switched in at $A000",
+            "\tlda D_05_AF00,y",
+            "\tlda D_03_B000 ; dynamic: reads the bank switched in at $A000 (bank 3 on every path traced)",
+        ],
+    );
+    // No label of a stage bank stands for the dynamic reads.
+    assert!(!after.text().contains("_AD00"), "{}", after.text());
+    assert!(!after.text().contains("_AE00"), "{}", after.text());
+    assert_eq!(after.summary().dynamic_references, 3);
+    let found = after.dynamic_references();
+    let shown: Vec<_> = found
+        .iter()
+        .map(|r| {
+            (
+                r.id.as_str(),
+                r.issue_id.as_str(),
+                r.target.to_string(),
+                r.window.to_string(),
+                r.candidate_banks.clone(),
+                r.known_bank,
+                r.traced,
+                r.line.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                "dynamic_reference:7:$E009",
+                "unresolved_bank:7:$E009",
+                "$AD00".into(),
+                "$A000".into(),
+                vec![1, 3, 5],
+                None,
+                true,
+                "lda $AD00,y ; dynamic: reads the bank switched in at $A000"
+            ),
+            (
+                "dynamic_reference:7:$E00E",
+                "unresolved_bank:7:$E00E",
+                "$AE00".into(),
+                "$A000".into(),
+                vec![1, 3, 5],
+                None,
+                true,
+                "lda $AE00,y ; dynamic: reads the bank switched in at $A000"
+            ),
+            (
+                "dynamic_reference:7:$E01F",
+                "unresolved_bank:7:$E01F",
+                "$B000".into(),
+                "$A000".into(),
+                vec![1, 3, 5],
+                Some(3),
+                true,
+                "lda D_03_B000 ; dynamic: reads the bank switched in at $A000 (bank 3 on every path traced)"
+            ),
+        ]
+    );
+    assert_eq!(found[0].evidence, [STAGE_EVIDENCE]);
+    let json = serde_json::to_value(&found[0]).unwrap();
+    assert!(
+        json.get("known_bank").is_none() && json.get("status").is_none(),
+        "{json}"
+    );
+
+    // xrefs tell the reads through the window from references to a bank.
+    let windows = |query: &str| -> Vec<(String, Option<String>)> {
+        after
+            .xrefs(query)
+            .unwrap()
+            .iter()
+            .map(|x| (x.address.to_string(), x.window.map(|w| w.to_string())))
+            .collect()
+    };
+    assert_eq!(windows("$AD00"), [("$E009".into(), Some("$A000".into()))]);
+    assert_eq!(windows("D_05_AF00"), [("$E013".into(), None)]);
+    assert_eq!(
+        windows("D_03_B000"),
+        [("$E01F".into(), Some("$A000".into()))]
+    );
+    let xref = serde_json::to_value(&after.xrefs("$AF00").unwrap()[0]).unwrap();
+    assert!(xref.get("window").is_none(), "{xref}");
+
+    // The comparison shows the issues settled as dynamic references.
+    let compared = disasm::compare_issues(before.issues(), after.issues());
+    let resolved: Vec<&str> = compared.resolved.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(
+        resolved,
+        [
+            "unresolved_bank:7:$E009",
+            "unresolved_bank:7:$E00E",
+            "unresolved_bank:7:$E013"
+        ]
+    );
+    let compared = disasm::compare_dynamic_references(&before.dynamic_references(), &found);
+    let added: Vec<&str> = compared.added.iter().map(|r| r.issue_id.as_str()).collect();
+    assert_eq!(
+        added,
+        [
+            "unresolved_bank:7:$E009",
+            "unresolved_bank:7:$E00E",
+            "unresolved_bank:7:$E01F"
+        ]
+    );
+    assert!(compared.removed.is_empty());
+    let back = disasm::compare_dynamic_references(&found, &before.dynamic_references());
+    assert_eq!(back.removed.len(), 3);
+    assert!(back.added.is_empty());
+}
+
+#[test]
+fn dynamic_references_do_not_take_bank_bytes_as_values() {
+    // Only bank 1 is laid out at $A000, so $AD00 resolves to it: without
+    // the annotation its $02 selects bank 2 at $8000.
+    let rom = switching_rom(
+        &stage_banks().replace("  .db $11\n", "  .db $02\n"),
+        "  lda $AD00\n  sta <$F5\n  jsr Switch\n  jsr $8000\n",
+    );
+    let layout = r#""banks": [{"bank": 3, "org": "$8000"}, {"bank": 5, "org": "$8000"}]"#;
+    let d = round_trip(&rom, &config(&format!("{{{layout}}}")));
+    assert!(
+        issues(&d, IssueKind::UnresolvedBank).is_empty(),
+        "{:?}",
+        d.issues()
+    );
+    assert_lines(&d, &["\tlda D_AD00", "\tjsr sub_02_8000"]);
+    // Read from whichever bank is switched in, the value is not known.
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{{layout}, "references": [{}]}}"#,
+            dynamic_entry("$E000")
+        )),
+    );
+    assert_eq!(
+        issues(&d, IssueKind::UnresolvedBank),
+        ["$E008 $8000 is held by banks 0, 2, 3, 4, 5; add a references entry with target_bank"]
+    );
+    assert_lines(
+        &d,
+        &[
+            "\tlda $AD00 ; dynamic: reads the bank switched in at $A000",
+            "\tjsr $8000",
+        ],
+    );
+    assert_eq!(d.dynamic_references()[0].candidate_banks, [1]);
+}
+
+#[test]
+fn dynamic_references_are_checked() {
+    let rom = stage_rom();
+    let fails = |references: &str| -> Vec<String> {
+        let json = format!(r#"{{"references": [{references}]}}"#);
+        disasm::disassemble(&rom, None, &config(&json), Path::new("out.asm"), &NEVER)
+            .err()
+            .expect("the annotations should be refused")
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+    let entry = |address: &str, fields: &str| {
+        format!(r#"{{"address": "{address}", {fields}, "evidence": ["{STAGE_EVIDENCE}"]}}"#)
+    };
+    let window = r#""target_window": "$A000""#;
+    for (references, message) in [
+        (
+            entry("$E009", r#""target_bank": 3, "target_window": "$A000""#),
+            "references[0] $E009: give target_bank (a fixed bank) or target_window (the bank switched in at run time), not both",
+        ),
+        (
+            r#"{"address": "$E009"}"#.into(),
+            "references[0] $E009: give target_bank or target_window",
+        ),
+        (
+            entry("$E009", r#""target_window": "$C000""#),
+            "references[0] $E009: target_window $C000 is not a switchable window; give \"$8000\" or \"$A000\"",
+        ),
+        (
+            entry("$E009", r#""target_window": "$A001""#),
+            "references[0] $E009: target_window $A001 is not a switchable window; give \"$8000\" or \"$A000\"",
+        ),
+        (
+            r#"{"address": "$E009", "target_window": "$A000", "evidence": [" "]}"#.into(),
+            "references[0] $E009: target_window needs evidence: how the bank is switched in and why it varies",
+        ),
+        (
+            entry("$E009", r#""target_window": "$8000""#),
+            "references[0] $E009: the operand $AD00 is outside the window $8000-$9FFF",
+        ),
+        (
+            entry("$E004", window),
+            "references[0] $E004: JSR transfers control; target_window applies only to data reads",
+        ),
+        (
+            entry("$E024", window),
+            "references[0] $E024: JMP transfers control; target_window applies only to data reads",
+        ),
+        (
+            entry("$E02F", r#""target_window": "$8000""#),
+            "references[0] $E02F: STA writes its operand; target_window applies only to data reads",
+        ),
+        (
+            entry("$E00C", window),
+            "references[0] $E00C: STA writes its operand; target_window applies only to data reads",
+        ),
+        (
+            entry("$E007", window),
+            "references[0] $E007: LDY has no absolute operand ($xxxx, $xxxx,X or $xxxx,Y); target_window applies only to them",
+        ),
+        (
+            entry("$E000", window),
+            "references[0] $E000: LDA has no absolute operand ($xxxx, $xxxx,X or $xxxx,Y); target_window applies only to them",
+        ),
+        (
+            format!(
+                "{}, {}",
+                entry("$E009", r#""target_bank": 3"#),
+                entry("$E009", window)
+            ),
+            "references[1] $E009: another references entry names the same instruction (bank 7); give target_bank or target_window in one entry",
+        ),
+        (
+            format!(
+                "{}, {}",
+                entry("$E009", window),
+                entry("$E009", r#""target_bank": 3"#)
+            ),
+            "references[1] $E009: another references entry names the same instruction (bank 7); give target_bank or target_window in one entry",
+        ),
+    ] {
+        assert_eq!(fails(&references), [message], "{references}");
+    }
+    // A branch is refused too.
+    let rom = nrom("Reset:\n  bne Reset\n  jmp Reset\nNmi:\n  rti\n");
+    let json = format!(r#"{{"references": [{}]}}"#, entry("$E000", window));
+    let e = disasm::disassemble(&rom, None, &config(&json), Path::new("out.asm"), &NEVER)
+        .err()
+        .unwrap();
+    assert_eq!(
+        e[0].message,
+        "references[0] $E000: BNE transfers control; target_window applies only to data reads"
+    );
+}
+
+#[test]
+fn dynamic_references_are_annotated_with_evidence() {
+    let rom = stage_rom();
+    let original = config(r#"{"rom": "stage.nes"}"#);
+    let d = round_trip(&rom, &original);
+    // An unresolved read suggests the window besides each bank.
+    let found = suggestions(&d, IssueKind::UnresolvedBank);
+    assert_eq!(found.as_array().unwrap().len(), 3);
+    let window = &found[0][3];
+    assert_eq!(
+        window,
+        &serde_json::json!({
+            "description": "the instruction reads whichever bank is switched in at $A000 at run time (tables of the same layout in several banks)",
+            "operations": [{"op": "upsert", "kind": "references",
+                            "item": {"bank": 7, "address": "$E009", "target_window": "$A000"}}],
+            "evidence_required": true,
+        })
+    );
+    // Evidence is required.
+    assert_eq!(
+        apply_errors(&rom, &original, window["operations"].clone()),
+        [
+            "operations[0] (upsert references): this entry overrides what the analysis finds: give evidence"
+        ]
+    );
+    let changed = apply(&rom, &original, with_evidence(window));
+    assert_eq!(
+        disasm::canonical_json(&changed),
+        concat!(
+            "{\n",
+            "  \"rom\": \"stage.nes\",\n",
+            "  \"format_version\": 3,\n",
+            "  \"references\": [\n",
+            "    {\"bank\":7,\"address\":\"$E009\",\"target_window\":\"$A000\",\"evidence\":[\"checked in the code\"]}\n",
+            "  ]\n",
+            "}\n",
+        )
+    );
+    let d = round_trip(&rom, &changed);
+    assert_eq!(issues(&d, IssueKind::UnresolvedBank).len(), 2);
+    assert_eq!(d.dynamic_references().len(), 1);
+    // A fixed bank replaces the window for the same instruction (same key).
+    let (fixed, applied) = disasm::apply_operations(
+        &changed,
+        &rom,
+        &operations(serde_json::json!([{"op": "upsert", "kind": "references",
+            "item": {"address": "$E009", "target_bank": 3}, "evidence": "only stage 3 reads it"}])),
+    )
+    .unwrap();
+    assert_eq!(
+        applied[0].previous,
+        [
+            serde_json::json!({"bank": 7, "address": "$E009", "target_window": "$A000", "evidence": ["checked in the code"]})
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&fixed.references).unwrap(),
+        serde_json::json!([{"bank": 7, "address": "$E009", "target_bank": 3, "evidence": ["only stage 3 reads it"]}])
+    );
+    // Without a target_window the format goes back to 2.
+    assert!(disasm::canonical_json(&fixed).contains("\"format_version\": 2,"));
+    // Contradicting or invalid entries are refused.
+    for (item, message) in [
+        (
+            serde_json::json!({"address": "$E009", "target_bank": 3, "target_window": "$A000"}),
+            "operations[0] (upsert references): give target_bank (a fixed bank) or target_window (the bank switched in at run time), not both",
+        ),
+        (
+            serde_json::json!({"address": "$E009", "target_window": "$E000"}),
+            "operations[0] (upsert references): target_window $E000 is not a switchable window; give \"$8000\" or \"$A000\"",
+        ),
+    ] {
+        assert_eq!(
+            apply_errors(
+                &rom,
+                &changed,
+                serde_json::json!([{"op": "upsert", "kind": "references", "item": item, "evidence": "x"}])
+            ),
+            [message]
+        );
+    }
+    // The item may give the evidence itself.
+    let item_evidence = apply(
+        &rom,
+        &original,
+        serde_json::json!([{"op": "upsert", "kind": "references",
+            "item": {"address": "$E00E", "target_window": "$A000", "evidence": ["read per stage"]}}]),
+    );
+    assert_eq!(item_evidence.references[0].evidence, ["read per stage"]);
+    // Removed by key, as other references.
+    let removed = apply(
+        &rom,
+        &changed,
+        serde_json::json!([{"op": "remove", "kind": "references", "key": {"address": "$E009"}}]),
+    );
+    assert!(removed.references.is_empty());
+    assert!(!disasm::canonical_json(&removed).contains("format_version"));
+    // Hypotheses are applied only on request.
+    let hypothesis = config(&format!(
+        r#"{{"references": [{{"address": "$E009", "target_window": "$A000", "evidence": ["{STAGE_EVIDENCE}"], "status": "hypothesis"}}]}}"#
+    ));
+    let d = round_trip(&rom, &hypothesis);
+    assert!(d.dynamic_references().is_empty());
+    assert_eq!(issues(&d, IssueKind::UnresolvedBank).len(), 3);
+    let d = round_trip(&rom, &hypothesis.with_hypotheses());
+    let json = serde_json::to_value(d.dynamic_references()).unwrap();
+    assert_eq!(json[0]["status"], "hypothesis");
+}
+
+#[test]
+fn annotations_with_target_window_are_format_3() {
+    let rom = stage_rom();
+    // Older formats are read as before.
+    for json in [
+        r#"{"references": [{"address": "$E009", "target_bank": 3}]}"#,
+        r#"{"format_version": 2, "references": [{"address": "$E009", "target_bank": 3, "evidence": ["x"]}]}"#,
+    ] {
+        let d = round_trip(&rom, &config(json));
+        assert_lines(&d, &["\tlda D_03_AD00,y"]);
+        assert!(d.dynamic_references().is_empty());
+    }
+    let json = format!(r#"{{"references": [{}]}}"#, dynamic_entry("$E009"));
+    let parsed = config(&json);
+    assert_eq!(parsed.references[0].target_bank, None);
+    assert_eq!(parsed.references[0].target_window, Some(Address(0xa000)));
+    round_trip(&rom, &parsed);
+}
+
+#[test]
+fn dynamic_references_are_instructions_the_analysis_decodes() {
+    // $E003: bytes that decode as `lda $AD00,y` but follow a JMP; $E007:
+    // the operand of `lda $ADAD`, which decodes as `lda $ADAD` too.
+    let rom = switching_rom(
+        &stage_banks(),
+        "  jmp Next\nTable:\n  .db $B9, $00, $AD\nNext:\n  lda $ADAD\n  lda $ADAD\n",
+    );
+    let fails = |json: String| -> Vec<String> {
+        disasm::disassemble(&rom, None, &config(&json), Path::new("out.asm"), &NEVER)
+            .err()
+            .expect("the annotations should be refused")
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+    // Bytes a region describes as data.
+    assert_eq!(
+        fails(format!(
+            r#"{{"regions": [{{"start": "$E003", "length": 3, "type": "pointers"}}], "references": [{}]}}"#,
+            dynamic_entry("$E003")
+        )),
+        [
+            "references[0] $E003: the bytes there are data (a region or inline arguments), not an instruction; target_window applies only to data reads"
+        ]
+    );
+    // The operand bytes of an instruction.
+    assert_eq!(
+        fails(format!(r#"{{"references": [{}]}}"#, dynamic_entry("$E007"))),
+        [
+            "references[0] $E007: the bytes there are inside another instruction, not an instruction; target_window applies only to data reads"
+        ]
+    );
+    // Bytes no code reaches are accepted, but not traced.
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{"references": [{}]}}"#,
+            dynamic_entry("$E003")
+        )),
+    );
+    let found = d.dynamic_references();
+    assert!(!found[0].traced);
+    assert_eq!(found[0].line, "");
+}
+
+#[test]
+fn dynamic_references_in_code_regions_are_traced_only_when_reached() {
+    // A code region decodes the read after the RTS, which no path reaches.
+    let rom = switching_rom(
+        &stage_banks(),
+        "  lda #$03\n  sta <$F6\n  jsr Switch\n  jsr Read\n  jmp Halt\nRead:\n  lda $AD00\n  rts\n  lda $AE00\n  rts\n",
+    );
+    // Read: $E00D (lda $AD00), $E010 rts, $E011 (lda $AE00).
+    // The region starts at the RTS: a region's start is traced knowing
+    // nothing, so it would be a path that does not know the bank.
+    let regions = r#""regions": [{"start": "$E010", "length": 5, "type": "code"}]"#;
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{{regions}, "references": [{}, {}]}}"#,
+            dynamic_entry("$E00D"),
+            dynamic_entry("$E011")
+        )),
+    );
+    let found: Vec<_> = d
+        .dynamic_references()
+        .into_iter()
+        .map(|r| (r.address.to_string(), r.traced, r.known_bank))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("$E00D".into(), true, Some(3)),
+            ("$E011".into(), false, None)
+        ]
+    );
+    assert_lines(
+        &d,
+        &[
+            "\tlda D_03_AD00 ; dynamic: reads the bank switched in at $A000 (bank 3 on every path traced)",
+            "\tlda $AE00 ; dynamic: reads the bank switched in at $A000",
+        ],
+    );
+}
+
+#[test]
+fn annotate_repairs_invalid_references() {
+    let rom = stage_rom();
+    // A file with a window but no evidence, as written by hand.
+    let invalid = config(
+        r#"{"rom": "stage.nes", "references": [{"bank": 7, "address": "$E009", "target_window": "$A000"}]}"#,
+    );
+    let removed = apply(
+        &rom,
+        &invalid,
+        serde_json::json!([{"op": "remove", "kind": "references", "key": {"address": "$E009"}}]),
+    );
+    assert!(removed.references.is_empty());
+    let replaced = apply(
+        &rom,
+        &invalid,
+        serde_json::json!([{"op": "upsert", "kind": "references",
+            "item": {"address": "$E009", "target_window": "$A000"}, "evidence": "read per stage"}]),
+    );
+    assert_eq!(replaced.references[0].evidence, ["read per stage"]);
+    // Kept as it is, it is still an error.
+    assert_eq!(
+        apply_errors(&rom, &invalid, serde_json::json!([])),
+        [
+            "In the changed annotations: references[0] $E009: target_window needs evidence: how the bank is switched in and why it varies"
+        ]
     );
 }
