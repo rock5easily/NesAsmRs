@@ -666,6 +666,7 @@ classDiagram
         +chr_file() Option
         +summary() Summary
         +issues() Vec~Issue~
+        +dynamic_references() Vec~DynamicReference~
         +view(bank, from, to)
         +xrefs(query)
         +routines() Vec~Routine~
@@ -732,6 +733,7 @@ classDiagram
         disassemble(rom_file, base_file, config, source, cancel)
         is_unedited_source(text)
         compare_issues(before, after)
+        compare_dynamic_references(before, after)
         DisasmConfig::with_hypotheses()
         apply_operations(config, rom_file, operations)
         canonical_json(config)

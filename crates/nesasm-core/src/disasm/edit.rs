@@ -2,11 +2,12 @@
 //! entries by key, the suggestions made from issues in the same form, and
 //! the canonical text annotations are written in.
 
-use super::analysis::{Analysis, Fix, Loc, Memory};
+use super::analysis::{Analysis, Fix, Loc, Memory, window_index};
 use super::config::{
     Address, BankLayout, CommentDef, CommentPosition, DisasmConfig, DisasmOptions, EntryPoint,
     LabelDef, OperandDef, PatchDef, Provenance, ReferenceDef, RegionDef, SymbolDef,
 };
+use crate::state::BANK_SIZE;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -314,6 +315,9 @@ impl Entry for ReferenceDef {
     fn order(&self) -> (Option<usize>, u32, String) {
         at_order(self.bank, self.address)
     }
+    fn check(&self) -> Result<(), String> {
+        ReferenceDef::check(self)
+    }
 }
 
 impl Entry for BankLayout {
@@ -378,14 +382,14 @@ fn upsert<T: Entry>(
         return Err(format!("fill in {name} (null)"));
     }
     let mut item: T = serde_json::from_value(item.clone()).map_err(|e| e.to_string())?;
-    item.check()?;
-    normalize(&mut item, memory)?;
     // The operation's evidence is added to what the item gives.
     if let Some(text) = evidence.map(str::trim).filter(|t| !t.is_empty())
         && !item.evidence().iter().any(|e| e == text)
     {
         item.evidence_mut().push(text.to_owned());
     }
+    item.check()?;
+    normalize(&mut item, memory)?;
     let key = item.key();
     // In the place of the first entry it replaces, as order can matter.
     let place = list.iter().position(|entry| key.names(&entry.key()));
@@ -682,8 +686,8 @@ pub fn canonical_json(config: &DisasmConfig) -> String {
         "  \"rom\": {}",
         text(config.rom.to_string_lossy().as_ref())
     )];
-    if config.needs_format_2() {
-        fields.push(format!("  \"format_version\": {}", super::FORMAT_VERSION));
+    if let Some(version) = config.required_format() {
+        fields.push(format!("  \"format_version\": {version}"));
     }
     if let Some(address) = config.load_address {
         fields.push(format!("  \"load_address\": {}", text(&address)));
@@ -752,19 +756,42 @@ pub(crate) fn suggestions(
             )],
             &[],
         )],
-        Fix::Reference { from, banks } => banks
-            .iter()
-            .map(|bank| {
-                suggestion(
-                    format!("the reference is to bank {bank}"),
+        Fix::Reference { from, banks } => {
+            let mut suggestions: Vec<Suggestion> = banks
+                .iter()
+                .map(|bank| {
+                    suggestion(
+                        format!("the reference is to bank {bank}"),
+                        vec![upsert(
+                            AnnotationKind::References,
+                            json!({"bank": from.bank, "address": address(*from), "target_bank": bank}),
+                        )],
+                        &[],
+                    )
+                })
+                .collect();
+            // A data read in a switchable window can read whichever bank is
+            // switched in there.
+            let window = analysis.insns.get(from).and_then(|insn| {
+                let window = 0x8000 + window_index(insn.value)? as u32 * BANK_SIZE as u32;
+                analysis.window_read(*from, window).ok().map(|_| window)
+            });
+            if let Some(window) = window {
+                suggestions.push(suggestion(
+                    format!(
+                        "the instruction reads whichever bank is switched in at {} at run time (tables of the same layout in several banks)",
+                        Address(window)
+                    ),
                     vec![upsert(
                         AnnotationKind::References,
-                        json!({"bank": from.bank, "address": address(*from), "target_bank": bank}),
+                        json!({"bank": from.bank, "address": address(*from),
+                               "target_window": Address(window).to_string()}),
                     )],
                     &[],
-                )
-            })
-            .collect(),
+                ));
+            }
+            suggestions
+        }
         Fix::SwitchBanks { routine, banks } => {
             let mut fields = entry(*routine);
             fields.remove("keeps_banks");

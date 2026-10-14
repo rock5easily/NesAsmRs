@@ -171,7 +171,8 @@ From these values it also follows:
   the region to add (`pointers`, or `low_bytes` with its `pair`, and
   `adjust: -1` for RTS jumps).
 
-Annotations take precedence: `references` over the banks a path knows,
+Annotations take precedence: `references` with `target_bank` over the banks
+a path knows (with `target_window`, the bank a path knows is used),
 `entry_points` with `no_return`, `inline_bytes`, `switch_banks` or `keeps_banks` over what a
 routine is found to do, and regions over jump tables found after a JSR.
 Writes to $8000-$FFFF are mapper registers: their operands are numbers
@@ -284,14 +285,17 @@ writes it as one change:
   `reformatted` tells that a file was not in that form before.
 - Each write appends a line to `<name>.disasm.log.jsonl` beside the file: the
   time, the operations with their evidence, the SHA-256 before and after, and
-  PRG totals (instructions, code, data and unknown bytes, issues) before and
-  after. The result gives the same `log_entry`, also for a dry run or
+  PRG totals (instructions, code, data and unknown bytes, issues, dynamic
+  references) before and after. The result gives the same `log_entry`, also for a dry run or
   `inline` annotations (then nothing is written and the changed
   `annotations` are returned).
 - The result also gives the summaries before and after, `verification`, and
   the issues resolved, introduced and changed (`issues_changed`: reported
   before and after with another message, with its `previous_message`),
-  matched by `id`.
+  matched by `id`, and the dynamic references added and removed
+  (`dynamic_references_added`, `dynamic_references_removed`, when there are
+  any). An `unresolved_bank` settled by `target_window` is among the issues
+  resolved, and its id is the `issue_id` of the added reference.
 
 Only files named `*.disasm.json` inside the root and outside hidden
 directories are written (also after following links; a link to a file or
@@ -300,10 +304,12 @@ directory that does not exist is refused), with their log.
 ## Annotation file
 
 - `rom`: the ROM file relative to the root: `.nes` (iNES) or a raw `.bin`.
-- `format_version`: 2 when entries give `evidence` or `status` (`annotate`
-  writes it then, and leaves it out otherwise); absent for 1. Versions of
-  nesasm before format 2 cannot read such files; a version newer than this one
-  reads is an error.
+- `format_version`: 3 when `references` give `target_window`, 2 when entries
+  give `evidence` or `status` (`annotate` writes the lowest that fits, and
+  leaves it out otherwise); absent for 1. Versions of nesasm before format 2
+  cannot read files of format 2, and versions before format 3 refuse files
+  of format 3 (they do not ignore `target_window`); a version newer than this
+  one reads (3) is an error.
 - Every entry of the lists below may also give `evidence`, the observations
   that support it (an array of strings, not written into the source), and
   `status`: `confirmed` (default) or `hypothesis`. A hypothesis is kept with
@@ -358,9 +364,13 @@ directory that does not exist is refused), with their log.
 - `operands`: `[{"address", "bank", "expr"}]` replaces the operand of the
   instruction (`#LOW(Table)`, `<ptr+1`, `[ptr],y`) or a data value at the
   address. The round-trip check catches expressions that change the bytes.
-- `references`: `[{"address", "bank", "target_bank"}]` selects the bank of a
-  reference (instruction or table entry at `address`) to an address several
-  banks hold.
+- `references`: `[{"address", "bank", "target_bank" | "target_window"}]`.
+  `target_bank` selects the bank of a reference (instruction or table entry
+  at `address`) to an address several banks hold. `target_window` (`"$8000"`
+  or `"$A000"`) instead records a data read from whichever bank is switched
+  in at that window at run time (see Dynamic references below); it needs
+  `evidence` and `format_version` 3. An entry gives one of the two, and one
+  instruction has one entry.
 - `options`: `uppercase` (mnemonics, default false), `data_per_line`
   (default 8), `address_comments` (append `; $C000`), `auto_ram_labels`
   (`zp_10`, `ram_0300`), `nes_registers` (PPUCTRL ... JOY2, default true),
@@ -369,6 +379,61 @@ directory that does not exist is refused), with their log.
   exceed 512 KiB), `mapper4_fixed_prg_16k`
   (mapper 4: the last two PRG banks as one range at $C000-$FFFF, see above;
   default false).
+
+### Dynamic references
+
+Some routines read tables of the same layout from whichever PRG bank they
+switched in, such as stage data that every stage bank holds at the same
+addresses. Such a read has no single bank: `target_bank` would fix it to one,
+and a comment would not tell it from a reference not analysed yet. A
+`references` entry with `target_window` confirms it as dynamic.
+
+For example, a routine at $D829 in bank 30 (Rockman 5) saves the $A000 bank
+request $F6, sets $F6 from the stage's bank number in $27 and calls the
+routine at $FF43, which writes $F6 to MMC3 R7 ($A000-$BFFF). It then reads
+five tables of the stage bank (`lda $AD00,y` ... `lda $B100,y`) and restores
+$F6:
+
+```json
+"format_version": 3,
+"references": [
+  {"bank": 30, "address": "$D849", "target_window": "$A000",
+   "evidence": ["$D829-$D82E save $F6 and set it from StageDataBank ($27)",
+                "$D830 JSR $FF43 (SetPrgBanks): $FF53-$FF5E write $F6 to MMC3 R7 ($A000-$BFFF)",
+                "$D89B-$D89E restore $F6; every stage bank holds the tile and attribute tables at $AD00-$B1FF"]},
+  {"bank": 30, "address": "$D84F", "target_window": "$A000", "evidence": ["..."]},
+  {"bank": 30, "address": "$D855", "target_window": "$A000", "evidence": ["..."]},
+  {"bank": 30, "address": "$D85B", "target_window": "$A000", "evidence": ["..."]},
+  {"bank": 30, "address": "$D861", "target_window": "$A000", "evidence": ["..."]}
+]
+```
+
+With `annotate`, upsert each item (kind `references`) with the evidence.
+
+- Only data reads with an absolute operand (`lda $AD00`, `lda $AD00,y`,
+  `cmp $AD00,x` ...) whose operand is in the window (`$8000`-`$9FFF` or
+  `$A000`-`$BFFF`). Writes (`sta`, `inc` ...), jumps, calls, branches,
+  indirect jumps, immediate and zero page operands are refused, as are other
+  windows, an operand outside the window, an entry with both `target_bank`
+  and `target_window`, and an entry without evidence.
+- The read is not an `unresolved_bank` issue. It is listed in the report's
+  `dynamic_references` (`id` `dynamic_reference:30:$D849`, the `issue_id`
+  it would otherwise have, the instruction's `bank` and `address`, the
+  `target` read, the `window`, the `candidate_banks` the layout places at the
+  window holding the target, `known_bank`, `traced`, the `routine`, the source
+  `line` and the `evidence`). Other reads of the same tables without the
+  annotation stay `unresolved_bank`.
+- The target is not fixed to a bank. If every traced path to the instruction
+  knows the same bank switched in at the window, the reference uses it, as
+  without the annotation (`known_bank`, and the source names the target in
+  that bank); otherwise the operand stays a number (`lda $AD00,y`), and no
+  bank's byte is taken as the value read. The bytes of the tables are not
+  marked as data: describe them with `regions` in each bank.
+- The source line keeps the instruction's bytes and says
+  `; dynamic: reads the bank switched in at $A000` (with
+  `(bank N on every path traced)` when known). `xrefs` gives the reference
+  with `window`, so it is not taken for a reference to one bank; an address
+  query (`"$AD00"`) and the labels of the banks the window can hold find it.
 
 Names use letters, digits and `_`, do not start with a digit and are at most
 64 characters. `A`, `X`, `Y`, expression function names and assembler symbols
@@ -401,6 +466,9 @@ in bank 1 overlap`, `banks[2]: Bank 9 is not a PRG bank of the ROM`.
   `chr: "db"`, each CHR bank is `.bank`, `.org $0000` and `.db` lines instead
   (a bank file of its own when split), and there is no CHR file.
 - Writes to $8000-$FFFF (mapper registers) keep numeric operands.
+- Dynamic references (`target_window`) keep numeric operands unless every
+  traced path knows the bank, with `; dynamic: reads the bank switched in at
+  $A000` at the end of the line.
 - Instructions and directives are indented by one tab; labels, constants and
   comments start the line.
 - Paths in `.include` and `.incbin` are relative to the project root.
@@ -453,7 +521,8 @@ so the code after the JSR is not followed: give its `inline_bytes`),
 be followed, but other paths run code that cannot: give it `switch_banks` if
 it always does),
 `unresolved_bank` (add `references`, or the `banks` entry the message names
-for a bank switched in where the layout does not place it), `outside_rom`
+for a bank switched in where the layout does not place it; a read meant to
+follow the bank switched in is a dynamic reference), `outside_rom`
 (code in RAM or SRAM is called), `flow_leaves_rom` (code runs off a bank),
 `mapper_write` (a write to $8000-$FFFF, usually bank switching; MMC3 writes
 are explained), and `unknown_range` (bytes not described; padding runs are
@@ -478,7 +547,8 @@ Issues whose settlement the analysis can shape have `suggestions`, each one
 alternative: `description`, the `operations` to give `annotate` together,
 `needs` (fields left null that the analysis cannot determine, such as a
 table's `length`) and `evidence_required`. `unresolved_bank` suggests a
-`banks` entry, or a `references` entry per bank holding the address;
+`banks` entry, or a `references` entry per bank holding the address and, for
+a data read in $8000-$BFFF, one with `target_window`;
 `bank_switch` the routine's `switch_banks`; `return_address` its
 `inline_bytes` or `no_return`; `jump_table` a `pointers` region; and
 `indirect_jump` through tables a `pointers` region, or `low_bytes` and
@@ -505,9 +575,13 @@ instructions. A jump table after a JSR has at most 128 entries.
 ## Queries
 
 `disassemble` returns the first 20 issues; `issues` selects a `kind`,
-`offset` and `limit`. `view` returns the source lines of `from`-`to` (default
-256 bytes) with their bytes. `xrefs` lists the references to each label,
-symbol or address. `routines` lists code reached from each entry without
+`offset` and `limit`. Confirmed dynamic references are returned apart from
+the issues, as `dynamic_references` (the first 20 when there are any;
+`dynamic_references` with `offset` and `limit` pages them), and counted in
+the summary's `dynamic_references`. `view` returns the source lines of
+`from`-`to` (default 256 bytes) with their bytes. `xrefs` lists the
+references to each label, symbol or address; a dynamic reference has the
+`window` it reads through. `routines` lists code reached from each entry without
 following calls (also into the next bank), with callers, calls and the RAM
 it reads and writes; a routine is followed for up to 16384 instructions and
 marked `truncated` beyond. `ram` lists addresses outside the ROM with read
@@ -525,5 +599,8 @@ they were confirmed (the baseline too); the report's `hypotheses` gives their
 `baseline` (`annotations` or `inline`, with `offset` and `limit`) analyses
 other annotations of the ROM, such as a copy of an earlier version, and
 returns their `inputs`, `summary` and the issues resolved, introduced and
-changed since, matched by `id`. A baseline that cannot be analysed fails the
+changed since, matched by `id`, with the dynamic references added and
+removed since (`dynamic_references_added`, `dynamic_references_removed`,
+when there are any; matched by `id`, each with the `issue_id` it settles).
+A baseline that cannot be analysed fails the
 request; one whose ROM or base ROM has other contents is a warning.

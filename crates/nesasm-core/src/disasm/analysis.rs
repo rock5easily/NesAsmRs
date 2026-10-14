@@ -2,7 +2,7 @@
 //! points, references and names.
 
 use super::config::{
-    self, Address, CommentPosition, DisasmConfig, JOY2, NES_REGISTERS, RegionType,
+    self, Address, CommentPosition, DisasmConfig, JOY2, NES_REGISTERS, RegionType, Status,
 };
 use super::flow::{self, State, Summaries, Summary};
 use super::{Issue, IssueKind, RomFormat, XrefKind};
@@ -662,6 +662,53 @@ pub(crate) enum Target {
     Rom(Loc),
     Ambiguous(u32),
     Outside(u32),
+    /// An address in the bank switched in at run time (`target_window`).
+    Dynamic(u32),
+}
+
+/// A data read through a switchable window (`references.target_window`).
+#[derive(Clone, Debug)]
+pub(crate) struct DynamicRef {
+    /// CPU address of the window ($8000 or $A000).
+    pub window: u32,
+    /// The operand address.
+    pub target: u32,
+    pub evidence: Vec<String>,
+    pub status: Status,
+}
+
+/// Whether `mnemonic` writes its memory operand.
+pub(crate) fn writes(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Sta
+            | Mnemonic::Stx
+            | Mnemonic::Sty
+            | Mnemonic::Inc
+            | Mnemonic::Dec
+            | Mnemonic::Asl
+            | Mnemonic::Lsr
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+    )
+}
+
+/// Why `insn` is not a data read with an absolute operand, which
+/// `references.target_window` describes.
+pub(crate) fn data_read(insn: Insn) -> Result<(), String> {
+    let name = insn.mnemonic.name().to_ascii_uppercase();
+    match (insn.mnemonic, insn.mode) {
+        (Mnemonic::Jsr | Mnemonic::Jmp, _) | (_, Mode::Rel) => Err(format!(
+            "{name} transfers control; target_window applies only to data reads"
+        )),
+        (m, _) if writes(m) => Err(format!(
+            "{name} writes its operand; target_window applies only to data reads"
+        )),
+        (_, Mode::Abs | Mode::Ax | Mode::Ay) => Ok(()),
+        _ => Err(format!(
+            "{name} has no absolute operand ($xxxx, $xxxx,X or $xxxx,Y); target_window applies only to them"
+        )),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -725,6 +772,11 @@ pub(crate) struct Analysis {
     /// Routines whose code exceeds [`MAX_ROUTINE`] instructions.
     pub truncated: HashSet<Loc>,
     references: HashMap<Loc, usize>,
+    /// Data reads through a switchable window, by instruction.
+    pub dynamic: BTreeMap<Loc, DynamicRef>,
+    /// For each of them traced: the bank every path found switched in, or
+    /// `None` when a path did not know it (or knew another).
+    dynamic_seen: HashMap<Loc, Option<usize>>,
     /// Banks of references found by following the bank switches (and
     /// `bank_table`), by referring location.
     inferred: HashMap<Loc, usize>,
@@ -833,6 +885,8 @@ impl Analysis {
             routine_index: HashMap::new(),
             truncated: HashSet::new(),
             references: HashMap::new(),
+            dynamic: BTreeMap::new(),
+            dynamic_seen: HashMap::new(),
             inferred: HashMap::new(),
             entries: HashMap::new(),
             flow: HashMap::new(),
@@ -1062,21 +1116,52 @@ impl Analysis {
             .enumerate()
             .filter(|(_, e)| config.applies(*e))
         {
-            match self.memory.locate(reference.bank, reference.address) {
-                Ok(loc)
-                    if self
-                        .memory
-                        .banks
-                        .get(reference.target_bank)
-                        .is_some_and(|b| !b.chr) =>
-                {
-                    self.references.insert(loc, reference.target_bank);
+            let what = format!("references[{i}] {}", reference.address);
+            let loc = match reference
+                .check()
+                .and_then(|()| self.memory.locate(reference.bank, reference.address))
+            {
+                Ok(loc) => loc,
+                Err(e) => {
+                    errors.push(format!("{what}: {e}"));
+                    continue;
                 }
-                Ok(_) => errors.push(format!(
-                    "references[{i}] {}: bank {} is not a PRG bank of the ROM",
-                    reference.address, reference.target_bank
-                )),
-                Err(e) => errors.push(format!("references[{i}] {}: {e}", reference.address)),
+            };
+            // A fixed bank and a window for one instruction contradict.
+            let other = if reference.target_window.is_some() {
+                self.references.contains_key(&loc) || self.dynamic.contains_key(&loc)
+            } else {
+                self.dynamic.contains_key(&loc)
+            };
+            if other {
+                errors.push(format!(
+                    "{what}: another references entry names the same instruction (bank {}); give target_bank or target_window in one entry",
+                    loc.bank
+                ));
+                continue;
+            }
+            match (reference.target_bank, reference.target_window) {
+                (Some(bank), _) if self.memory.banks.get(bank).is_some_and(|b| !b.chr) => {
+                    self.references.insert(loc, bank);
+                }
+                (Some(bank), _) => {
+                    errors.push(format!("{what}: bank {bank} is not a PRG bank of the ROM"));
+                }
+                (None, Some(window)) => match self.window_read(loc, window.0) {
+                    Ok(target) => {
+                        self.dynamic.insert(
+                            loc,
+                            DynamicRef {
+                                window: window.0,
+                                target,
+                                evidence: reference.evidence.clone(),
+                                status: reference.status,
+                            },
+                        );
+                    }
+                    Err(e) => errors.push(format!("{what}: {e}")),
+                },
+                (None, None) => {}
             }
         }
         self.apply_regions(config, &mut errors);
@@ -1282,8 +1367,55 @@ impl Analysis {
         }
     }
 
+    /// The operand address of the instruction at `loc`, if it is a data
+    /// read that `references.target_window` can give the window at `window`.
+    pub fn window_read(&self, loc: Loc, window: u32) -> Result<u32, String> {
+        let insn = flow::Code::insn(self, loc)
+            .ok_or("the bytes there are not an NMOS 6502 instruction")?;
+        data_read(insn)?;
+        let end = window + BANK_SIZE as u32;
+        if !(window..end).contains(&insn.value) {
+            return Err(format!(
+                "the operand ${:04X} is outside the window ${window:04X}-${:04X}",
+                insn.value,
+                end - 1
+            ));
+        }
+        Ok(insn.value)
+    }
+
+    /// The location of `address` in PRG bank `bank`, if it holds it.
+    fn in_prg_bank(&self, bank: usize, address: u32) -> Option<Loc> {
+        match self.memory.resolve(Some(bank), address) {
+            Resolved::Rom(loc) if loc.bank == bank => Some(loc),
+            _ => None,
+        }
+    }
+
+    /// The bank every traced path of a data read through a window found
+    /// switched in, if any.
+    pub fn dynamic_bank(&self, from: Loc) -> Option<usize> {
+        self.dynamic_seen.get(&from).copied().flatten()
+    }
+
+    /// Whether the code was traced through a data read through a window.
+    pub fn dynamic_traced(&self, from: Loc) -> bool {
+        self.dynamic_seen.contains_key(&from)
+    }
+
     /// The bank a reference from `from` to `address` uses.
     pub fn target_of(&self, from: Loc, address: u32) -> Target {
+        // The bank switched in at run time: a bank only when every path
+        // knew the same one.
+        if self.dynamic.contains_key(&from) {
+            return match self
+                .dynamic_bank(from)
+                .and_then(|bank| self.in_prg_bank(bank, address))
+            {
+                Some(loc) => Target::Rom(loc),
+                None => Target::Dynamic(address),
+            };
+        }
         if let Some(&bank) = self.references.get(&from) {
             return match self.memory.resolve(Some(bank), address) {
                 Resolved::Rom(loc) if loc.bank == bank => Target::Rom(loc),
@@ -1321,6 +1453,17 @@ impl Analysis {
     /// Like [`Self::resolve_from`], for an instruction on a path where the
     /// banks at $8000 and $A000 may be known.
     fn resolve_with(&mut self, from: Loc, address: u32, state: &State) -> Target {
+        if self.dynamic.contains_key(&from) {
+            let known = window_index(address)
+                .and_then(|w| state.window(w))
+                .and_then(|bank| self.memory.in_bank(bank, address))
+                .map(|loc| loc.bank);
+            let seen = self.dynamic_seen.entry(from).or_insert(known);
+            if *seen != known {
+                *seen = None;
+            }
+            return self.target_of(from, address);
+        }
         if !self.references.contains_key(&from)
             && let Some(window) = window_index(address)
             && let Some(bank) = state.window(window)
@@ -2502,18 +2645,7 @@ impl Analysis {
             (_, Mode::Rel) => XrefKind::Branch,
             // Its pointer; the trace follows or reports where it goes.
             (Mnemonic::Jmp, _) => XrefKind::Read,
-            (
-                Mnemonic::Sta
-                | Mnemonic::Stx
-                | Mnemonic::Sty
-                | Mnemonic::Inc
-                | Mnemonic::Dec
-                | Mnemonic::Asl
-                | Mnemonic::Lsr
-                | Mnemonic::Rol
-                | Mnemonic::Ror,
-                _,
-            ) => XrefKind::Write,
+            (m, _) if writes(m) => XrefKind::Write,
             _ => XrefKind::Read,
         };
         let zero_page = matches!(
@@ -2936,6 +3068,13 @@ impl flow::Code for Analysis {
     }
 
     fn target(&self, from: Loc, address: u32, windows: [Option<u8>; 2]) -> Option<Loc> {
+        // Only the bank known to be switched in: the bytes of the others
+        // are not what the read gets.
+        if self.dynamic.contains_key(&from) {
+            return window_index(address)
+                .and_then(|w| windows[w])
+                .and_then(|bank| self.memory.in_bank(bank, address));
+        }
         if let Some(&bank) = self.references.get(&from) {
             return match self.memory.resolve(Some(bank), address) {
                 Resolved::Rom(loc) if loc.bank == bank => Some(loc),

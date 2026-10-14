@@ -356,9 +356,30 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
   `export_disassembly` は推測を適用しません。`annotate` は、推測を適用した注釈と適用しない注釈の両方が
   有効であることを確かめ、試行の解析で書き込む場合は推測なしの往復検証も一致することを求めます。
   操作で足した根拠も上限の検査をします。
-- 互換性のため、`evidence` か `status` を使う注釈にだけ `format_version: 2` を書きます。旧版は
-  未知の欄として拒否し、新しい版は自分が読めるより新しい版を原因がわかるエラーで拒否します。
+- 互換性のため、`evidence` か `status` を使う注釈にだけ `format_version: 2` を、`references` の
+  `target_window` を使う注釈にだけ `format_version: 3` を書きます（`canonical_json` は必要な最小の版を
+  書きます）。旧版は未知の欄として拒否し、新しい版は自分が読めるより新しい版を原因がわかるエラーで
+  拒否します。`target_window` を黙って無視して単なる未解決参照として扱う版はありません。
   `evidence` は1項目64件・1件2000文字までです。
+
+`references` の `target_window`（`"$8000"`／`"$A000"`）は、実行時に切り替えた窓のバンクを読む
+データ参照（複数のバンクに同じ配置で置いたステージデータなど）を「確認済みの動的参照」として記録します。
+`target_bank` と排他で、`evidence` が必須です（`ReferenceDef::check`。注釈の読み込み時と `annotate` の
+`upsert` で検査します）。対象は絶対アドレス（`$xxxx`、`$xxxx,X`、`$xxxx,Y`）を読む命令で、オペランドが
+窓の中にあるものに限ります。書き込み・JSR／JMP・分岐・間接ジャンプ・即値・ゼロページは拒否します
+（`analysis::data_read`）。
+
+- 解析は `Target::Dynamic` として扱い、`unresolved_bank` を出しません。参照先を特定のバンクに固定せず、
+  `flow::Code::target` もその命令からは窓のバンクが判明している場合だけROMのバイトを返すので、
+  どの候補バンクのバイトも読み取り値の定数になりません。追跡したすべての経路が同じバンクを窓に
+  入れていた場合（`dynamic_seen`）だけ、注釈がない場合と同じくそのバンクで解決します（`known_bank`）。
+- 生成ソースはオペランドを数値のまま書き（バンク固有のラベルにしない）、行末に
+  `; dynamic: reads the bank switched in at $A000` を付けます。命令のバイトは変わりません。
+- `Disassembly::dynamic_references` が命令位置・読むアドレス・窓・候補バンク・根拠・置き換えた課題の
+  `issue_id`（`unresolved_bank:30:$D849`）を返し、`Summary::dynamic_references` が件数を数えます。
+  `Xref::window` で特定バンクへの参照と区別します。`compare_dynamic_references` が2つの解析の動的参照を
+  `id`（`dynamic_reference:30:$D849`）で照合し、MCPの `annotate` と `baseline` が追加・削除を返します。
+- `unresolved_bank` の修正案に、窓の中を読む命令なら `target_window` の案を加えます。
 
 課題は `id`（`種類:bank:アドレス`、bankがなければ `-`、例 `unresolved_bank:30:$DEB1`）を持ちます。
 ヘッダの課題はどれも $0000 なので主題（`nes2`／`trainer`／`size`／`partial_bank`）を加えます。

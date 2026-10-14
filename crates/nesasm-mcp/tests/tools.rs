@@ -1284,3 +1284,227 @@ fn annotate_checks_the_annotations_without_the_hypotheses_too() {
         "{r}"
     );
 }
+
+/// An MMC3 ROM whose fixed bank reads $A000, which banks 1 and 3 hold
+/// with different bytes, from whichever is switched in.
+fn stage_rom(c: &mut Client) -> Vec<u8> {
+    let source = concat!(
+        "  .inesprg 3\n  .inesmap 4\n",
+        "  .bank 1\n  .org $A000\n  .db $11\n  .bank 3\n  .org $A000\n  .db $33\n",
+        "  .bank 5\n  .org $E000\n",
+        "Reset:\n  lda $A000\n  sta <$10\nLoop:\n  jmp Loop\nNmi:\n  rti\n",
+        "  .org $FFFA\n  .dw Nmi, Reset, Nmi\n",
+    );
+    let r = c.call(
+        "assemble",
+        json!({"input":"src/stage.asm","sources":{"src/stage.asm":source},"output":"stage.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    std::fs::read(c.root.join("stage.nes")).unwrap()
+}
+
+#[test]
+fn dynamic_references_are_annotated_reported_and_exported() {
+    let mut c = Client::start();
+    let original = stage_rom(&mut c);
+    let plain = r#"{"rom": "stage.nes"}"#;
+    c.write("stage.disasm.json", plain);
+    let r = c.call("disassemble", json!({"annotations":"stage.disasm.json"}));
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(
+        report["issues"]["items"][0]["id"],
+        "unresolved_bank:5:$E000"
+    );
+    assert!(report.get("dynamic_references").is_none(), "{r}");
+    let suggestions = report["issues"]["items"][0]["suggestions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        suggestions[2]["operations"][0]["item"],
+        json!({"bank": 5, "address": "$E000", "target_window": "$A000"})
+    );
+
+    // A read through the window is refused without evidence, and for an
+    // instruction that is not a data read.
+    let digest = nesasm_core::disasm::sha256_hex(plain.as_bytes());
+    let op = |address: &str| {
+        json!([{"op": "upsert", "kind": "references",
+                "item": {"address": address, "target_window": "$A000"}}])
+    };
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"stage.disasm.json","operations":op("$E000"),"expected_sha256":digest}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(Client::messages(&r).contains("give evidence"), "{r}");
+    let mut jump = op("$E005");
+    jump[0]["evidence"] = json!("x");
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"stage.disasm.json","operations":jump,"expected_sha256":digest}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains(
+            "references[0] $E005: JMP transfers control; target_window applies only to data reads"
+        ),
+        "{r}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(c.root.join("stage.disasm.json")).unwrap(),
+        plain
+    );
+
+    // With evidence it is written as format 3 and logged; the issue is
+    // resolved and the dynamic reference added.
+    let evidence = "Reset switches in the stage bank at $A000; banks 1 and 3 hold the table";
+    let mut ops = op("$E000");
+    ops[0]["evidence"] = json!(evidence);
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"stage.disasm.json","operations":ops,"expected_sha256":digest}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["written"], true);
+    let written = std::fs::read_to_string(c.root.join("stage.disasm.json")).unwrap();
+    assert_eq!(
+        written,
+        concat!(
+            "{\n",
+            "  \"rom\": \"stage.nes\",\n",
+            "  \"format_version\": 3,\n",
+            "  \"references\": [\n",
+            "    {\"bank\":5,\"address\":\"$E000\",\"target_window\":\"$A000\",\"evidence\":[\"Reset switches in the stage bank at $A000; banks 1 and 3 hold the table\"]}\n",
+            "  ]\n",
+            "}\n",
+        )
+    );
+    assert_eq!(
+        report["issues_resolved"]["items"][0]["id"],
+        "unresolved_bank:5:$E000"
+    );
+    let added = &report["dynamic_references_added"];
+    assert_eq!(added["total"], 1, "{r}");
+    assert_eq!(added["items"][0]["issue_id"], "unresolved_bank:5:$E000");
+    assert!(report.get("dynamic_references_removed").is_none(), "{r}");
+    assert_eq!(report["summary_after"]["dynamic_references"], 1);
+    let log = std::fs::read_to_string(c.root.join("stage.disasm.log.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["operations"][0]["evidence"], evidence);
+    assert_eq!(entry["before"]["dynamic_references"], 0);
+    assert_eq!(entry["after"]["dynamic_references"], 1);
+    let text = Client::text(&r);
+    for line in [
+        "Dynamic references added: 1",
+        "  bank 5 $E000: reads $A000 in the bank switched in at $A000 (banks 1, 3) (issue unresolved_bank:5:$E000)",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("After: ") && l.ends_with(", 1 dynamic references")),
+        "{text}"
+    );
+
+    // The report lists it apart from the issues, the view and xrefs show it,
+    // and the baseline comparison tells the change.
+    let r = c.call(
+        "disassemble",
+        json!({"annotations":"stage.disasm.json","baseline":{"inline":{"rom":"stage.nes"}},
+               "view":{"bank":5,"from":"$E000","to":"$E002"},"xrefs":["$A000"]}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    // The tables stay unknown bytes: the read marks no bank's bytes as data.
+    let kinds: Vec<&Value> = report["issues"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| &i["kind"])
+        .collect();
+    assert_eq!(
+        kinds,
+        [&json!("unknown_range"), &json!("unknown_range")],
+        "{r}"
+    );
+    let dynamic = &report["dynamic_references"];
+    assert_eq!(dynamic["total"], 1);
+    let item = &dynamic["items"][0];
+    assert_eq!(item["id"], "dynamic_reference:5:$E000");
+    assert_eq!(item["address"], "$E000");
+    assert_eq!(item["target"], "$A000");
+    assert_eq!(item["window"], "$A000");
+    assert_eq!(item["candidate_banks"], json!([1, 3]));
+    assert_eq!(item["evidence"], json!([evidence]));
+    assert_eq!(item["traced"], true);
+    assert_eq!(
+        report["view"]["items"][1]["text"],
+        "\tlda $A000 ; dynamic: reads the bank switched in at $A000"
+    );
+    assert_eq!(report["view"]["items"][1]["bytes"], "AD 00 A0");
+    let xref = &report["xrefs"]["$A000"][0];
+    assert_eq!(xref["window"], "$A000");
+    assert_eq!(xref["kind"], "read");
+    let baseline = &report["baseline"];
+    assert_eq!(
+        baseline["issues_resolved"]["items"][0]["id"],
+        "unresolved_bank:5:$E000"
+    );
+    assert_eq!(baseline["dynamic_references_added"]["total"], 1);
+    assert!(baseline.get("dynamic_references_removed").is_none(), "{r}");
+    let text = Client::text(&r);
+    for line in [
+        "Dynamic references added: 1",
+        "Dynamic references (confirmed, not issues): 1",
+        "  bank 5 $E000: reads $A000 in the bank switched in at $A000 (banks 1, 3)",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+
+    // The exported source keeps the instruction's bytes and reassembles to
+    // the ROM.
+    let r = c.call(
+        "export_disassembly",
+        json!({"annotations":"stage.disasm.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let source = std::fs::read_to_string(c.root.join("stage.asm")).unwrap();
+    assert!(
+        source.contains("\tlda $A000 ; dynamic: reads the bank switched in at $A000"),
+        "{source}"
+    );
+    let r = c.call("check", json!({"input":"stage.asm"}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = c.call(
+        "assemble",
+        json!({"input":"stage.asm","output":"rebuilt/stage.nes"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        std::fs::read(c.root.join("rebuilt/stage.nes")).unwrap(),
+        original
+    );
+
+    // Removing the annotation brings the issue back.
+    let digest = nesasm_core::disasm::sha256_hex(written.as_bytes());
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"stage.disasm.json","dry_run":true,"expected_sha256":digest,
+               "operations":[{"op":"remove","kind":"references","key":{"address":"$E000"}}]}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["dynamic_references_removed"]["total"], 1, "{r}");
+    assert_eq!(
+        report["issues_introduced"]["items"][0]["id"],
+        "unresolved_bank:5:$E000"
+    );
+}

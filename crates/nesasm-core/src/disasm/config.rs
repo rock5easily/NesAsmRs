@@ -86,8 +86,9 @@ impl JsonSchema for Address {
 pub struct DisasmConfig {
     /// ROM file relative to the project root: .nes with an iNES header, or a raw .bin.
     pub rom: PathBuf,
-    /// The version of the annotation format: 2 when entries give `evidence`
-    /// or `status` (which older versions of nesasm cannot read); absent for 1.
+    /// The version of the annotation format: 3 when references give
+    /// `target_window`, 2 when entries give `evidence` or `status` (which
+    /// older versions of nesasm cannot read); absent for 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format_version: Option<u32>,
     /// For a raw .bin fragment: the CPU address of its first byte. Required
@@ -151,7 +152,9 @@ pub enum Status {
 }
 
 /// The newest annotation format this version reads.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+/// The CPU windows whose bank `references.target_window` can name.
+pub const SWITCHABLE_WINDOWS: [u32; 2] = [0x8000, 0xa000];
 /// Evidence strings per entry, and characters per string.
 pub const MAX_EVIDENCE: usize = 64;
 pub const MAX_EVIDENCE_TEXT: usize = 2000;
@@ -265,8 +268,12 @@ impl DisasmConfig {
         self.apply_hypotheses || entry.status() == Status::Confirmed
     }
 
-    /// Whether an entry gives `evidence` or `status`, which needs format 2.
-    pub(crate) fn needs_format_2(&self) -> bool {
+    /// The format version the annotations need: 3 when a reference gives
+    /// `target_window`, 2 when an entry gives `evidence` or `status`.
+    pub(crate) fn required_format(&self) -> Option<u32> {
+        if self.references.iter().any(|r| r.target_window.is_some()) {
+            return Some(3);
+        }
         let config = self;
         let mut found = false;
         each_list!(config, _name, list, [&] => {
@@ -274,7 +281,7 @@ impl DisasmConfig {
                 .iter()
                 .any(|e| !e.evidence().is_empty() || e.status() != Status::Confirmed);
         });
-        found
+        found.then_some(2)
     }
 
     /// Errors in the format version and the evidence of the entries.
@@ -305,6 +312,11 @@ impl DisasmConfig {
                 }
             }
         });
+        for (i, reference) in self.references.iter().enumerate() {
+            if let Err(e) = reference.check() {
+                errors.push(format!("references[{i}] {}: {e}", reference.address));
+            }
+        }
         errors
     }
 }
@@ -552,8 +564,18 @@ pub struct ReferenceDef {
     pub bank: Option<usize>,
     /// Address of the referring instruction or pointer.
     pub address: Address,
-    /// Bank holding the referenced address.
-    pub target_bank: usize,
+    /// Bank holding the referenced address. Give this or `target_window`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bank: Option<usize>,
+    /// For an instruction that reads data from whichever PRG bank is
+    /// switched in at run time (tables of the same layout in several
+    /// banks): the CPU window, "$8000" or "$A000", that holds the operand
+    /// address. The reference is not fixed to a bank: the source keeps the
+    /// address as a number, and the bytes of no bank are taken as the value
+    /// read. Only for reads with an absolute operand (`lda $AD00,y`), not
+    /// writes, jumps or calls. Needs `evidence` and format_version 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_window: Option<Address>,
     /// What was observed that supports the entry (callers, the code that
     /// reads a table, documentation), one observation per string.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -561,6 +583,26 @@ pub struct ReferenceDef {
     /// `hypothesis`: not confirmed yet; the analysis applies it only on request.
     #[serde(default, skip_serializing_if = "is_default")]
     pub status: Status,
+}
+
+impl ReferenceDef {
+    /// Errors of the entry by itself: one of `target_bank` and
+    /// `target_window`, a switchable window, evidence for a window.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        match (self.target_bank, self.target_window) {
+            (Some(_), Some(_)) => Err(
+                "give target_bank (a fixed bank) or target_window (the bank switched in at run time), not both".into(),
+            ),
+            (None, None) => Err("give target_bank or target_window".into()),
+            (None, Some(window)) if !SWITCHABLE_WINDOWS.contains(&window.0) => Err(format!(
+                "target_window {window} is not a switchable window; give \"$8000\" or \"$A000\""
+            )),
+            (None, Some(_)) if !self.evidence.iter().any(|e| !e.trim().is_empty()) => Err(
+                "target_window needs evidence: how the bank is switched in and why it varies".into(),
+            ),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]

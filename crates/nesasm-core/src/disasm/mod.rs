@@ -16,7 +16,7 @@ mod render;
 pub use config::{
     Address, BankLayout, ChrMode, CommentDef, CommentPosition, DisasmConfig, DisasmOptions,
     EntryPoint, FORMAT_VERSION, LabelDef, MAX_EVIDENCE, MAX_EVIDENCE_TEXT, OperandDef, PatchDef,
-    ReferenceDef, RegionDef, RegionType, Status, SymbolDef,
+    ReferenceDef, RegionDef, RegionType, SWITCHABLE_WINDOWS, Status, SymbolDef,
 };
 pub use edit::{
     AnnotationKind, Applied, EntryKey, Operation, OperationKind, Suggestion, apply_operations,
@@ -242,6 +242,89 @@ pub fn compare_issues(before: &[Issue], after: &[Issue]) -> IssueComparison {
     }
 }
 
+/// A data read from whichever PRG bank is switched in at a CPU window at
+/// run time, as `references.target_window` gives it: a reference confirmed
+/// to be dynamic rather than an unresolved one, so not an issue.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct DynamicReference {
+    /// Identifies the reference across analyses:
+    /// `"dynamic_reference:30:$D849"` (the bank and address of the
+    /// instruction).
+    pub id: String,
+    /// The `unresolved_bank` issue the reference would be without the
+    /// annotation (when several banks hold the address).
+    pub issue_id: String,
+    /// The bank and address of the reading instruction.
+    pub bank: usize,
+    pub address: Address,
+    /// The address it reads (the operand; indexed reads add X or Y).
+    pub target: Address,
+    /// The CPU window ($8000 or $A000) whose bank is read.
+    pub window: Address,
+    /// PRG banks the layout places at the window: the banks the read can
+    /// reach, depending on which is switched in.
+    pub candidate_banks: Vec<usize>,
+    /// The bank every traced path to the instruction found switched in, if
+    /// they agree; the source then names the target in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_bank: Option<usize>,
+    /// Whether code flow reaches the instruction; otherwise the annotation
+    /// has no effect yet.
+    pub traced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routine: Option<String>,
+    /// The source line of the instruction; empty in a ROM hack's unchanged ranges.
+    pub line: String,
+    /// The evidence of the annotation.
+    pub evidence: Vec<String>,
+    /// `hypothesis` when the annotation is one applied on request.
+    #[serde(default, skip_serializing_if = "is_confirmed")]
+    pub status: Status,
+}
+
+fn is_confirmed(status: &Status) -> bool {
+    *status == Status::Confirmed
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// How the dynamic references of two analyses differ, matched by id.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct DynamicComparison {
+    /// References only the second analysis confirms as dynamic (their
+    /// `issue_id` is among the issues resolved when the first reported it).
+    pub added: Vec<DynamicReference>,
+    /// References only the first analysis confirms as dynamic.
+    pub removed: Vec<DynamicReference>,
+}
+
+/// Compares the dynamic references of two analyses of a ROM by id.
+pub fn compare_dynamic_references(
+    before: &[DynamicReference],
+    after: &[DynamicReference],
+) -> DynamicComparison {
+    let ids = |refs: &[DynamicReference]| -> BTreeSet<String> {
+        refs.iter().map(|r| r.id.clone()).collect()
+    };
+    let (old, new) = (ids(before), ids(after));
+    DynamicComparison {
+        added: after
+            .iter()
+            .filter(|r| !old.contains(&r.id))
+            .cloned()
+            .collect(),
+        removed: before
+            .iter()
+            .filter(|r| !new.contains(&r.id))
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Gives each issue its id (see [`Issue::id`]). Two issues of a kind at one
 /// place from one path are not expected; should they occur, the further
 /// ones get `#2`, `#3` in report order.
@@ -323,6 +406,10 @@ pub struct Summary {
     pub routines: usize,
     /// Number of issues of each kind.
     pub issues: BTreeMap<IssueKind, usize>,
+    /// Number of data reads confirmed to go through a switchable window
+    /// (`references.target_window`), which are not issues.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dynamic_references: usize,
     /// For a ROM hack: how it differs from the base ROM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<DiffSummary>,
@@ -413,6 +500,11 @@ pub struct Xref {
     pub bank: usize,
     pub address: Address,
     pub kind: XrefKind,
+    /// For a read through a switchable window (`references.target_window`):
+    /// the window. The reference is to whichever bank is switched in there,
+    /// not to one bank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<Address>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routine: Option<String>,
     /// The referring source line; empty in a ROM hack's unchanged ranges.
@@ -682,6 +774,7 @@ impl Disassembly {
             labels: a.labels.values().map(Vec::len).sum(),
             routines: a.routines.len(),
             issues,
+            dynamic_references: a.dynamic.len(),
             diff: self.patches.as_ref().map(|p| DiffSummary {
                 changed_bytes: p.changed.iter().flatten().filter(|c| **c).count(),
                 ranges: p.ranges.iter().map(Vec::len).sum(),
@@ -921,11 +1014,21 @@ impl Disassembly {
             } else {
                 None
             };
-        let matches = |target: &Target| match target {
+        let matches = |r: &analysis::Ref| match &r.target {
             Target::Rom(loc) => {
                 rom.contains(loc) || address.is_some_and(|v| v.0 == a.memory.address(*loc))
             }
             Target::Ambiguous(v) => address.is_some_and(|a| a.0 == *v),
+            // A label of a bank the window can hold, or the address.
+            Target::Dynamic(v) => {
+                address.is_some_and(|a| a.0 == *v)
+                    || rom.iter().any(|loc| {
+                        a.memory.address(*loc) == *v
+                            && a.dynamic
+                                .get(&r.from)
+                                .is_some_and(|d| a.memory.banks[loc.bank].org == d.window)
+                    })
+            }
             Target::Outside(v) => {
                 symbol.is_some_and(|s| *v >= s.value && *v < s.value + s.size)
                     || address.is_some_and(|a| a.0 == *v)
@@ -934,9 +1037,47 @@ impl Disassembly {
         let lines = self.line_map();
         Ok(a.refs
             .iter()
-            .filter(|r| matches(&r.target))
+            .filter(|r| matches(r))
             .map(|r| self.xref(r, &lines))
             .collect())
+    }
+
+    /// The data reads confirmed to go through a switchable window
+    /// (`references.target_window`), in bank and address order.
+    pub fn dynamic_references(&self) -> Vec<DynamicReference> {
+        let a = &self.analysis;
+        let lines = self.line_map();
+        a.dynamic
+            .iter()
+            .map(|(loc, d)| {
+                let at = Address(a.memory.address(*loc));
+                let traced = a.dynamic_traced(*loc);
+                DynamicReference {
+                    id: format!("dynamic_reference:{}:{at}", loc.bank),
+                    issue_id: format!("unresolved_bank:{}:{at}", loc.bank),
+                    bank: loc.bank,
+                    address: at,
+                    target: Address(d.target),
+                    window: Address(d.window),
+                    candidate_banks: a
+                        .memory
+                        .holders(d.target)
+                        .into_iter()
+                        .filter(|b| a.memory.banks[*b].org == d.window)
+                        .collect(),
+                    known_bank: a.dynamic_bank(*loc),
+                    traced,
+                    routine: a.routine_of(*loc).map(|h| self.name(h)),
+                    line: if traced {
+                        self.line_at(*loc, &lines)
+                    } else {
+                        String::new()
+                    },
+                    evidence: d.evidence.clone(),
+                    status: d.status,
+                }
+            })
+            .collect()
     }
 
     /// Source lines that produce bytes, by bank and address.
@@ -949,27 +1090,32 @@ impl Disassembly {
             .collect()
     }
 
-    fn xref(&self, r: &analysis::Ref, lines: &BTreeMap<(usize, u32), &SourceLine>) -> Xref {
-        let a = &self.analysis;
-        let at = a.memory.address(r.from);
+    /// The text of the source line covering `loc`.
+    fn line_at(&self, loc: Loc, lines: &BTreeMap<(usize, u32), &SourceLine>) -> String {
+        let at = self.analysis.memory.address(loc);
         // A ROM hack's unchanged ranges have no source lines.
         let included = self
             .patches
             .as_ref()
-            .is_some_and(|p| p.range_at(r.from).is_none());
-        let line = lines
-            .range(..=(r.from.bank, at))
+            .is_some_and(|p| p.range_at(loc).is_none());
+        lines
+            .range(..=(loc.bank, at))
             .next_back()
             .filter(|_| !included)
-            .filter(|((bank, start), l)| *bank == r.from.bank && at < start + l.size as u32)
+            .filter(|((bank, start), l)| *bank == loc.bank && at < start + l.size as u32)
             .map(|(_, l)| l.text.trim().to_owned())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    fn xref(&self, r: &analysis::Ref, lines: &BTreeMap<(usize, u32), &SourceLine>) -> Xref {
+        let a = &self.analysis;
         Xref {
             bank: r.from.bank,
-            address: Address(at),
+            address: Address(a.memory.address(r.from)),
             kind: r.kind,
+            window: a.dynamic.get(&r.from).map(|d| Address(d.window)),
             routine: a.routine_of(r.from).map(|h| self.name(h)),
-            line,
+            line: self.line_at(r.from, lines),
         }
     }
 

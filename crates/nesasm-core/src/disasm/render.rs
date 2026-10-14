@@ -1,11 +1,11 @@
 //! NESASM source from an analysis. Every byte of the ROM is emitted in
 //! order, so the source reassembles to the same ROM.
 
-use super::analysis::{Analysis, Class, FILL_RUN, Insn, Label, Loc, Region, Target};
+use super::analysis::{Analysis, Class, FILL_RUN, Insn, Label, Loc, Region, Target, writes};
 use super::config::{ChrMode, RegionType};
 use super::patch::Patches;
 use super::{Address, RomFormat, SourceLine};
-use crate::opcode::{Mnemonic, Mode};
+use crate::opcode::Mode;
 use crate::state::BANK_SIZE;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -614,6 +614,17 @@ impl Writer<'_> {
         if self.a.options.address_comments {
             parts.push(hex4(self.a.memory.address(loc)));
         }
+        // A data read through a window: the address is a number, not a
+        // label of one bank.
+        if let Some(d) = self.a.dynamic.get(&loc) {
+            parts.push(match self.a.dynamic_bank(loc) {
+                Some(bank) => format!(
+                    "dynamic: reads the bank switched in at {} (bank {bank} on every path traced)",
+                    hex4(d.window)
+                ),
+                None => format!("dynamic: reads the bank switched in at {}", hex4(d.window)),
+            });
+        }
         for inner in self.covered(loc, size) {
             if let Some((_, line)) = self.a.comments.get(&inner) {
                 parts.extend(line.iter().cloned());
@@ -708,19 +719,7 @@ impl Writer<'_> {
             _ => {
                 // A write to $8000-$FFFF goes to the mapper, not to the ROM
                 // byte a label would name.
-                let mapper = value >= 0x8000
-                    && matches!(
-                        insn.mnemonic,
-                        Mnemonic::Sta
-                            | Mnemonic::Stx
-                            | Mnemonic::Sty
-                            | Mnemonic::Inc
-                            | Mnemonic::Dec
-                            | Mnemonic::Asl
-                            | Mnemonic::Lsr
-                            | Mnemonic::Rol
-                            | Mnemonic::Ror
-                    );
+                let mapper = value >= 0x8000 && writes(insn.mnemonic);
                 let expr = if mapper {
                     hex4(value)
                 } else {
@@ -741,7 +740,7 @@ impl Writer<'_> {
     fn target(&mut self, from: Loc, value: u32) -> String {
         match self.a.target_of(from, value) {
             Target::Rom(t) => self.rom_name(t),
-            Target::Ambiguous(_) => None,
+            Target::Ambiguous(_) | Target::Dynamic(_) => None,
             Target::Outside(v) => self.symbol(v),
         }
         .unwrap_or_else(|| hex4(value))
@@ -903,7 +902,7 @@ impl Writer<'_> {
         let name = match self.a.target_of(from, target as u32) {
             Target::Rom(t) => self.rom_name(t),
             Target::Outside(v) => self.symbol(v),
-            Target::Ambiguous(_) => None,
+            Target::Ambiguous(_) | Target::Dynamic(_) => None,
         }?;
         Some(adjusted(&name, adjust))
     }
