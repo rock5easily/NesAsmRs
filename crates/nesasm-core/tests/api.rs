@@ -487,6 +487,25 @@ fn an_incbin_into_many_chr_banks() {
 }
 
 #[test]
+fn a_line_after_a_full_bank_starts_in_the_next_bank() {
+    let t = Temp::new();
+    t.write("tail.bin", [1; 9000]);
+    let mut request = t.request(Default::default());
+    request.collect_lines = true;
+    t.write(
+        "test.asm",
+        "  .bank 0\n  .org $E000\n  .ds 8192\n  .incbin \"tail.bin\"\n",
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    let line = r.lines.iter().find(|l| l.text.contains("incbin")).unwrap();
+    assert_eq!(line.bank, Some(1));
+    assert_eq!(line.rom_range(), Some(8192..17192));
+    let banks: Vec<u8> = (0..4).filter(|b| line.in_bank(*b)).collect();
+    assert_eq!(banks, [1, 2]);
+}
+
+#[test]
 fn disassembly_names_branches_and_symbols_in_other_banks() {
     let t = Temp::new();
     let r = t.run(concat!(

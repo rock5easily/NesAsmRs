@@ -648,13 +648,19 @@ impl<'a> Engine<'a> {
     /// Adds `line` to the line map of the result.
     fn record_line(&mut self, line: &Line, start: Position, section: Section, bytes: &[u8]) {
         const SHOWN_BYTES: usize = 64;
+        // At the end of a full bank, the bytes start in the next bank.
+        let bank = if !bytes.is_empty() && start.offset >= BANK_SIZE {
+            start.bank + 1
+        } else {
+            start.bank
+        };
         self.result.lines.push(LineRecord {
             location: line.location(),
             called_from: line.expanded.then(|| line.trace.last().cloned()).flatten(),
             bank: if section.is_ram() {
                 None
             } else {
-                u8::try_from(start.bank).ok()
+                u8::try_from(bank).ok()
             },
             address: start.pc() as u32,
             bytes: bytes[..bytes.len().min(SHOWN_BYTES)].to_vec(),
