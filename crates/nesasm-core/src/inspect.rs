@@ -135,9 +135,16 @@ impl Rom {
 
     /// The ROM of a successful assembly.
     pub fn from_assembly(result: &AssembleResult) -> Self {
+        let header = InesHeader::parse(&result.header).ok();
+        // CHR banks are not in the CPU's address space, whatever addresses
+        // an INCBIN that continues into them counts.
+        let prg_banks = header.as_ref().map_or(usize::MAX, |h| {
+            usize::from(h.prg_16k) * PRG_UNIT / BANK_SIZE
+        });
         let vector_banks = result
             .banks
             .iter()
+            .filter(|bank| bank.bank < prg_banks)
             .filter(|bank| {
                 bank.segments.iter().any(|s| {
                     let start = s.start as u32;
@@ -147,7 +154,7 @@ impl Rom {
             .map(|bank| bank.bank)
             .collect();
         Self {
-            header: InesHeader::parse(&result.header).ok(),
+            header,
             payload: result.binary.clone(),
             vector_banks,
             header_bytes: result.header.clone(),

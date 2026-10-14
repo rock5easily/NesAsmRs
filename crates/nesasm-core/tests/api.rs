@@ -453,6 +453,59 @@ fn rom_warnings() {
 }
 
 #[test]
+fn an_incbin_into_many_chr_banks() {
+    let t = Temp::new();
+    // From $0000 in bank 2, the addresses of the twelfth CHR bank (13) are
+    // $E000-$FFFF.
+    t.write("chr.bin", [0x41; 12 * 8192]);
+    let mut request = t.request(Default::default());
+    request.collect_lines = true;
+    t.write(
+        "test.asm",
+        concat!(
+            "  .inesprg 1\n  .ineschr 12\n",
+            "  .bank 1\n  .org $FFFA\n  .dw $E000, $E000, $E000\n",
+            "  .bank 2\n  .org $0000\n  .incbin \"chr.bin\"\n",
+        ),
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    // The line is in each bank its bytes reach.
+    let line = r.lines.iter().find(|l| l.text.contains("incbin")).unwrap();
+    assert_eq!(line.rom_range(), Some(2 * 8192..14 * 8192));
+    let banks: Vec<u8> = (0..16).filter(|b| line.in_bank(*b)).collect();
+    assert_eq!(banks, (2..14).collect::<Vec<u8>>());
+    // CHR banks hold no interrupt vectors.
+    let rom = Rom::from_assembly(&r);
+    let banks: Vec<usize> = rom.vectors().iter().map(|v| v.bank).collect();
+    assert_eq!(banks, [1]);
+    let warnings = rom.warnings();
+    assert!(
+        !warnings.iter().any(|w| w.contains("vector")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_line_after_a_full_bank_starts_in_the_next_bank() {
+    let t = Temp::new();
+    t.write("tail.bin", [1; 9000]);
+    let mut request = t.request(Default::default());
+    request.collect_lines = true;
+    t.write(
+        "test.asm",
+        "  .bank 0\n  .org $E000\n  .ds 8192\n  .incbin \"tail.bin\"\n",
+    );
+    let r = nesasm_core::assemble(&request);
+    assert!(r.success, "{:?}", r.diagnostics);
+    let line = r.lines.iter().find(|l| l.text.contains("incbin")).unwrap();
+    assert_eq!(line.bank, Some(1));
+    assert_eq!(line.rom_range(), Some(8192..17192));
+    let banks: Vec<u8> = (0..4).filter(|b| line.in_bank(*b)).collect();
+    assert_eq!(banks, [1, 2]);
+}
+
+#[test]
 fn disassembly_names_branches_and_symbols_in_other_banks() {
     let t = Temp::new();
     let r = t.run(concat!(
@@ -701,9 +754,9 @@ fn write_disassembly_protects_split_sources_and_chr() {
     let kinds: Vec<ArtifactKind> = write().unwrap().iter().map(|a| a.kind).collect();
     assert_eq!(
         kinds,
-        // The main file, a file per bank (including the CHR bank) and the CHR file.
+        // The main file (which includes the CHR file), a file per PRG bank
+        // and the CHR file.
         [
-            ArtifactKind::Source,
             ArtifactKind::Source,
             ArtifactKind::Source,
             ArtifactKind::Source,
@@ -1151,6 +1204,103 @@ fn export_disassembly_replaces_a_chr_file_of_changed_banks_with_the_whole_chr() 
         fs::read_to_string(t.0.join("game.asm")).unwrap(),
         generated(&body)
     );
+}
+
+#[test]
+fn export_disassembly_removes_old_chr_bank_files() {
+    let t = Temp::new();
+    let r = t.run(concat!(
+        "  .inesprg 1
+  .ineschr 2
+  .bank 1
+  .org $FFFA
+  .dw 0, 0, 0
+",
+        "  .bank 2
+  .db 1
+  .bank 3
+  .db 2
+",
+    ));
+    assert!(r.success, "{:?}", r.diagnostics);
+    let mut rom = r.header.clone();
+    rom.extend(&r.binary);
+    t.write("game.nes", &rom);
+    let never = AtomicBool::new(false);
+    let config =
+        nesasm_core::disasm::parse_config(r#"{"options": {"split_banks": true}}"#).unwrap();
+    let new = nesasm_core::disasm::disassemble(&rom, None, &config, Path::new("game.asm"), &never)
+        .unwrap();
+    let rebuilt = || {
+        let request = nesasm_core::AssembleRequest {
+            input: "game.asm".into(),
+            working_directory: t.0.clone(),
+            ..Default::default()
+        };
+        let r = nesasm_core::assemble(&request);
+        assert!(r.success, "{:?}", r.diagnostics);
+        let mut rom = r.header.clone();
+        rom.extend(&r.binary);
+        rom
+    };
+    // The files of earlier versions: a bank file per CHR bank, each
+    // including its part of the CHR file.
+    let body = new.text().split_once('\n').unwrap().1;
+    let (main, chr) = body
+        .split_once(
+            "
+	.bank 2
+	.org $0000
+	.incbin \"game.chr\"
+",
+        )
+        .unwrap();
+    assert!(chr.is_empty(), "{chr}");
+    let write_old = || {
+        t.write(
+            "game.asm",
+            generated(&format!(
+                "{main}	.include \"game_bank02.asm\"
+	.include \"game_bank03.asm\"
+"
+            )),
+        );
+        t.write(
+            "game_bank02.asm",
+            generated(
+                "	.bank 2
+	.incbin \"game.chr\", 0, 8192
+",
+            ),
+        );
+        t.write(
+            "game_bank03.asm",
+            generated(
+                "	.bank 3
+	.incbin \"game.chr\", 8192, 8192
+",
+            ),
+        );
+        for (path, text) in &new.files()[1..] {
+            t.write(&path.to_string_lossy(), text);
+        }
+        t.write("game.chr", new.chr_file().unwrap().1);
+    };
+    write_old();
+    assert_eq!(rebuilt(), rom);
+    let e = nesasm_core::export_disassembly(&new, &t.0, Some(&t.0), Path::new("game.nes"), &never)
+        .unwrap();
+    assert_eq!(
+        file_names(e.artifacts.iter().map(|a| a.path.as_path())),
+        ["game.asm", "game_bank00.asm", "game_bank01.asm", "game.chr"]
+    );
+    assert_eq!(
+        file_names(e.removed.iter().map(|p| p.as_path())),
+        ["game_bank02.asm", "game_bank03.asm"]
+    );
+    let main = fs::read_to_string(t.0.join("game.asm")).unwrap();
+    assert_eq!(main.replace("\r\n", "\n"), new.text());
+    assert_eq!(rebuilt(), rom);
 }
 
 fn file_names<'a>(paths: impl Iterator<Item = &'a Path>) -> Vec<String> {

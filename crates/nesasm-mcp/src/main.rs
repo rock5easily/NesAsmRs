@@ -101,7 +101,8 @@ struct LineQuery {
     from_line: Option<usize>,
     /// Last source line number (inclusive).
     to_line: Option<usize>,
-    /// Only lines placed in this ROM bank.
+    /// Only lines placed in this ROM bank (a line that continues into the
+    /// next banks, such as a large INCBIN, is in each of them).
     bank: Option<u8>,
     /// First CPU address (inclusive), as a number (49152 for $C000).
     from_address: Option<u32>,
@@ -672,7 +673,7 @@ impl Server {
             .filter(|r| file.is_none_or(|f| Self::relative(root, &r.location.file) == f))
             .filter(|r| query.from_line.is_none_or(|l| r.location.line >= l))
             .filter(|r| query.to_line.is_none_or(|l| r.location.line <= l))
-            .filter(|r| query.bank.is_none_or(|b| r.bank == Some(b)))
+            .filter(|r| query.bank.is_none_or(|b| r.in_bank(b)))
             .filter(|r| query.from_address.is_none_or(|a| r.address >= a))
             .filter(|r| query.to_address.is_none_or(|a| r.address <= a))
             .collect();
