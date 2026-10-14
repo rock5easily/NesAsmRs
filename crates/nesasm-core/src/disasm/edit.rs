@@ -654,7 +654,11 @@ pub fn apply_operations(
         });
     }
     // Evidence added by the operations is within the limits too.
-    for error in config.check_format() {
+    for error in config
+        .check_format()
+        .into_iter()
+        .chain(config.check_entries())
+    {
         errors.push(format!("In the changed annotations: {error}"));
     }
     if !errors.is_empty() {

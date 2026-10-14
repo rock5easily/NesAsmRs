@@ -415,7 +415,10 @@ With `annotate`, upsert each item (kind `references`) with the evidence.
   `$A000`-`$BFFF`). Writes (`sta`, `inc` ...), jumps, calls, branches,
   indirect jumps, immediate and zero page operands are refused, as are other
   windows, an operand outside the window, an entry with both `target_bank`
-  and `target_window`, and an entry without evidence.
+  and `target_window`, and an entry without evidence. So are bytes the
+  analysis finds to be data (a region, inline arguments) or inside another
+  instruction. An entry at bytes no code reaches is kept but has no effect
+  yet (`traced: false`).
 - The read is not an `unresolved_bank` issue. It is listed in the report's
   `dynamic_references` (`id` `dynamic_reference:30:$D849`, the `issue_id`
   it would otherwise have, the instruction's `bank` and `address`, the

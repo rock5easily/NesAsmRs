@@ -669,6 +669,8 @@ pub(crate) enum Target {
 /// A data read through a switchable window (`references.target_window`).
 #[derive(Clone, Debug)]
 pub(crate) struct DynamicRef {
+    /// Index of the `references` entry, for errors.
+    pub index: usize,
     /// CPU address of the window ($8000 or $A000).
     pub window: u32,
     /// The operand address.
@@ -837,6 +839,7 @@ impl Analysis {
             let mut analysis = Self::new(file, config, joins, summaries)?;
             analysis.trace_all(cancel)?;
             if analysis.new_joins.is_empty() || round == MAX_ROUNDS {
+                analysis.check_dynamic()?;
                 analysis.name_labels()?;
                 analysis.find_routines();
                 analysis.report_unknown();
@@ -1152,6 +1155,7 @@ impl Analysis {
                         self.dynamic.insert(
                             loc,
                             DynamicRef {
+                                index: i,
                                 window: window.0,
                                 target,
                                 evidence: reference.evidence.clone(),
@@ -1384,6 +1388,32 @@ impl Analysis {
         Ok(insn.value)
     }
 
+    /// Errors of data reads through a window whose bytes the analysis
+    /// found to be data or inside another instruction.
+    fn check_dynamic(&self) -> Result<(), Vec<String>> {
+        let errors: Vec<String> = self
+            .dynamic
+            .iter()
+            .filter_map(|(loc, d)| {
+                let what = match self.class[loc.bank][loc.offset] {
+                    Class::Data => "data (a region or inline arguments)",
+                    Class::Operand => "inside another instruction",
+                    _ => return None,
+                };
+                Some(format!(
+                    "references[{}] {}: the bytes there are {what}, not an instruction; target_window applies only to data reads",
+                    d.index,
+                    Address(self.memory.address(*loc))
+                ))
+            })
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// The location of `address` in PRG bank `bank`, if it holds it.
     fn in_prg_bank(&self, bank: usize, address: u32) -> Option<Loc> {
         match self.memory.resolve(Some(bank), address) {
@@ -1454,6 +1484,11 @@ impl Analysis {
     /// banks at $8000 and $A000 may be known.
     fn resolve_with(&mut self, from: Loc, address: u32, state: &State) -> Target {
         if self.dynamic.contains_key(&from) {
+            // Only paths that reach it: code regions also decode bytes no
+            // path reaches, knowing nothing.
+            if !self.arrivals.contains_key(&from) {
+                return self.target_of(from, address);
+            }
             let known = window_index(address)
                 .and_then(|w| state.window(w))
                 .and_then(|bank| self.memory.in_bank(bank, address))

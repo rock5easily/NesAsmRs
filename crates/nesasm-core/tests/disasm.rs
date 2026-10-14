@@ -4910,3 +4910,118 @@ fn annotations_with_target_window_are_format_3() {
     assert_eq!(parsed.references[0].target_window, Some(Address(0xa000)));
     round_trip(&rom, &parsed);
 }
+
+#[test]
+fn dynamic_references_are_instructions_the_analysis_decodes() {
+    // $E003: bytes that decode as `lda $AD00,y` but follow a JMP; $E007:
+    // the operand of `lda $ADAD`, which decodes as `lda $ADAD` too.
+    let rom = switching_rom(
+        &stage_banks(),
+        "  jmp Next\nTable:\n  .db $B9, $00, $AD\nNext:\n  lda $ADAD\n  lda $ADAD\n",
+    );
+    let fails = |json: String| -> Vec<String> {
+        disasm::disassemble(&rom, None, &config(&json), Path::new("out.asm"), &NEVER)
+            .err()
+            .expect("the annotations should be refused")
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+    // Bytes a region describes as data.
+    assert_eq!(
+        fails(format!(
+            r#"{{"regions": [{{"start": "$E003", "length": 3, "type": "pointers"}}], "references": [{}]}}"#,
+            dynamic_entry("$E003")
+        )),
+        [
+            "references[0] $E003: the bytes there are data (a region or inline arguments), not an instruction; target_window applies only to data reads"
+        ]
+    );
+    // The operand bytes of an instruction.
+    assert_eq!(
+        fails(format!(r#"{{"references": [{}]}}"#, dynamic_entry("$E007"))),
+        [
+            "references[0] $E007: the bytes there are inside another instruction, not an instruction; target_window applies only to data reads"
+        ]
+    );
+    // Bytes no code reaches are accepted, but not traced.
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{"references": [{}]}}"#,
+            dynamic_entry("$E003")
+        )),
+    );
+    let found = d.dynamic_references();
+    assert!(!found[0].traced);
+    assert_eq!(found[0].line, "");
+}
+
+#[test]
+fn dynamic_references_in_code_regions_are_traced_only_when_reached() {
+    // A code region decodes the read after the RTS, which no path reaches.
+    let rom = switching_rom(
+        &stage_banks(),
+        "  lda #$03\n  sta <$F6\n  jsr Switch\n  jsr Read\n  jmp Halt\nRead:\n  lda $AD00\n  rts\n  lda $AE00\n  rts\n",
+    );
+    // Read: $E00D (lda $AD00), $E010 rts, $E011 (lda $AE00).
+    // The region starts at the RTS: a region's start is traced knowing
+    // nothing, so it would be a path that does not know the bank.
+    let regions = r#""regions": [{"start": "$E010", "length": 5, "type": "code"}]"#;
+    let d = round_trip(
+        &rom,
+        &config(&format!(
+            r#"{{{regions}, "references": [{}, {}]}}"#,
+            dynamic_entry("$E00D"),
+            dynamic_entry("$E011")
+        )),
+    );
+    let found: Vec<_> = d
+        .dynamic_references()
+        .into_iter()
+        .map(|r| (r.address.to_string(), r.traced, r.known_bank))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("$E00D".into(), true, Some(3)),
+            ("$E011".into(), false, None)
+        ]
+    );
+    assert_lines(
+        &d,
+        &[
+            "\tlda D_03_AD00 ; dynamic: reads the bank switched in at $A000 (bank 3 on every path traced)",
+            "\tlda $AE00 ; dynamic: reads the bank switched in at $A000",
+        ],
+    );
+}
+
+#[test]
+fn annotate_repairs_invalid_references() {
+    let rom = stage_rom();
+    // A file with a window but no evidence, as written by hand.
+    let invalid = config(
+        r#"{"rom": "stage.nes", "references": [{"bank": 7, "address": "$E009", "target_window": "$A000"}]}"#,
+    );
+    let removed = apply(
+        &rom,
+        &invalid,
+        serde_json::json!([{"op": "remove", "kind": "references", "key": {"address": "$E009"}}]),
+    );
+    assert!(removed.references.is_empty());
+    let replaced = apply(
+        &rom,
+        &invalid,
+        serde_json::json!([{"op": "upsert", "kind": "references",
+            "item": {"address": "$E009", "target_window": "$A000"}, "evidence": "read per stage"}]),
+    );
+    assert_eq!(replaced.references[0].evidence, ["read per stage"]);
+    // Kept as it is, it is still an error.
+    assert_eq!(
+        apply_errors(&rom, &invalid, serde_json::json!([])),
+        [
+            "In the changed annotations: references[0] $E009: target_window needs evidence: how the bank is switched in and why it varies"
+        ]
+    );
+}

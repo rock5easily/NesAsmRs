@@ -367,7 +367,10 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
 `target_bank` と排他で、`evidence` が必須です（`ReferenceDef::check`。注釈の読み込み時と `annotate` の
 `upsert` で検査します）。対象は絶対アドレス（`$xxxx`、`$xxxx,X`、`$xxxx,Y`）を読む命令で、オペランドが
 窓の中にあるものに限ります。書き込み・JSR／JMP・分岐・間接ジャンプ・即値・ゼロページは拒否します
-（`analysis::data_read`）。
+（`analysis::data_read`）。追跡後に、データ（領域・インライン引数）や他の命令の途中と判明したバイトへの指定も
+拒否します（`Analysis::check_dynamic`）。到達の有無（`traced`）と既知のバンクは、経路が到達した命令だけで
+記録します（`code` 領域が到達しない部分を解読する場合は数えません）。エントリ単体の検査（`check_entries`）は
+`annotate` では操作の適用後に行うので、不正な既存の項目も `remove`／`upsert` で直せます。
 
 - 解析は `Target::Dynamic` として扱い、`unresolved_bank` を出しません。参照先を特定のバンクに固定せず、
   `flow::Code::target` もその命令からは窓のバンクが判明している場合だけROMのバイトを返すので、

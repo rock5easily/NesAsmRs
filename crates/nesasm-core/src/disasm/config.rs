@@ -312,12 +312,21 @@ impl DisasmConfig {
                 }
             }
         });
-        for (i, reference) in self.references.iter().enumerate() {
-            if let Err(e) = reference.check() {
-                errors.push(format!("references[{i}] {}: {e}", reference.address));
-            }
-        }
         errors
+    }
+
+    /// Errors of entries by themselves (a `references` entry with one of
+    /// `target_bank` and `target_window`). Checked after operations, so
+    /// `annotate` can still repair or remove such an entry.
+    pub(crate) fn check_entries(&self) -> Vec<String> {
+        self.references
+            .iter()
+            .enumerate()
+            .filter_map(|(i, reference)| {
+                let e = reference.check().err()?;
+                Some(format!("references[{i}] {}: {e}", reference.address))
+            })
+            .collect()
     }
 }
 

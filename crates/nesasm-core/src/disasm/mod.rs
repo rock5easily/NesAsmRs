@@ -604,7 +604,8 @@ pub fn disassemble(
             ))]);
         }
     }
-    let errors_of_format = config.check_format();
+    let mut errors_of_format = config.check_format();
+    errors_of_format.extend(config.check_entries());
     if !errors_of_format.is_empty() {
         return Err(errors(errors_of_format));
     }
