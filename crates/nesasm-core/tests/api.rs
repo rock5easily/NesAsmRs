@@ -500,13 +500,8 @@ fn a_line_after_a_full_bank_starts_in_the_next_bank() {
     };
     // File data that runs past $FFFF continues at $8000 in the next bank.
     let r = lines(concat!(
-        "  .bank 0
-  .org $E000
-  .ds 8192
-Here:
-",
-        "  .incbin \"tail.bin\"
-",
+        "  .bank 0\n  .org $E000\n  .ds 8192\nHere:\n",
+        "  .incbin \"tail.bin\"\n",
     ));
     let line = r.iter().find(|l| l.text.contains("incbin")).unwrap();
     assert_eq!((line.bank, line.address), (Some(1), 0x8000));
@@ -516,15 +511,9 @@ Here:
     // A line without bytes stays where the full bank ends.
     let label = r.iter().find(|l| l.text == "Here:").unwrap();
     assert_eq!((label.bank, label.address), (Some(0), 0x10000));
-    // An instruction that CATBANK continues wraps to $0000.
-    let r = lines(
-        "  .catbank 0
-  .bank 0
-  .org $E000
-  .ds 8192
-  lda #1
-",
-    );
+    // CATBANK given after the bank is full: the instruction changes the bank
+    // when it is emitted, and wraps to $0000.
+    let r = lines("  .bank 0\n  .org $E000\n  .ds 8192\n  .catbank 0\n  lda #1\n");
     let line = r.iter().find(|l| l.text.contains("lda")).unwrap();
     assert_eq!((line.bank, line.address, line.size), (Some(1), 0x0000, 2));
     assert_eq!(line.rom_range(), Some(8192..8194));
