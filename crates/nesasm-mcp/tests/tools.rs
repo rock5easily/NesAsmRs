@@ -620,7 +620,7 @@ fn rom_hacks_become_patch_sources() {
         .replace("\r\n", "\n");
     // The whole base once (without its header), then the ranges over it.
     assert!(
-        source.contains("\t.bank 0\n\t.org $C000\n\t.incbin \"roms/base.nes\", 16, 16384\n"),
+        source.contains("\t.bank $00\n\t.org $C000\n\t.incbin \"roms/base.nes\", 16, 16384\n"),
         "{source}"
     );
     assert_eq!(source.matches(".incbin").count(), 1, "{source}");

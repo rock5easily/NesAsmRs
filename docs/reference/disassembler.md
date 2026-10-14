@@ -46,7 +46,7 @@ one PRG bank holds the address.
 
 For a ROM hack, give the original ROM as `base`. Only the ranges that differ
 from it become source. The main file includes the base ROM once, without its
-header (`.bank 0`, `.org`, `.incbin "base.nes", 16, size`), and the source
+header (`.bank $00`, `.org`, `.incbin "base.nes", 16, size`), and the source
 then writes each changed range over it with `.bank` and `.org`, so the
 source reassembles to the hack when the base ROM is present. The header comes
 from the hack. A bank without changes has no lines (and, when the source is
@@ -474,6 +474,9 @@ in bank 1 overlap`, `banks[2]: Bank 9 is not a PRG bank of the ROM`.
   $A000` at the end of the line.
 - Instructions and directives are indented by one tab; labels, constants and
   comments start the line.
+- `.bank` takes the bank number in two uppercase hexadecimal digits
+  (`.bank $1E` for bank 30), as `.catbank` does. Older versions wrote it in
+  decimal (`.bank 30`); their unedited bank files are still told by it.
 - Paths in `.include` and `.incbin` are relative to the project root.
 - Bank files are `<stem>_bankXX.asm`, with the bank number in two uppercase
   hexadecimal digits (`_bank0A.asm` for bank 10, `_bank3F.asm` for bank 63),

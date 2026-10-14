@@ -78,7 +78,7 @@ pub(crate) enum Role {
 /// The role of a generated source that has not been edited since. Bank
 /// files are told apart by their `.bank` line, not by their name: the
 /// decimal names of older versions (`_bank10` for bank 10) name other banks
-/// in hexadecimal.
+/// in hexadecimal. Older versions also wrote the `.bank` number in decimal.
 pub(crate) fn role(text: &str) -> Option<Role> {
     if !is_unedited(text) {
         return None;
@@ -87,8 +87,12 @@ pub(crate) fn role(text: &str) -> Option<Role> {
     if first.starts_with(SOURCE_LINE) {
         return Some(Role::Main);
     }
-    let bank = first.trim_start().strip_prefix(".bank ")?;
-    bank.trim().parse().ok().map(Role::Bank)
+    let bank = first.trim_start().strip_prefix(".bank ")?.trim();
+    match bank.strip_prefix('$') {
+        Some(hex) => usize::from_str_radix(hex, 16).ok(),
+        None => bank.parse().ok(),
+    }
+    .map(Role::Bank)
 }
 
 /// The `.include`d paths of a generated main source.
@@ -367,6 +371,11 @@ fn hex4(value: u32) -> String {
     format!("${value:04X}")
 }
 
+/// The `.bank` line of a bank, its number in hexadecimal like `.catbank`.
+fn bank_line(index: usize) -> String {
+    format!("{INDENT}.bank {}", hex2(index as u32))
+}
+
 impl Writer<'_> {
     fn push(&mut self, bank: usize, address: Option<u32>, size: usize, text: String) {
         let memory = &self.a.memory;
@@ -432,7 +441,7 @@ impl Writer<'_> {
                 self.boundary(index);
             } else {
                 self.push(index, None, 0, String::new());
-                self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+                self.push(index, None, 0, bank_line(index));
                 self.push(
                     index,
                     None,
@@ -452,7 +461,7 @@ impl Writer<'_> {
             if !continues {
                 self.push(index, None, 0, String::new());
                 if !opened {
-                    self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+                    self.push(index, None, 0, bank_line(index));
                 }
                 opened = true;
             }
@@ -548,7 +557,7 @@ impl Writer<'_> {
         }
         for (index, offset, file, size) in runs {
             let org = self.a.memory.banks[index].org + offset as u32;
-            self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+            self.push(index, None, 0, bank_line(index));
             self.push(index, None, 0, format!("{INDENT}.org {}", hex4(org)));
             let text = format!("{INDENT}.incbin \"{}\", {file}, {size}", patches.path);
             self.push(index, Some(org), size, text);
@@ -978,7 +987,7 @@ impl Writer<'_> {
                 file.extend_from_slice(&bank.data[bank.start..bank.end]);
             }
             self.push(first, None, 0, String::new());
-            self.push(first, None, 0, format!("{INDENT}.bank {first}"));
+            self.push(first, None, 0, bank_line(first));
             self.push(first, None, 0, format!("{INDENT}.org $0000"));
             let text = format!("{INDENT}.incbin \"{chr_name}\"");
             self.push(first, Some(0), file.len(), text);
@@ -990,7 +999,7 @@ impl Writer<'_> {
             let bank = &a.memory.banks[index];
             let data = &bank.data[bank.start..bank.end];
             self.push(index, None, 0, String::new());
-            self.push(index, None, 0, format!("{INDENT}.bank {index}"));
+            self.push(index, None, 0, bank_line(index));
             self.push(index, None, 0, format!("{INDENT}.org $0000"));
             let mut offset = 0;
             while offset < data.len() {
