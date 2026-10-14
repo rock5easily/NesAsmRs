@@ -789,7 +789,7 @@ fn write_disassembly_protects_split_sources_and_chr() {
     let bank = fs::read_to_string(t.0.join("game_bank01.asm")).unwrap();
     fs::write(
         t.0.join("game_bank01.asm"),
-        bank.replace(".bank 1", ".bank 1 ; mine"),
+        bank.replace(".bank $01", ".bank $01 ; mine"),
     )
     .unwrap();
     let e = write().unwrap_err();
@@ -896,9 +896,13 @@ fn write_old_format(t: &Temp, d: &nesasm_core::disasm::Disassembly, dir: &str) {
                     let bank = decimal(rest.trim_end_matches(".asm\""));
                     format!("  .include \"{dir}game_bank{bank:02}.asm\"\n")
                 }
-                None => match line.strip_prefix('\t') {
-                    Some(rest) => format!("  {rest}\n"),
-                    None => format!("{line}\n"),
+                // Older versions wrote the bank number in decimal.
+                None => match line.strip_prefix("\t.bank $") {
+                    Some(bank) => format!("  .bank {}\n", decimal(bank)),
+                    None => match line.strip_prefix('\t') {
+                        Some(rest) => format!("  {rest}\n"),
+                        None => format!("{line}\n"),
+                    },
                 },
             })
             .collect();
@@ -954,7 +958,7 @@ fn export_disassembly_migrates_decimal_bank_file_names() {
         (16, "game_bank10.asm"),
         (17, "game_bank11.asm"),
     ] {
-        assert_eq!(first_body_line(&t, name), format!("\t.bank {bank}"));
+        assert_eq!(first_body_line(&t, name), format!("\t.bank ${bank:02X}"));
     }
     for b in 12..18 {
         assert!(!t.0.join(format!("game_bank{b}.asm")).exists());
@@ -1031,7 +1035,7 @@ fn export_disassembly_does_not_mix_up_banks_of_old_names() {
         fs::read_to_string(t.0.join("game_bank13.asm")).unwrap(),
         edited
     );
-    assert_eq!(first_body_line(&t, "game_bank11.asm"), "\t.bank 17");
+    assert_eq!(first_body_line(&t, "game_bank11.asm"), "\t.bank $11");
     // An unedited bank file is not replaced by a main source.
     let bank0 = fs::read(t.0.join("game_bank00.asm")).unwrap();
     fs::write(t.0.join("other.asm"), &bank0).unwrap();
@@ -1099,7 +1103,7 @@ fn export_disassembly_migrates_files_with_long_paths() {
         .unwrap();
     assert_eq!(e.removed.len(), 6, "{:?}", e.removed);
     let text = fs::read_to_string(t.0.join(&dir).join("game_bank10.asm")).unwrap();
-    assert_eq!(text.lines().nth(1), Some("\t.bank 16"));
+    assert_eq!(text.lines().nth(1), Some("\t.bank $10"));
 }
 
 /// A mapper 4 ROM hack and its base, of four PRG banks and a CHR bank; the
@@ -1181,8 +1185,8 @@ fn export_disassembly_replaces_a_chr_file_of_changed_banks_with_the_whole_chr() 
         )
         .replace("\"base.nes\", 16, 16384", "\"base.nes\", 16, 32768")
         .replace(
-            "\t.bank 2\n\t.org $0000\n\t.incbin \"game.chr\"\n",
-            "\t.bank 3\n\t.org $0000\n\t.incbin \"game.chr\", 0, 8192\n",
+            "\t.bank $02\n\t.org $0000\n\t.incbin \"game.chr\"\n",
+            "\t.bank $03\n\t.org $0000\n\t.incbin \"game.chr\", 0, 8192\n",
         );
     assert!(
         body.contains("16, 32768") && body.contains("0, 8192"),
@@ -1263,7 +1267,7 @@ fn export_disassembly_removes_old_chr_bank_files() {
     let (main, chr) = body
         .split_once(
             "
-	.bank 2
+	.bank $02
 	.org $0000
 	.incbin \"game.chr\"
 ",
@@ -1354,7 +1358,7 @@ fn export_disassembly_replaces_old_chr_and_pair_bank_files() {
     let write_old = || {
         let old = disassemble(r#"{"base": "base.nes", "options": {"split_banks": true}}"#);
         let body = old.text().split_once('\n').unwrap().1;
-        let (main, chr) = body.split_once("\n\n\t.bank 4\n").unwrap();
+        let (main, chr) = body.split_once("\n\n\t.bank $04\n").unwrap();
         t.write(
             "game.asm",
             generated(&format!("{main}\n\t.include \"game_bank04.asm\"\n")),
@@ -1389,7 +1393,7 @@ fn export_disassembly_replaces_old_chr_and_pair_bank_files() {
     // An edited old bank file is kept; the unedited ones are removed.
     write_old();
     let bank3 = fs::read_to_string(t.0.join("game_bank03.asm")).unwrap();
-    let edited = bank3.replace(".bank 3", ".bank 3 ; mine");
+    let edited = bank3.replace(".bank $03", ".bank $03 ; mine");
     fs::write(t.0.join("game_bank03.asm"), &edited).unwrap();
     let e = export(&new).unwrap();
     assert_eq!(

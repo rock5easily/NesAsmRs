@@ -361,7 +361,7 @@ fn references_choose_between_banks_at_one_address() {
         &d,
         &[
             "; Assemble with -raw (no iNES header).",
-            "\t.bank 3",
+            "\t.bank $03",
             "\tjsr $8000",
         ],
     );
@@ -376,7 +376,7 @@ fn references_choose_between_banks_at_one_address() {
     assert_lines(
         &d,
         &[
-            "\t.bank 1",
+            "\t.bank $01",
             "\t.org $8000",
             "sub_01_8000:",
             "\tlda #$01",
@@ -397,7 +397,7 @@ fn fragments_are_placed_at_their_load_address() {
         &d,
         &[
             "PPUCTRL         = $2000",
-            "\t.bank 0",
+            "\t.bank $00",
             "\t.org $0300",
             "Start:",
             "\tlda #$00",
@@ -433,11 +433,11 @@ fn chr_banks_are_included_or_written_as_data() {
         let d = round_trip(&rom, &config(json));
         assert!(
             d.text()
-                .ends_with("\n\n\t.bank 2\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+                .ends_with("\n\n\t.bank $02\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
             "{}",
             d.text()
         );
-        assert!(!d.text().contains("\t.bank 3"), "{}", d.text());
+        assert!(!d.text().contains("\t.bank $03"), "{}", d.text());
         assert!(
             d.files()[1..]
                 .iter()
@@ -456,10 +456,10 @@ fn chr_banks_are_included_or_written_as_data() {
     assert_lines(
         &d,
         &[
-            "\t.bank 2",
+            "\t.bank $02",
             "\t.org $0000",
             "\t.db $00, $00, $00, $01",
-            "\t.bank 3",
+            "\t.bank $03",
             "\t.org $0000",
             "\t.db $AA, $AB, $AB, $AB",
         ],
@@ -704,7 +704,7 @@ fn large_sources_are_split_into_bank_files() {
         ],
     );
     let bank1 = &d.files()[2].1;
-    assert!(bank1.lines().nth(1) == Some("\t.bank 1"), "{bank1}");
+    assert!(bank1.lines().nth(1) == Some("\t.bank $01"), "{bank1}");
     assert!(
         d.files()
             .iter()
@@ -760,11 +760,11 @@ fn rom_hacks_disassemble_only_the_changes() {
             "; Labels in the unchanged ranges",
             "L_E00B          = $E00B",
             // The whole base without its header, then each range at its address.
-            "\t.bank 0",
+            "\t.bank $00",
             "\t.org $C000",
             "\t.incbin \"base.nes\", 16, 16384",
             "",
-            "\t.bank 1",
+            "\t.bank $01",
             "\t.org $E005",
             "\tjsr sub_E100",
             "",
@@ -842,7 +842,7 @@ fn patches_widen_the_disassembled_ranges() {
         &d,
         &[
             "\t.incbin \"base.nes\", 16, 16384",
-            "\t.bank 1",
+            "\t.bank $01",
             "; Hooked start-up",
             "\t.org $E002",
             "\tsta PPUCTRL",
@@ -888,17 +888,17 @@ fn expanded_rom_hacks_line_up_chr_banks() {
     assert_lines(
         &d,
         &[
-            "\t.bank 0",
+            "\t.bank $00",
             "\t.org $8000",
             "\t.incbin \"base.nes\", 16, 16384",
             "",
-            "\t.bank 2",
+            "\t.bank $02",
             "\t.org $C000",
         ],
     );
     assert!(
         d.text()
-            .ends_with("\n\n\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+            .ends_with("\n\n\t.bank $04\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
         "{}",
         d.text()
     );
@@ -980,21 +980,21 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
         &d,
         &[
             "\t.inesprg 2",
-            "\t.bank 0",
+            "\t.bank $00",
             "\t.org $C000",
             "\t.incbin \"base.nes\", 16, 16384",
             "",
             "\t.include \"out_bank01.asm\"",
             "\t.include \"out_bank03.asm\"",
             "",
-            "\t.bank 4",
+            "\t.bank $04",
             "\t.org $0000",
             "\t.incbin \"out.chr\"",
         ],
     );
     assert!(
         d.text().ends_with(
-            "\t.include \"out_bank03.asm\"\n\n\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\"\n"
+            "\t.include \"out_bank03.asm\"\n\n\t.bank $04\n\t.org $0000\n\t.incbin \"out.chr\"\n"
         ),
         "{}",
         d.text()
@@ -1011,7 +1011,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
     assert_eq!(
         lines,
         [
-            "\t.bank 1",
+            "\t.bank $01",
             "\t.org $E005",
             "\tjsr NewInit",
             "",
@@ -1030,7 +1030,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
         ]
     );
     // New banks are written whole; the CHR bank comes from the CHR file.
-    assert!(d.files()[2].1.contains("\t.bank 2\n\t.org $8000\n"));
+    assert!(d.files()[2].1.contains("\t.bank $02\n\t.org $8000\n"));
     assert_eq!(
         d.chr_file(),
         Some((Path::new("out.chr"), new_chr.as_slice()))
@@ -1050,7 +1050,7 @@ fn rom_hack_bank_files_overwrite_the_included_base() {
     assert_tab_indented(&d);
     assert!(
         d.text()
-            .ends_with("\t.bank 4\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+            .ends_with("\t.bank $04\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
         "{}",
         d.text()
     );
@@ -1115,7 +1115,7 @@ fn raw_rom_hacks_name_bank_files_in_hexadecimal() {
         &d,
         &[
             "; Assemble with -raw (no iNES header).",
-            "\t.bank 0",
+            "\t.bank $00",
             "\t.org $8000",
             "\t.incbin \"base.bin\", 0, 147456",
         ],
@@ -1126,7 +1126,7 @@ fn raw_rom_hacks_name_bank_files_in_hexadecimal() {
         let text = &d.files()[name].1;
         assert_eq!(
             text.lines().nth(1),
-            Some(format!("\t.bank {bank}").as_str()),
+            Some(format!("\t.bank ${bank:02X}").as_str()),
             "{text}"
         );
     }
@@ -1801,7 +1801,7 @@ fn mapper4_fixed_prg_16k_decodes_across_the_last_two_banks() {
         &d,
         &[
             "\t.catbank $02",
-            "\t.bank 2",
+            "\t.bank $02",
             "\t.org $C000",
             "RESET:",
             "\tjsr sub_E010",
@@ -1816,7 +1816,7 @@ fn mapper4_fixed_prg_16k_decodes_across_the_last_two_banks() {
         ],
     );
     // No `.bank` or `.org` splits the instruction.
-    assert!(!d.text().contains("\t.bank 3"), "{}", d.text());
+    assert!(!d.text().contains("\t.bank $03"), "{}", d.text());
     assert!(!d.text().contains(".org $E000"), "{}", d.text());
     let line = d.view(Some(2), 0xdffe, 0xdffe)[0];
     assert_eq!(
@@ -1907,9 +1907,9 @@ fn mapper4_fixed_prg_16k_writes_one_file_for_the_last_two_banks() {
     );
     assert_eq!(d.text().matches(".catbank").count(), 1);
     let pair = &d.files()[3].1;
-    assert_eq!(pair.lines().nth(1), Some("\t.bank 2"), "{pair}");
+    assert_eq!(pair.lines().nth(1), Some("\t.bank $02"), "{pair}");
     assert!(!pair.contains(".catbank"), "{pair}");
-    assert!(!pair.contains("\t.bank 3"), "{pair}");
+    assert!(!pair.contains("\t.bank $03"), "{pair}");
     assert!(
         pair.contains(
             "\tlda $0390,x\n; Bank 3 starts at $E000, inside the instruction above\n\tbeq RESET\n"
@@ -1938,7 +1938,7 @@ fn mapper4_fixed_prg_16k_writes_one_file_for_the_last_two_banks() {
     let d = round_trip(&mmc3_rom(false), &split);
     let pair = &d.files()[3].1;
     assert!(
-        pair.contains("\tnop\n\n\t.bank 3\n\t.org $E000\n\tbeq RESET\n"),
+        pair.contains("\tnop\n\n\t.bank $03\n\t.org $E000\n\tbeq RESET\n"),
         "{pair}"
     );
     assert_lines(&d, &["\t.catbank $02", "\t.include \"out_bank02_03.asm\""]);
@@ -2042,12 +2042,12 @@ fn mapper4_fixed_prg_16k_rom_hacks_continue_across_the_boundary() {
     assert_eq!(
         pair,
         [
-            "\t.bank 2",
+            "\t.bank $02",
             "\t.org $DFFE",
             "\tlda $0490,x",
             "; Bank 3 starts at $E000, inside the instruction above",
             "",
-            "\t.bank 3",
+            "\t.bank $03",
             "\t.org $E100",
             "\t.db $EA",
         ]
@@ -2061,12 +2061,12 @@ fn mapper4_fixed_prg_16k_rom_hacks_continue_across_the_boundary() {
             "\t.incbin \"base.nes\", 16, 32768",
             "",
             "\t.catbank $02",
-            "\t.bank 2",
+            "\t.bank $02",
             "\t.org $DFFE",
             "\tlda $0490,x",
             "; Bank 3 starts at $E000, inside the instruction above",
             "",
-            "\t.bank 3",
+            "\t.bank $03",
             "\t.org $E100",
         ],
     );
@@ -2076,7 +2076,7 @@ fn mapper4_fixed_prg_16k_rom_hacks_continue_across_the_boundary() {
     let d = patch_round_trip(&hack, &base, &json);
     let names: Vec<PathBuf> = d.files().iter().map(|(p, _)| p.clone()).collect();
     assert_eq!(names, ["out.asm", "out_bank02_03.asm"].map(PathBuf::from));
-    assert_eq!(d.files()[1].1.lines().nth(1), Some("\t.bank 3"));
+    assert_eq!(d.files()[1].1.lines().nth(1), Some("\t.bank $03"));
     assert_lines(&d, &["\t.catbank $02", "\t.include \"out_bank02_03.asm\""]);
 }
 
@@ -2127,7 +2127,7 @@ fn rom_hacks_with_many_changed_chr_banks_keep_a_small_main_file() {
     assert_eq!(d.text().matches("\"out.chr\"").count(), 1);
     assert!(
         d.text()
-            .ends_with("\n\n\t.bank 2\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
+            .ends_with("\n\n\t.bank $02\n\t.org $0000\n\t.incbin \"out.chr\"\n"),
         "{}",
         d.text()
     );
@@ -2161,7 +2161,7 @@ fn mapper4_fixed_prg_16k_inline_arguments_cross_the_boundary() {
         &[
             "\tjsr Print",
             "\t.db $01",
-            "\t.bank 3",
+            "\t.bank $03",
             "\t.org $E000",
             "\t.db $02, $03, $04",
             "L_E003:",
@@ -2733,7 +2733,7 @@ fn rom_hacks_write_whole_instructions_reached_after_a_bank_switch() {
     assert_eq!(diffs, [(2, Address(0x8000), Address(0x8001), 1, 2)]);
     assert_lines(
         &d,
-        &["\t.bank 2", "\t.org $8000", "sub_02_8000:", "\tlda #$22"],
+        &["\t.bank $02", "\t.org $8000", "sub_02_8000:", "\tlda #$22"],
     );
 }
 
