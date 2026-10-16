@@ -87,6 +87,7 @@ MCPの入力・依存ファイル・出力先は起動時の `--root` 内に制�
 ## ドキュメント
 
 - [MCPとLLMによる逆アセンブル手順](docs/disassembly-workflow.md): 調査、根拠付き注釈の追加と再解析、ソース生成・検証
+  （Claude Code 向けには同じ手順を skill `nesasm-disassembly`（[.claude/skills/nesasm-disassembly/SKILL.md](.claude/skills/nesasm-disassembly/SKILL.md)、英語）にしてあります）
 - [Rust版の詳細](docs/rust.md): 構成、C#版との互換性と意図した差分、比較検証の手順
 - [UML図](docs/rust-uml.md)
 - [リファレンス](docs/reference/index.md): 命令・ディレクティブ・式・CLIオプション・上限、
