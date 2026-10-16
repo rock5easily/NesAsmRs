@@ -321,6 +321,9 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
   ソースの読者に向けた説明は、別途 `comment`／`comments.text` に書きます。
 - ファイルを書き込むのは、全操作を適用でき、注釈が有効で、往復検証が一致し（`require_match`）、
   ファイルが `expected_sha256` から変わっていない場合だけです。`dry_run: true` で書き込まずに結果を確認できます。
+- 書き込んだ場合、応答はログの行（`log_entry`）を繰り返しません。ログ（`<名前>.disasm.log.jsonl`）を見ます。
+  反復を重ねて応答を小さくしたいときは `brief: true` を付けます。前後の要約（バンク別）を省き、
+  `applied` は既存の項目を置き換え・削除した操作だけになります。前後の集計はテキストの要約に残ります。
 - 応答の `summary_before`／`summary_after`、`issues_resolved`／`issues_introduced`／`issues_changed` で、
   変化した分類とissueを確認します。issueは `id`（種類・bank・アドレス、例 `unresolved_bank:30:$DEB1`）で
   照合し、同じissueのメッセージだけが変わったもの（表を領域で記述した間接ジャンプなど）は

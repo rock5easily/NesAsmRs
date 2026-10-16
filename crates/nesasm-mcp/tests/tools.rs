@@ -816,6 +816,9 @@ fn annotate_writes_canonical_files_and_logs_evidence() {
     let new_digest = nesasm_core::disasm::sha256_hex(written.as_bytes());
     assert_eq!(report["sha256"], new_digest.as_str());
     assert!(report.get("annotations").is_none(), "{r}");
+    // The log has the entry, so the result does not repeat it.
+    assert!(report.get("log_entry").is_none(), "{r}");
+    assert_eq!(report["log"], "loose.disasm.log.jsonl", "{r}");
     let log = std::fs::read_to_string(c.root.join("loose.disasm.log.jsonl")).unwrap();
     let entries: Vec<serde_json::Value> = log
         .lines()
@@ -1047,6 +1050,86 @@ fn annotate_reads_operations_from_a_file() {
     let r = c.call("annotate", json!({"inline":inline}));
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(r["structuredContent"]["applied"], json!([]));
+}
+
+#[test]
+fn annotate_returns_the_log_entry_it_could_not_log() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    // A directory where the log would be: the annotations are written, the
+    // log entry is not.
+    std::fs::create_dir_all(c.root.join("loose.disasm.log.jsonl")).unwrap();
+    let ops = json!([{"op": "upsert", "kind": "labels",
+                      "item": {"address": "$E005", "name": "Loop"}}]);
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","create":{"rom":"old/loose.nes"},
+               "operations":ops}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["written"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains("The annotations were written, but not the log entry"),
+        "{r}"
+    );
+    assert!(report.get("log").is_none(), "{r}");
+    assert_eq!(report["log_entry"]["operations"], ops);
+}
+
+#[test]
+fn annotate_brief_results_leave_out_the_summaries_and_unreplaced_operations() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let original = r#"{"rom": "old/loose.nes", "labels": [{"address": "$E005", "name": "Loop"}]}"#;
+    c.write("loose.disasm.json", original);
+    let ops = json!([
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E000", "name": "Start"}},
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E005", "name": "Loop",
+                                                     "comment": "forever"}},
+    ]);
+    let arguments = json!({"annotations":"loose.disasm.json","operations":ops,"dry_run":true});
+    let full = c.call("annotate", arguments.clone());
+    let mut arguments = arguments;
+    arguments["brief"] = json!(true);
+    let brief = c.call("annotate", arguments);
+    assert_eq!(brief["isError"], false, "{brief}");
+    let report = &brief["structuredContent"];
+    assert!(report.get("summary_before").is_none(), "{brief}");
+    assert!(report.get("summary_after").is_none(), "{brief}");
+    // Only the operation that replaced an entry, with what it replaced.
+    assert_eq!(
+        report["applied"],
+        json!([{"index": 1, "previous": [{"bank": 1, "address": "$E005", "name": "Loop"}]}]),
+        "{brief}"
+    );
+    assert_eq!(
+        full["structuredContent"]["applied"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{full}"
+    );
+    // The text is that of the full result: every operation counted, and the
+    // totals before and after.
+    assert_eq!(Client::text(&brief), Client::text(&full));
+    let text = Client::text(&brief);
+    assert!(
+        text.starts_with("2 operations applied; nothing written"),
+        "{text}"
+    );
+    for prefix in ["Before: ", "After: "] {
+        assert!(text.lines().any(|l| l.starts_with(prefix)), "{text}");
+    }
+    // The rest is as in the full result (the log entry has its time).
+    for key in ["sha256", "verification", "issues_resolved", "annotations"] {
+        assert_eq!(
+            report[key], full["structuredContent"][key],
+            "{key}: {brief}"
+        );
+    }
+    assert_eq!(report["log_entry"]["operations"], ops, "{brief}");
 }
 
 #[cfg(unix)]

@@ -311,6 +311,11 @@ struct AnnotateInput {
     /// hypotheses are still checked, but not applied.
     #[serde(default)]
     hypotheses: bool,
+    /// A shorter result: without summary_before and summary_after (the text
+    /// summary keeps their totals), and applied lists only the operations
+    /// that replaced or removed entries.
+    #[serde(default)]
+    brief: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -587,8 +592,8 @@ struct AnnotateReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     log: Option<PathBuf>,
     /// The log entry: the operations with their evidence, the digests and
-    /// totals before and after (also for inline annotations and dry runs, to
-    /// keep elsewhere).
+    /// totals before and after, when it is not in the log: for inline
+    /// annotations, dry runs and failures, to keep elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     log_entry: Option<serde_json::Value>,
 }
@@ -1673,7 +1678,11 @@ impl Server {
             .map(serde_json::Value::to_string)
             .unwrap_or_default();
         match nesasm_core::append_annotation_log(path, root, &line) {
-            Ok(log) => report.log = Some(log),
+            Ok(log) => {
+                report.log = Some(log);
+                // The log has it.
+                report.log_entry = None;
+            }
             Err(e) => report.diagnostics.push(Diagnostic {
                 severity: Severity::Warning,
                 ..error(
@@ -2106,9 +2115,10 @@ impl Server {
         let summary = Self::disasm_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations (inline, or a JSON file in the root with operations_file): upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after, and the issues resolved and introduced. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations (inline, or a JSON file in the root with operations_file): upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after (brief: only its totals, in the text), and the issues resolved and introduced; the log entry only when it is not written to the log. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
     async fn annotate(&self, Parameters(input): Parameters<AnnotateInput>) -> CallToolResult {
-        let report = match self
+        let brief = input.brief;
+        let mut report = match self
             .guarded_late(move |root, cancel| Self::annotate_report(root, &input, cancel))
             .await
         {
@@ -2131,6 +2141,11 @@ impl Server {
             },
         };
         let summary = Self::annotate_summary(&report);
+        if brief {
+            report.summary_before = None;
+            report.summary_after = None;
+            report.applied.retain(|a| !a.previous.is_empty());
+        }
         tool_result(&report, report.success, summary)
     }
     #[tool(description="Read assembler syntax documentation. Topics: index, instructions, directives, expressions, options, disassembler.",output_schema=schema::<ReferenceReport>(),annotations(read_only_hint=true))]
