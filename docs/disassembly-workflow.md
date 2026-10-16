@@ -327,6 +327,20 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
 - 書き込んだ場合、応答はログの行（`log_entry`）を繰り返しません。ログ（`<名前>.disasm.log.jsonl`）を見ます。
   反復を重ねて応答を小さくしたいときは `brief: true` を付けます。前後の要約（バンク別）を省き、
   `applied` は既存の項目を置き換え・削除した操作だけになります。前後の集計はテキストの要約に残ります。
+- 既存の注釈や根拠を確かめるときは、注釈ファイルを直接読まずに `query_annotations` を使います。
+  `entries` に種類・バンク・アドレス範囲・文字列（資料名など）を指定すると該当する項目だけが返り、
+  `history` でその項目を変えた書き込みと根拠をたどれます。応答の `sha256` は次の `annotate` の
+  `expected_sha256` に使えます。以前の版との比較はログの履歴と `baseline` で行い、
+  注釈全体のコピーを反復ごとに保存する必要はありません。
+
+```json
+{
+  "annotations": "annotations/game.disasm.json",
+  "entries": {"bank": 30, "from": "$D800", "to": "$D8FF"},
+  "history": {"from": "$D800", "to": "$D8FF", "limit": 5}
+}
+```
+
 - 応答の `summary_before`／`summary_after`、`issues_resolved`／`issues_introduced`／`issues_changed` で、
   変化した分類とissueを確認します。issueは `id`（種類・bank・アドレス、例 `unresolved_bank:30:$DEB1`）で
   照合し、同じissueのメッセージだけが変わったもの（表を領域で記述した間接ジャンプなど）は
@@ -478,7 +492,8 @@ issuesのsuggestionsを使う場合も実コードで確かめてから適用し
 
 未分類領域を線形に命令化せず、未知のバンクを都合のよい値で補わないでください。
 原作と改造版の注釈を無条件に共有せず、表・パディング・インライン引数の誤認を確認してください。
-注釈と結果を反復ごとに保存し、数値の増加だけで解析品質を判断しないでください。
+結果を反復ごとに保存し（注釈の変更と根拠はログに残り、query_annotationsで確認できます）、
+数値の増加だけで解析品質を判断しないでください。
 
 入力ROM・パッチ・手編集済みソースを保持してください。
 export_disassembly → check → assembleを実行し、入力と別の出力先で

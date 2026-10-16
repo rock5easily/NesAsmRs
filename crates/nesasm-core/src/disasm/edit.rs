@@ -5,7 +5,7 @@
 use super::analysis::{Analysis, Fix, Loc, Memory, window_index};
 use super::config::{
     Address, BankLayout, CommentDef, CommentPosition, DisasmConfig, DisasmOptions, EntryPoint,
-    LabelDef, OperandDef, PatchDef, Provenance, ReferenceDef, RegionDef, SymbolDef,
+    LabelDef, OperandDef, PatchDef, Provenance, ReferenceDef, RegionDef, Status, SymbolDef,
 };
 use crate::state::BANK_SIZE;
 #[cfg(feature = "schema")]
@@ -941,4 +941,160 @@ pub fn sha256_hex(data: &[u8]) -> String {
         }
     }
     state.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+/// Which annotation entries a query selects. Every field given must match.
+#[derive(Clone, Debug, Default)]
+pub struct AnnotationFilter {
+    /// The lists to search (empty: all but options).
+    pub kinds: Vec<AnnotationKind>,
+    /// Entries of this bank.
+    pub bank: Option<usize>,
+    /// Entries whose addresses meet `from`-`to` (inclusive; either may be
+    /// left out): the address of an entry, the range of a region or patch,
+    /// the values of a symbol and its size, the window of a bank.
+    pub from: Option<Address>,
+    pub to: Option<Address>,
+    /// Entries one of whose strings contains this text, ignoring case.
+    pub text: Option<String>,
+    /// Entries of this status.
+    pub status: Option<Status>,
+}
+
+impl AnnotationFilter {
+    /// Whether the filter selects every entry.
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+            && self.bank.is_none()
+            && self.from.is_none()
+            && self.to.is_none()
+            && self.text.is_none()
+            && self.status.is_none()
+    }
+}
+
+impl AnnotationFilter {
+    /// Whether the entry of `kind` (as written in the annotation file, or the
+    /// item or key of an operation) matches.
+    pub fn matches(&self, kind: AnnotationKind, entry: &Value) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.contains(&kind) {
+            return false;
+        }
+        if let Some(bank) = self.bank
+            && entry.get("bank").and_then(Value::as_u64) != Some(bank as u64)
+        {
+            return false;
+        }
+        if self.from.is_some() || self.to.is_some() {
+            // A range that ends before it starts holds nothing.
+            if let (Some(from), Some(to)) = (self.from, self.to)
+                && from.0 > to.0
+            {
+                return false;
+            }
+            let Some((first, last)) = span(kind, entry) else {
+                return false;
+            };
+            if self.from.is_some_and(|from| last < from.0) || self.to.is_some_and(|to| first > to.0)
+            {
+                return false;
+            }
+        }
+        if let Some(status) = self.status {
+            let given: Status = entry
+                .get("status")
+                .and_then(|s| serde_json::from_value(s.clone()).ok())
+                .unwrap_or_default();
+            if given != status {
+                return false;
+            }
+        }
+        match self.text.as_deref() {
+            Some(text) => contains_text(entry, &text.to_lowercase()),
+            None => true,
+        }
+    }
+}
+
+/// The first and last address an entry covers.
+fn span(kind: AnnotationKind, entry: &Value) -> Option<(u32, u32)> {
+    let address = |field: &str| {
+        entry
+            .get(field)
+            .and_then(|a| serde_json::from_value::<Address>(a.clone()).ok())
+            .map(|a| a.0)
+    };
+    let length = |field: &str| entry.get(field).and_then(Value::as_u64);
+    let through = |first: u32, count: u64| {
+        let count = u32::try_from(count.max(1)).unwrap_or(u32::MAX);
+        (first, first.saturating_add(count - 1))
+    };
+    match kind {
+        AnnotationKind::Banks => address("org").map(|org| through(org, BANK_SIZE as u64)),
+        AnnotationKind::Symbols => {
+            address("value").map(|v| through(v, length("size").unwrap_or(1)))
+        }
+        AnnotationKind::Regions | AnnotationKind::Patches => {
+            let start = address("start").or_else(|| address("address"))?;
+            Some(match (address("end"), length("length")) {
+                (Some(end), _) => (start, end.max(start)),
+                (None, Some(count)) => through(start, count),
+                (None, None) => (start, start),
+            })
+        }
+        AnnotationKind::Options => None,
+        _ => address("address")
+            .or_else(|| address("start"))
+            .map(|a| (a, a)),
+    }
+}
+
+fn contains_text(value: &Value, text: &str) -> bool {
+    match value {
+        Value::String(s) => s.to_lowercase().contains(text),
+        Value::Array(items) => items.iter().any(|v| contains_text(v, text)),
+        Value::Object(fields) => fields.values().any(|v| contains_text(v, text)),
+        _ => false,
+    }
+}
+
+/// An annotation entry a query selected.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct AnnotationMatch {
+    pub kind: AnnotationKind,
+    /// Index of the entry in its list.
+    pub index: usize,
+    /// The entry with the fields of the annotation file.
+    pub entry: Value,
+}
+
+/// The entries of the lists of `config` that `filter` selects, in the order
+/// of the lists of the canonical form and of the entries in each.
+pub fn query_annotations(config: &DisasmConfig, filter: &AnnotationFilter) -> Vec<AnnotationMatch> {
+    let mut config = config.clone();
+    let mut found = Vec::new();
+    for kind in LIST_KINDS {
+        with_list!(config, kind, list => {
+            for (index, entry) in list.iter().enumerate() {
+                let entry = to_value(entry);
+                if filter.matches(kind, &entry) {
+                    found.push(AnnotationMatch { kind, index, entry });
+                }
+            }
+        });
+    }
+    found
+}
+
+/// The number of entries of each list of `config`, by the name of the list.
+pub fn annotation_counts(config: &DisasmConfig) -> BTreeMap<String, usize> {
+    let mut config = config.clone();
+    let mut counts = BTreeMap::new();
+    for kind in LIST_KINDS {
+        with_list!(config, kind, list => {
+            counts.insert(kind.name().to_owned(), list.len());
+        });
+    }
+    counts
 }

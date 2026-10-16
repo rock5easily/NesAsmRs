@@ -18,10 +18,11 @@ fn stdio_lifecycle_validation_build_and_recovery() {
         "disassemble",
         "export_disassembly",
         "annotate",
+        "query_annotations",
     ] {
         assert!(names.contains(&name), "{names:?}");
     }
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 8);
     for tool in tools {
         assert!(tool["inputSchema"].is_object());
         assert!(tool["outputSchema"].is_object());
@@ -354,6 +355,20 @@ fn structured_content_matches_output_schema() {
         (
             "annotate",
             json!({"inline":{"rom":"game.bin"},"operations":[{"op":"set","kind":"labels"}]}),
+        ),
+        (
+            "annotate",
+            json!({"annotations":"game.disasm.json","create":{"rom":"game.bin"},
+                   "operations":[{"op":"upsert","kind":"labels",
+                                  "item":{"address":"$E000","name":"Start"}}]}),
+        ),
+        (
+            "query_annotations",
+            json!({"annotations":"game.disasm.json","entries":{},"history":{"text":"start"}}),
+        ),
+        (
+            "query_annotations",
+            json!({"annotations":"missing.disasm.json"}),
         ),
     ] {
         let result = c.call(name, arguments.clone());

@@ -5025,3 +5025,84 @@ fn annotate_repairs_invalid_references() {
         ]
     );
 }
+
+#[test]
+fn annotation_filters_select_by_span_bank_text_and_status() {
+    let annotations = config(
+        r#"{"rom": "game.nes",
+            "banks": [{"bank": 2, "org": "$C000"}],
+            "labels": [{"bank": 2, "address": "$C010", "name": "Main", "comment": "Main loop"},
+                       {"bank": 3, "address": "$E000", "name": "Reset", "status": "hypothesis",
+                        "evidence": ["the vector"]}],
+            "symbols": [{"name": "OAM", "value": "$0200", "size": 256}],
+            "regions": [{"bank": 2, "start": "$C100", "end": "$C10F"},
+                        {"bank": 2, "start": "$C200", "length": 16}],
+            "patches": [{"bank": 2, "start": "$C300", "length": 1}]}"#,
+    );
+    let select = |filter: disasm::AnnotationFilter| -> Vec<String> {
+        disasm::query_annotations(&annotations, &filter)
+            .iter()
+            .map(|m| format!("{:?} {}", m.kind, m.index))
+            .collect()
+    };
+    let filter = disasm::AnnotationFilter::default;
+    assert!(filter().is_empty());
+    assert_eq!(select(filter()).len(), 7);
+    let between = |from: u32, to: u32| disasm::AnnotationFilter {
+        from: Some(Address(from)),
+        to: Some(Address(to)),
+        ..filter()
+    };
+    // The window of a bank, the range of a symbol through its size, regions
+    // through their end (inclusive) or length, patches.
+    assert_eq!(select(between(0xdfff, 0xdfff)), ["Banks 0"]);
+    assert_eq!(select(between(0x02ff, 0x0300)), ["Symbols 0"]);
+    assert!(select(between(0x0300, 0x0300)).is_empty());
+    assert_eq!(select(between(0xc10f, 0xc10f)), ["Banks 0", "Regions 0"]);
+    assert_eq!(select(between(0xc20f, 0xc210)), ["Banks 0", "Regions 1"]);
+    assert_eq!(select(between(0xc210, 0xc2ff)), ["Banks 0"]);
+    assert_eq!(select(between(0xc300, 0xc300)), ["Banks 0", "Patches 0"]);
+    // A range that ends before it starts holds nothing.
+    assert!(select(between(0xc10f, 0xc100)).is_empty());
+    assert_eq!(
+        select(disasm::AnnotationFilter {
+            from: Some(Address(0xe000)),
+            ..filter()
+        }),
+        ["Labels 1"]
+    );
+    assert_eq!(
+        select(disasm::AnnotationFilter {
+            bank: Some(3),
+            ..filter()
+        }),
+        ["Labels 1"]
+    );
+    assert_eq!(
+        select(disasm::AnnotationFilter {
+            text: Some("MAIN LOOP".into()),
+            ..filter()
+        }),
+        ["Labels 0"]
+    );
+    assert_eq!(
+        select(disasm::AnnotationFilter {
+            status: Some(disasm::Status::Hypothesis),
+            ..filter()
+        }),
+        ["Labels 1"]
+    );
+    assert_eq!(
+        select(disasm::AnnotationFilter {
+            kinds: vec![
+                disasm::AnnotationKind::Regions,
+                disasm::AnnotationKind::Patches
+            ],
+            ..filter()
+        }),
+        ["Regions 0", "Regions 1", "Patches 0"]
+    );
+    let counts = disasm::annotation_counts(&annotations);
+    assert_eq!(counts["labels"], 2);
+    assert_eq!(counts["comments"], 0);
+}

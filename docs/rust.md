@@ -411,6 +411,23 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
 ROM Hackでは差分範囲で絞る前のROM全体の解析で付けます。`disasm::compare_issues` が2つの解析の課題を
 `id` で照合し、MCPの `annotate` と `disassemble` の `baseline`（以前の注釈との比較）が使います。
 
+MCPの `query_annotations` は、注釈ファイルを丸ごと返さずに問い合わせます（ファイルは書き込みません）。
+- 常にファイルのSHA-256（次の `annotate` の `expected_sha256`）、正規の書式かどうか（`canonical`、
+  正規化できないときは省略）、
+  `rom`・`base`・`load_address`・`options`、各リストの項目数を返します。エージェントが大きな注釈ファイルを
+  読んだり、比較のために反復ごとにコピーしたりせずに済むようにするためです。
+- `entries` は `disasm::query_annotations`（`AnnotationFilter`）で選んだ項目を、`annotate` が書く形
+  （`apply_operations` で各項目のバンクを補い、正規の順序に並べたもの）で、リスト内の `index` とともに返します。
+  条件は種類・バンク・アドレス範囲（領域・パッチの範囲、シンボルの `size`、バンクの窓との重なり。
+  `from` が `to` より後ろなら誤り、コアの `AnnotationFilter` では空の範囲）・
+  文字列（項目の文字列のどれかに含む、大文字小文字を区別しない）・`status` です。ROMを読めない、
+  または注釈が不正なときは警告を付け、ファイルのままの項目を対象にします。
+- `history` はログ（`*.disasm.log.jsonl`、64 MiBまで）を新しい順に返します。条件を付けると、条件に合う操作
+  （`item` か `key`、文字列は操作の `evidence` も対象）を含む書き込みだけを、その操作とともに返します。
+  SHA-256のつながり（`chained`）と、最後の書き込みが今のファイルと一致するか（`current`）も返します。
+  解析できない行は `invalid_lines` に挙げ、誤りにはしません。
+- 入力は注釈ファイルのパスだけで、`inline` は受け付けません（インラインの注釈は呼び出し側が持っています）。
+
 MCPの `disassemble`／`export_disassembly` は、読み込んだROM・ベースROM・注釈ファイル（`inline` では
 `annotate` が書く正規の書式のテキスト）のSHA-256とサーバーの版を `inputs` で返します。
 `baseline` のROMの不一致もパスではなくこのハッシュで判断します。

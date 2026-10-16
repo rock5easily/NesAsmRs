@@ -24,7 +24,10 @@ For a detailed Japanese guide, see [MCP and LLM workflow](../disassembly-workflo
    `xrefs`, `routines` and `ram`.
 3. Compare with the author's notes and specifications. Record names, data
    ranges and comments with `annotate`, with the evidence for them; settle
-   the issues (their `suggestions` are operations for `annotate`).
+   the issues (their `suggestions` are operations for `annotate`). Look up
+   existing entries, their evidence and the writes that changed them with
+   `query_annotations` (see [Querying annotations](#querying-annotations))
+   rather than reading the whole file.
 4. Repeat 2-3. Then call `export_disassembly`; it writes the source only if it
    reassembles to the same ROM. Check it with `check` (`options.raw` for
    `.bin` ROMs).
@@ -317,6 +320,46 @@ Only files named `*.disasm.json` inside the root and outside hidden
 directories are written (also after following links; a link to a file or
 directory that does not exist is refused), with their log.
 
+## Querying annotations
+
+`query_annotations` reads an annotation file without returning it whole, and
+writes nothing:
+
+```json
+{
+  "annotations": "game.disasm.json",
+  "entries": {"kinds": ["labels", "regions"], "bank": 30, "from": "$D800", "to": "$D8FF"},
+  "history": {"text": "SpriteDataBank", "limit": 10}
+}
+```
+
+- The result always gives the file's `sha256` (the `expected_sha256` of the
+  next `annotate`), `rom`, `base`, `load_address`, `options` and the
+  `counts` of entries of each list, and whether the file is `canonical` (in
+  the form `annotate` writes; left out when the annotations cannot be put in
+  that form).
+- `entries` returns the entries a filter selects, as `annotate` would write
+  them (each with its bank) in the canonical order of lists and entries, each
+  with its `kind` and `index` in its list. Every field given must match:
+  `kinds` (the lists; default all), `bank` (symbols have none), `from`-`to`
+  (inclusive, either may be left out, `from` after `to` is an error; the
+  address of an entry, the range of a region or patch, the value of a symbol
+  through its `size`, the 8 KiB window of a bank), `text` (in any string of the entry: names, comments,
+  `evidence`, expressions, addresses as written; ignoring case) and `status`.
+  `offset` and `limit` (default 100, at most 1000) page them. If the ROM
+  cannot be read or the annotations are not valid, a warning says so and the
+  entries are as in the file.
+- `history` returns the writes recorded in `<name>.disasm.log.jsonl`, latest
+  first: the line, time, SHA-256 before and after, the number of
+  operations, their count by op and kind, and the totals before and after.
+  With a filter (the fields of `entries`), only the writes with operations
+  it selects (by their `item` or `key`; `text` also by their `evidence`) are
+  returned, with those operations as `matched`. `writes` counts the entries
+  of the log; `chained` tells that each write starts from the SHA-256 the one
+  before ended with, and `current` that the last ended with the file's
+  SHA-256 (nothing changed the file since). Lines that are not entries are
+  listed in `invalid_lines`. Without a log, there are no writes.
+
 ## Annotation file
 
 - `rom`: the ROM file relative to the root: `.nes` (iNES) or a raw `.bin`.
@@ -586,7 +629,8 @@ whose adjusted target would wrap around $FFFF are written as numbers. An entry
 gives at most 64 `evidence` strings of at most 2000 characters each.
 
 ROMs of up to 128 banks of 8 KiB; over MCP, ROM, annotation and operations
-files of up to 8 MiB each (also the base ROM). A disassembly is subject to the server's time limit.
+files of up to 8 MiB each (also the base ROM), and annotation logs read by
+`query_annotations` of up to 64 MiB. A disassembly is subject to the server's time limit.
 
 The trace remembers up to 32 RAM values and 16 pushed values per path, and
 is repeated at most 16 times for joins of paths. A routine's summary follows

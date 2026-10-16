@@ -19,8 +19,9 @@ pub use config::{
     ReferenceDef, RegionDef, RegionType, SWITCHABLE_WINDOWS, Status, SymbolDef,
 };
 pub use edit::{
-    AnnotationKind, Applied, EntryKey, Operation, OperationKind, Suggestion, apply_operations,
-    canonical_json, requires_evidence, sha256_hex,
+    AnnotationFilter, AnnotationKind, AnnotationMatch, Applied, EntryKey, Operation, OperationKind,
+    Suggestion, annotation_counts, apply_operations, canonical_json, query_annotations,
+    requires_evidence, sha256_hex,
 };
 
 use crate::state::BANK_SIZE;
