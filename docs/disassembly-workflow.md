@@ -312,6 +312,9 @@ RTSで飛ぶ表は、保存値と飛び先の差を確認したうえで `adjust
 - 推定より優先される項目（`references`、`no_return`／`inline_bytes`／`switch_banks`／`keeps_banks` を
   持つ `entry_points`、`code` 領域、`code_targets` 付きの表）と推測（`hypothesis`）の項目には根拠が必須です。
   操作の `evidence` か、項目の `evidence` のどちらかに書きます。
+- 同じ根拠を多数の項目に付けるときは、`operations` と並べて `"evidence": "..."` を1回だけ書きます。
+  自身の `evidence` を持たない操作すべてに付き、各操作に書いた場合と同じに扱われます。
+  根拠が異なる操作のまとまりは、呼び出しを分けるか、操作ごとに書きます。
 - 操作の `evidence` は項目の `evidence`（文字列の配列）に追加され、注釈ファイルの中で項目と一緒に残ります。
   同じ文は二重に入りません。間違った根拠を消すときは、その文を除いた `evidence` を項目に付けて送ります。
   根拠を使うファイルには `"format_version": 2`（`target_window` を使うなら3）が書かれ、旧版のnesasmでは

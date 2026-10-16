@@ -268,6 +268,11 @@ writes it as one change:
   the `evidence` of the item, will do. The operation's `evidence` is added to
   the `evidence` of the item (once), so the entry keeps what was observed; to
   drop a string, give the item's `evidence` without it.
+- `evidence` beside `operations` (or `operations_file`) is the evidence of
+  every operation that gives none of its own (no `evidence`, or only
+  blanks), such as one observation behind many labels: it is sent once
+  instead of with each operation. The operations are applied, checked and
+  logged as if each gave it; it is at most 2000 characters.
 - Entries whose `status` is `hypothesis` are kept but not applied, unless
   `hypotheses: true` asks for an analysis with them taken as confirmed. They
   are still checked: the file is not written if the annotations with them

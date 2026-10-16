@@ -1053,6 +1053,87 @@ fn annotate_reads_operations_from_a_file() {
 }
 
 #[test]
+fn annotate_shares_evidence_among_the_operations() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let inline = json!({"rom": "old/loose.nes", "labels": [{"address": "$E000", "name": "Old"}]});
+    let shared = "Reset falls into the loop; nothing reads the bytes after it";
+    // The code region needs evidence, which the shared evidence gives; an
+    // operation with its own keeps it, and blanks are none.
+    let ops = json!([
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E005", "name": "Loop"}},
+        {"op": "upsert", "kind": "regions",
+         "item": {"start": "$E008", "length": 5, "type": "code"}, "evidence": "  "},
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E003", "name": "Store"},
+         "evidence": "own"},
+        {"op": "remove", "kind": "labels", "key": {"name": "Old"}},
+    ]);
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations":ops,"evidence":shared}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    let labels = report["annotations"]["labels"].as_array().unwrap();
+    let evidence_of =
+        |name: &str| labels.iter().find(|l| l["name"] == name).unwrap()["evidence"].clone();
+    assert_eq!(evidence_of("Loop"), json!([shared]));
+    assert_eq!(evidence_of("Store"), json!(["own"]));
+    assert!(labels.iter().all(|l| l["name"] != "Old"), "{r}");
+    assert_eq!(
+        report["annotations"]["regions"][0]["evidence"],
+        json!([shared])
+    );
+    // The log has the operations as applied, each with its evidence.
+    let logged: Vec<&serde_json::Value> = report["log_entry"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| &o["evidence"])
+        .collect();
+    assert_eq!(logged, [shared, shared, "own", shared]);
+    // So for the operations of a file.
+    c.write("ops/region.json", json!([ops[1]]).to_string());
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations_file":"ops/region.json","evidence":shared}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        r["structuredContent"]["annotations"]["regions"][0]["evidence"],
+        json!([shared])
+    );
+    for (evidence, message) in [
+        (
+            json!("   "),
+            "this entry overrides what the analysis finds: give evidence",
+        ),
+        (
+            json!("x".repeat(2001)),
+            "evidence of 2001 characters; at most 2000",
+        ),
+    ] {
+        let r = c.call(
+            "annotate",
+            json!({"inline":inline,"operations":[ops[1]],"evidence":evidence}),
+        );
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(Client::messages(&r).contains(message), "{r}");
+    }
+    // The limit is that of the evidence added to the entries: trimmed.
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations":[ops[1]],
+               "evidence":format!(" {} ", "x".repeat(2000))}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        r["structuredContent"]["annotations"]["regions"][0]["evidence"],
+        json!(["x".repeat(2000)])
+    );
+}
+
+#[test]
 fn annotate_returns_the_log_entry_it_could_not_log() {
     let mut c = Client::start();
     loose_rom(&mut c);
