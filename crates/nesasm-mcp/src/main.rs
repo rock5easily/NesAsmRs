@@ -298,6 +298,10 @@ struct AnnotateInput {
     /// form of operations), such as one a script generated. The operations
     /// are logged as if given inline.
     operations_file: Option<PathBuf>,
+    /// Evidence for the operations that give none of their own (no
+    /// evidence, or only blanks), such as one observation behind many
+    /// entries. The operations are applied and logged with it.
+    evidence: Option<String>,
     /// Apply and analyse without writing anything.
     #[serde(default)]
     dry_run: bool,
@@ -1694,8 +1698,39 @@ impl Server {
         Ok(())
     }
 
-    /// The operations given inline or in `operations_file`.
+    /// The operations given inline or in `operations_file`, with the
+    /// shared `evidence` for those that give none.
     fn read_operations(
+        root: &Path,
+        input: &AnnotateInput,
+    ) -> Result<Vec<Operation>, Vec<Diagnostic>> {
+        let mut operations = Self::given_operations(root, input)?;
+        if let Some(text) = input.evidence.as_deref().filter(|t| !t.trim().is_empty()) {
+            // Once, rather than for each entry it would be added to.
+            let length = text.chars().count();
+            if length > disasm::MAX_EVIDENCE_TEXT {
+                return Err(vec![error(
+                    DiagnosticCode::Disasm,
+                    format!(
+                        "evidence of {length} characters; at most {}",
+                        disasm::MAX_EVIDENCE_TEXT
+                    ),
+                )]);
+            }
+            for operation in &mut operations {
+                if !operation
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|e| !e.trim().is_empty())
+                {
+                    operation.evidence = Some(text.to_owned());
+                }
+            }
+        }
+        Ok(operations)
+    }
+
+    fn given_operations(
         root: &Path,
         input: &AnnotateInput,
     ) -> Result<Vec<Operation>, Vec<Diagnostic>> {
@@ -2115,7 +2150,7 @@ impl Server {
         let summary = Self::disasm_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations (inline, or a JSON file in the root with operations_file): upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after (brief: only its totals, in the text), and the issues resolved and introduced; the log entry only when it is not written to the log. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations (inline, or a JSON file in the root with operations_file): upsert an entry by its key, remove entries by key, or set options; evidence gives the evidence of the operations without their own. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after (brief: only its totals, in the text), and the issues resolved and introduced; the log entry only when it is not written to the log. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
     async fn annotate(&self, Parameters(input): Parameters<AnnotateInput>) -> CallToolResult {
         let brief = input.brief;
         let mut report = match self
