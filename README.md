@@ -62,6 +62,9 @@ MCPクライアントの設定例（実行ファイルとプロジェクトの�
   根拠（`evidence`）が必須で、項目の `evidence` に残し、操作とともに `<名前>.disasm.log.jsonl` にも
   記録します。未確認の項目は `status: "hypothesis"` で置け、`hypotheses: true` を指定した解析でだけ適用します。
   `disassemble` の課題は、この操作の形で修正案（`suggestions`）を返します。
+- `query_annotations`: 注釈ファイルを丸ごと読まずに、SHA-256（`annotate` の `expected_sha256`）と各リストの
+  項目数、条件（種類・バンク・アドレス範囲・文字列・`status`）で選んだ項目、`<名前>.disasm.log.jsonl` の
+  書き込みの履歴（条件に合う操作とその根拠）を返します。ファイルは書き込みません。
 - `get_reference`: 命令・ディレクティブ・式・オプション・逆アセンブラの説明を取得します。
 
 `check`／`assemble`／`inspect_rom` は、ファイルの代わりにソースの文字列を `sources` で受け取れます

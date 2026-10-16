@@ -1794,3 +1794,317 @@ fn dynamic_references_are_annotated_reported_and_exported() {
         "unresolved_bank:5:$E000"
     );
 }
+
+/// Writes `loose.disasm.json` with two annotate calls (two log entries).
+fn queried_annotations(c: &mut Client) {
+    loose_rom(c);
+    let first = json!([
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E005", "name": "Loop"}},
+        {"op": "upsert", "kind": "regions",
+         "item": {"start": "$E008", "length": 5, "type": "code"},
+         "evidence": "The bytes after JMP Loop are never read"},
+        {"op": "upsert", "kind": "symbols", "item": {"name": "PPUCTRL", "value": "$2000"}},
+        {"op": "upsert", "kind": "comments", "item": {"address": "$E000", "text": "start"}},
+    ]);
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","create":{"rom":"old/loose.nes"},
+               "operations":first}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let second = json!([
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E000", "name": "Start"},
+         "evidence": "the reset vector"},
+        {"op": "upsert", "kind": "labels",
+         "item": {"address": "$E003", "name": "Store", "status": "hypothesis",
+                  "evidence": ["stores to PPUCTRL"]}},
+    ]);
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","operations":second,
+               "expected_sha256":r["structuredContent"]["sha256"]}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+}
+
+#[test]
+fn query_annotations_selects_entries() {
+    let mut c = Client::start();
+    queried_annotations(&mut c);
+    let file = std::fs::read(c.root.join("loose.disasm.json")).unwrap();
+    let query = |c: &mut Client, entries: serde_json::Value| {
+        let r = c.call(
+            "query_annotations",
+            json!({"annotations":"loose.disasm.json","entries":entries}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        r["structuredContent"].clone()
+    };
+    // Without a query, the file's digest and counts.
+    let r = c.call(
+        "query_annotations",
+        json!({"annotations":"loose.disasm.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(
+        report["sha256"],
+        nesasm_core::disasm::sha256_hex(&file).as_str()
+    );
+    assert_eq!(report["canonical"], true);
+    assert_eq!(report["rom"], "old/loose.nes");
+    assert_eq!(report["counts"]["labels"], 3);
+    assert_eq!(report["counts"]["regions"], 1);
+    assert_eq!(report["counts"]["patches"], 0);
+    assert!(report.get("entries").is_none(), "{r}");
+    assert!(
+        Client::text(&r).starts_with("Annotations: 1 comments, 3 labels, 1 regions, 1 symbols"),
+        "{r}"
+    );
+    let names = |report: &serde_json::Value| -> Vec<String> {
+        report["entries"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let entry = &m["entry"];
+                let name = entry["name"].as_str().or(entry["text"].as_str());
+                format!(
+                    "{} {} {}",
+                    m["kind"].as_str().unwrap(),
+                    m["index"],
+                    name.unwrap_or_else(|| entry["start"].as_str().unwrap())
+                )
+            })
+            .collect()
+    };
+    // Every entry, in the order of the canonical form, with its bank.
+    let all = query(&mut c, json!({}));
+    assert_eq!(
+        names(&all),
+        [
+            "labels 0 Start",
+            "labels 1 Store",
+            "labels 2 Loop",
+            "symbols 0 PPUCTRL",
+            "regions 0 $E008",
+            "comments 0 start",
+        ]
+    );
+    assert_eq!(all["entries"]["items"][0]["entry"]["bank"], 1);
+    for (entries, expected) in [
+        (
+            json!({"kinds":["labels"],"offset":1,"limit":1}),
+            vec!["labels 1 Store"],
+        ),
+        // The region $E008-$E00C meets $E00A-; the label at $E005 does not.
+        (
+            json!({"from":"$E006","to":"$E009"}),
+            vec!["regions 0 $E008"],
+        ),
+        (json!({"from":"$E00C"}), vec!["regions 0 $E008"]),
+        (
+            json!({"to":"$E000"}),
+            vec!["labels 0 Start", "symbols 0 PPUCTRL", "comments 0 start"],
+        ),
+        // Symbols name no bank.
+        (
+            json!({"bank":1,"to":"$E000"}),
+            vec!["labels 0 Start", "comments 0 start"],
+        ),
+        (json!({"bank":0}), vec![]),
+        // Text in names, evidence and comments, ignoring case.
+        (json!({"text":"NEVER read"}), vec!["regions 0 $E008"]),
+        (
+            json!({"text":"ppuctrl"}),
+            vec!["labels 1 Store", "symbols 0 PPUCTRL"],
+        ),
+        (json!({"status":"hypothesis"}), vec!["labels 1 Store"]),
+        (
+            json!({"status":"confirmed","kinds":["labels"]}),
+            vec!["labels 0 Start", "labels 2 Loop"],
+        ),
+    ] {
+        let report = query(&mut c, entries.clone());
+        assert_eq!(names(&report), expected, "{entries}");
+    }
+    let report = query(&mut c, json!({"kinds":["labels"],"offset":1,"limit":1}));
+    assert_eq!(report["entries"]["total"], 3);
+    assert_eq!(report["entries"]["offset"], 1);
+    // A file not in canonical form is queried as annotate would write it.
+    let mut edited = file.clone();
+    edited.extend(b"\n");
+    c.write("loose.disasm.json", &edited);
+    let report = query(&mut c, json!({"kinds":["labels"],"limit":1}));
+    assert_eq!(report["canonical"], false);
+    assert_eq!(
+        report["sha256"],
+        nesasm_core::disasm::sha256_hex(&edited).as_str()
+    );
+    assert_eq!(names(&report), ["labels 0 Start"]);
+    // Without the ROM, the entries are as in the file, with a warning.
+    std::fs::remove_file(c.root.join("old/loose.nes")).unwrap();
+    let r = c.call(
+        "query_annotations",
+        json!({"annotations":"loose.disasm.json","entries":{"kinds":["labels"]}}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let d = &r["structuredContent"]["diagnostics"][0];
+    assert_eq!(d["severity"], "warning", "{r}");
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("; the entries are as in the file"),
+        "{r}"
+    );
+    assert_eq!(r["structuredContent"]["entries"]["total"], 3);
+    // Whether the file is canonical is not known then.
+    assert!(r["structuredContent"].get("canonical").is_none(), "{r}");
+}
+
+#[test]
+fn query_annotations_returns_the_history() {
+    let mut c = Client::start();
+    queried_annotations(&mut c);
+    let history = |c: &mut Client, history: serde_json::Value| {
+        let r = c.call(
+            "query_annotations",
+            json!({"annotations":"loose.disasm.json","history":history}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        r
+    };
+    let r = history(&mut c, json!({}));
+    let h = &r["structuredContent"]["history"];
+    assert_eq!(h["log"], "loose.disasm.log.jsonl");
+    assert_eq!(h["writes"], 2);
+    assert_eq!(h["chained"], true);
+    assert_eq!(h["current"], true);
+    assert!(h.get("invalid_lines").is_none(), "{r}");
+    // Latest first, without the operations.
+    let selected = &h["selected"];
+    assert_eq!(selected["total"], 2);
+    assert_eq!(selected["items"][0]["line"], 2);
+    assert_eq!(selected["items"][0]["operations"], 2);
+    assert_eq!(selected["items"][0]["kinds"], json!({"upsert labels": 2}));
+    assert!(selected["items"][0].get("matched").is_none(), "{r}");
+    let first = &selected["items"][1];
+    assert_eq!(first["line"], 1);
+    assert!(first.get("sha256_before").is_none(), "{r}");
+    assert_eq!(
+        first["kinds"],
+        json!({"upsert comments": 1, "upsert labels": 1, "upsert regions": 1,
+               "upsert symbols": 1})
+    );
+    // The file was new: totals after only.
+    assert!(first.get("before").is_none(), "{r}");
+    assert!(first["after"]["instructions"].as_u64().unwrap() > 0, "{r}");
+    assert_eq!(selected["items"][0]["before"], first["after"], "{r}");
+    assert_eq!(selected["items"][0]["sha256_before"], first["sha256_after"]);
+    assert!(
+        Client::text(&r)
+            .lines()
+            .any(|l| l == "History: 2 writes in loose.disasm.log.jsonl; 2 selected"),
+        "{r}"
+    );
+    // A filter selects the writes with matching operations, and returns them
+    // with their evidence.
+    let matched = |r: &serde_json::Value| -> Vec<(u64, u64)> {
+        r["structuredContent"]["history"]["selected"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| {
+                w["matched"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|m| (w["line"].as_u64().unwrap(), m["index"].as_u64().unwrap()))
+            })
+            .collect()
+    };
+    for (query, expected) in [
+        (json!({"text":"Reset Vector"}), vec![(2, 0)]),
+        (json!({"text":"stores to"}), vec![(2, 1)]),
+        (json!({"kinds":["regions"]}), vec![(1, 1)]),
+        (
+            json!({"from":"$E000","to":"$E005"}),
+            vec![(2, 0), (2, 1), (1, 0), (1, 3)],
+        ),
+        (json!({"status":"hypothesis"}), vec![(2, 1)]),
+        (json!({"kinds":["patches"]}), vec![]),
+    ] {
+        let r = history(&mut c, query.clone());
+        assert_eq!(matched(&r), expected, "{query}");
+    }
+    let r = history(&mut c, json!({"text":"never read"}));
+    let operation = &r["structuredContent"]["history"]["selected"]["items"][0]["matched"][0];
+    assert_eq!(
+        operation["operation"]["evidence"],
+        "The bytes after JMP Loop are never read"
+    );
+    // A changed file, a broken chain and lines that are not entries.
+    let log = std::fs::read_to_string(c.root.join("loose.disasm.log.jsonl")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    c.write(
+        "loose.disasm.log.jsonl",
+        format!("{}\nnot json\n{{\"time\":1}}\n\n{}\n", lines[1], lines[0]),
+    );
+    let r = history(&mut c, json!({}));
+    let h = &r["structuredContent"]["history"];
+    assert_eq!(h["writes"], 2);
+    assert_eq!(h["invalid_lines"], json!([2, 3]));
+    assert_eq!(h["chained"], false);
+    assert_eq!(h["current"], false);
+    assert_eq!(h["selected"]["items"][0]["line"], 5);
+    assert!(
+        Client::text(&r).lines().any(|l| l
+            == "History: 2 writes in loose.disasm.log.jsonl, not chained, the file changed since the last; 2 selected"),
+        "{r}"
+    );
+    // Without a log there is no history.
+    std::fs::remove_file(c.root.join("loose.disasm.log.jsonl")).unwrap();
+    let r = history(&mut c, json!({}));
+    let h = &r["structuredContent"]["history"];
+    assert!(h.get("log").is_none(), "{r}");
+    assert_eq!(h["writes"], 0);
+    assert_eq!(h["selected"]["total"], 0);
+    assert!(
+        Client::text(&r).lines().any(|l| l == "History: no log"),
+        "{r}"
+    );
+}
+
+#[test]
+fn query_annotations_errors() {
+    let mut c = Client::start();
+    queried_annotations(&mut c);
+    for (arguments, message) in [
+        (
+            json!({"annotations":"loose.json"}),
+            "must end with .disasm.json",
+        ),
+        (
+            json!({"annotations":"missing.disasm.json"}),
+            "missing.disasm.json",
+        ),
+        (
+            json!({"annotations":"../outside.disasm.json"}),
+            "outside the project root",
+        ),
+        (
+            json!({"annotations":"loose.disasm.json","entries":{"kind":["labels"]}}),
+            "unknown field",
+        ),
+        (
+            json!({"annotations":"loose.disasm.json","history":{"text":"x","limit":"9"}}),
+            "invalid type",
+        ),
+    ] {
+        let r = c.call("query_annotations", arguments.clone());
+        assert_eq!(r["isError"], true, "{arguments}: {r}");
+        let text = format!("{}{}", Client::messages(&r), r);
+        assert!(text.contains(message), "{arguments}: {r}");
+    }
+}

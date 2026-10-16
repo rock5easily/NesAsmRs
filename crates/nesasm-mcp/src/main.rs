@@ -2,8 +2,9 @@ use nesasm_core::{
     Artifact, AssembleOptions, AssembleRequest, AssembleResult, BankUsage, Diagnostic,
     DiagnosticCode, LineRecord, ReferenceTopic, Region, Severity, SourceLocation, Symbol,
     disasm::{
-        self, Address, Applied, ChangedIssue, Diff, DisasmConfig, Disassembly, DynamicReference,
-        Issue, IssueKind, Operation, RamUse, Routine, SourceLine, Summary, Verification, Xref,
+        self, Address, AnnotationFilter, AnnotationKind, AnnotationMatch, Applied, ChangedIssue,
+        Diff, DisasmConfig, Disassembly, DynamicReference, Issue, IssueKind, Operation, RamUse,
+        Routine, SourceLine, Summary, Verification, Xref,
     },
     inspect::{Disassembled, HexRow, InesHeader, Rom, Vectors},
 };
@@ -45,6 +46,8 @@ const MAX_ROM_FILE: u64 = 8 * 1024 * 1024;
 const MAX_ANNOTATIONS_FILE: u64 = 8 * 1024 * 1024;
 /// Largest operations file annotate reads.
 const MAX_OPERATIONS_FILE: u64 = 8 * 1024 * 1024;
+/// Largest annotation log query_annotations reads.
+const MAX_LOG_FILE: u64 = 64 * 1024 * 1024;
 const DEFAULT_ISSUE_LIMIT: usize = 20;
 const DEFAULT_DIFF_LIMIT: usize = 20;
 const DEFAULT_ITEM_LIMIT: usize = 100;
@@ -600,6 +603,137 @@ struct AnnotateReport {
     /// annotations, dry runs and failures, to keep elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     log_entry: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct QueryAnnotationsInput {
+    /// Annotation file within the root; its name ends with .disasm.json.
+    annotations: PathBuf,
+    /// Entries to return, those the filter selects; without it, only the
+    /// counts of each list.
+    entries: Option<AnnotationQuery>,
+    /// Writes of annotate recorded in <name>.disasm.log.jsonl beside the
+    /// file, latest first. With a filter, only the writes with operations
+    /// it selects (by their item or key; text also by their evidence),
+    /// returned with them.
+    history: Option<AnnotationQuery>,
+}
+
+/// A filter of annotation entries (every field given must match), and a page.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AnnotationQuery {
+    /// The lists to search (default: all but options).
+    #[serde(default)]
+    kinds: Vec<AnnotationKind>,
+    /// Entries of this bank (symbols have none).
+    bank: Option<usize>,
+    /// Entries whose addresses meet from-to (inclusive; either may be left
+    /// out): the address of an entry, the range of a region or patch, the
+    /// value of a symbol through its size, the window of a bank.
+    from: Option<Address>,
+    to: Option<Address>,
+    /// Entries one of whose strings (name, comment, evidence, expression,
+    /// address as written) contains this text, ignoring case.
+    text: Option<String>,
+    /// Entries of this status.
+    status: Option<disasm::Status>,
+    #[serde(default)]
+    offset: usize,
+    /// Maximum items returned (default 100, at most 1000).
+    limit: Option<usize>,
+}
+
+impl AnnotationQuery {
+    fn filter(&self) -> AnnotationFilter {
+        AnnotationFilter {
+            kinds: self.kinds.clone(),
+            bank: self.bank,
+            from: self.from,
+            to: self.to,
+            text: self.text.clone(),
+            status: self.status,
+        }
+    }
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+struct QueryAnnotationsReport {
+    success: bool,
+    diagnostics: Vec<Diagnostic>,
+    /// SHA-256 of the file: the expected_sha256 of annotate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    /// The file is in the canonical form annotate writes (the indices of
+    /// the entries are those of the canonical form); absent when the
+    /// annotations could not be put in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rom: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_address: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<serde_json::Value>,
+    /// Entries of each list.
+    counts: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entries: Option<Page<AnnotationMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<History>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct History {
+    /// The log, if there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log: Option<PathBuf>,
+    /// Writes recorded in the log.
+    writes: usize,
+    /// Each write starts from the SHA-256 the one before ended with.
+    chained: bool,
+    /// The last write ended with the SHA-256 of the file as it is: nothing
+    /// changed the file since.
+    current: bool,
+    /// Lines (from 1) that are not log entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    invalid_lines: Vec<usize>,
+    /// The writes selected, latest first.
+    selected: Page<LogWrite>,
+}
+
+#[derive(Clone, Serialize, JsonSchema)]
+struct LogWrite {
+    /// Line in the log (from 1).
+    line: usize,
+    /// Seconds since 1970-01-01 UTC.
+    time: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256_after: Option<String>,
+    /// Number of operations.
+    operations: usize,
+    /// Operations by op and kind, such as "upsert labels".
+    kinds: BTreeMap<String, usize>,
+    /// PRG totals before and after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<serde_json::Value>,
+    /// The operations the filter selects, with their evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    matched: Vec<LoggedOperation>,
+}
+
+#[derive(Clone, Serialize, JsonSchema)]
+struct LoggedOperation {
+    /// Index of the operation in the write.
+    index: usize,
+    operation: serde_json::Value,
 }
 
 #[derive(Default, Serialize, JsonSchema)]
@@ -1756,6 +1890,263 @@ impl Server {
         }
     }
 
+    fn query_annotations_report(
+        root: &Path,
+        input: &QueryAnnotationsInput,
+    ) -> QueryAnnotationsReport {
+        let mut report = QueryAnnotationsReport::default();
+        match Self::select_annotations(root, input, &mut report) {
+            Ok(()) => report.success = true,
+            Err(diagnostics) => report.diagnostics.extend(diagnostics),
+        }
+        report
+    }
+
+    fn select_annotations(
+        root: &Path,
+        input: &QueryAnnotationsInput,
+        report: &mut QueryAnnotationsReport,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let path = input.annotations.as_path();
+        let Some(log) = nesasm_core::annotation_log_path(path) else {
+            return Err(vec![error(
+                DiagnosticCode::Disasm,
+                "The annotation file name must end with .disasm.json",
+            )]);
+        };
+        let (config, bytes) = Self::read_annotations(root, path)?;
+        let sha256 = disasm::sha256_hex(&bytes);
+        report.sha256 = Some(sha256.clone());
+        let location = SourceLocation::file(path);
+        // The entries as annotate writes them: each with its bank, in
+        // canonical order. That needs the ROM.
+        let normalized = Self::read_rom(root, &config, &location).and_then(|rom| {
+            disasm::apply_operations(&config, &rom.bytes, &[]).map_err(|errors| {
+                errors
+                    .into_iter()
+                    .map(|e| Diagnostic::error(DiagnosticCode::Disasm, e, location.clone()))
+                    .collect()
+            })
+        });
+        let config = match normalized {
+            Ok((normalized, _)) => {
+                report.canonical = Some(disasm::canonical_json(&normalized).as_bytes() == bytes);
+                normalized
+            }
+            Err(diagnostics) => {
+                report
+                    .diagnostics
+                    .extend(diagnostics.into_iter().map(|d| Diagnostic {
+                        severity: Severity::Warning,
+                        message: format!("{}; the entries are as in the file", d.message),
+                        ..d
+                    }));
+                config
+            }
+        };
+        report.rom = Some(config.rom.clone());
+        report.base.clone_from(&config.base);
+        report.load_address = config.load_address;
+        report.options = serde_json::to_value(&config.options).ok();
+        report.counts = disasm::annotation_counts(&config);
+        if let Some(query) = &input.entries {
+            let found = disasm::query_annotations(&config, &query.filter());
+            report.entries = Some(Page::of(
+                &found,
+                query.offset,
+                query.limit,
+                DEFAULT_ITEM_LIMIT,
+                MAX_ITEM_LIMIT,
+            ));
+        }
+        if let Some(query) = &input.history {
+            report.history = Some(Self::history(root, &log, &sha256, query)?);
+        }
+        Ok(())
+    }
+
+    /// The writes recorded in the log `path`.
+    fn history(
+        root: &Path,
+        path: &Path,
+        sha256: &str,
+        query: &AnnotationQuery,
+    ) -> Result<History, Vec<Diagnostic>> {
+        let exists = nesasm_core::resolve_path(path, root, Some(root)).is_ok_and(|p| p.exists());
+        let text = if exists {
+            Some(
+                read_limited(root, path, MAX_LOG_FILE)
+                    .map_err(|d| vec![d])?
+                    .1,
+            )
+        } else {
+            None
+        };
+        let filter = &query.filter();
+        let filtered = !filter.is_empty();
+        let mut writes = 0;
+        let mut selected = Vec::new();
+        let mut invalid_lines = Vec::new();
+        let mut chained = true;
+        // The SHA-256 the last write ended with.
+        let mut last: Option<Option<String>> = None;
+        let text = String::from_utf8_lossy(text.as_deref().unwrap_or_default()).into_owned();
+        for (i, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::from_str::<serde_json::Value>(line).ok();
+            let Some((entry, operations)) = entry.as_ref().and_then(|e| {
+                e.get("operations")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|o| (e, o))
+            }) else {
+                invalid_lines.push(i + 1);
+                continue;
+            };
+            writes += 1;
+            let digest = |field: &str| {
+                entry
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            let (before, after) = (digest("sha256_before"), digest("sha256_after"));
+            if last.as_ref().is_some_and(|previous| *previous != before) {
+                chained = false;
+            }
+            last = Some(after.clone());
+            let mut kinds = BTreeMap::new();
+            let mut matched = Vec::new();
+            for (index, operation) in operations.iter().enumerate() {
+                let name = |field: &str| {
+                    operation
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                        .to_owned()
+                };
+                *kinds
+                    .entry(format!("{} {}", name("op"), name("kind")))
+                    .or_insert(0) += 1;
+                if filtered && Self::selects(filter, operation) {
+                    matched.push(LoggedOperation {
+                        index,
+                        operation: operation.clone(),
+                    });
+                }
+            }
+            if filtered && matched.is_empty() {
+                continue;
+            }
+            let totals = |field: &str| entry.get(field).filter(|v| !v.is_null()).cloned();
+            selected.push(LogWrite {
+                line: i + 1,
+                time: entry
+                    .get("time")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                sha256_before: before,
+                sha256_after: after,
+                operations: operations.len(),
+                kinds,
+                before: totals("before"),
+                after: totals("after"),
+                matched,
+            });
+        }
+        selected.reverse();
+        Ok(History {
+            log: exists.then(|| path.to_owned()),
+            writes,
+            chained,
+            current: last.is_some_and(|after| after.as_deref() == Some(sha256)),
+            invalid_lines,
+            selected: Page::of(
+                &selected,
+                query.offset,
+                query.limit,
+                DEFAULT_ITEM_LIMIT,
+                MAX_ITEM_LIMIT,
+            ),
+        })
+    }
+
+    /// Whether `filter` selects a logged operation: by its item (upsert)
+    /// or key (remove), and for text also by its evidence.
+    fn selects(filter: &AnnotationFilter, operation: &serde_json::Value) -> bool {
+        let Some(kind) = operation
+            .get("kind")
+            .and_then(|k| serde_json::from_value::<AnnotationKind>(k.clone()).ok())
+        else {
+            return false;
+        };
+        let mut target = operation
+            .get("item")
+            .or_else(|| operation.get("key"))
+            .cloned()
+            .unwrap_or_default();
+        if let (Some(fields), Some(evidence)) = (target.as_object_mut(), operation.get("evidence"))
+        {
+            fields.insert("operation_evidence".into(), evidence.clone());
+        }
+        filter.matches(kind, &target)
+    }
+
+    fn query_annotations_summary(report: &QueryAnnotationsReport) -> String {
+        let mut text = Vec::new();
+        if let Some(sha256) = &report.sha256 {
+            let counts: Vec<String> = report
+                .counts
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(kind, n)| format!("{n} {kind}"))
+                .collect();
+            text.push(format!(
+                "Annotations{}: {} (sha256 {sha256})",
+                if report.canonical == Some(false) {
+                    " (not in canonical form)"
+                } else {
+                    ""
+                },
+                if counts.is_empty() {
+                    "no entries".to_owned()
+                } else {
+                    counts.join(", ")
+                }
+            ));
+        }
+        if let Some(entries) = &report.entries {
+            text.push(format!(
+                "Entries: {} (from {}, {} returned)",
+                entries.total,
+                entries.offset,
+                entries.items.len()
+            ));
+        }
+        if let Some(history) = &report.history {
+            text.push(match &history.log {
+                None => "History: no log".to_owned(),
+                Some(log) => format!(
+                    "History: {} writes in {}{}{}; {} selected",
+                    history.writes,
+                    log.display(),
+                    if history.chained { "" } else { ", not chained" },
+                    if history.current {
+                        ""
+                    } else {
+                        ", the file changed since the last"
+                    },
+                    history.selected.total
+                ),
+            });
+        }
+        if !report.diagnostics.is_empty() {
+            text.push(diagnostics_summary(&report.diagnostics));
+        }
+        text.join("\n")
+    }
+
     fn annotate_summary(report: &AnnotateReport) -> String {
         let mut text = Vec::new();
         text.push(format!(
@@ -2184,6 +2575,21 @@ impl Server {
         }
         tool_result(&report, report.success, summary)
     }
+    #[tool(description="Read an annotation file (<name>.disasm.json in the root) without reading it whole: its SHA-256 (the expected_sha256 of annotate), whether it is in canonical form, and the number of entries of each list; on request, the entries a filter selects (kinds, bank, from-to addresses, text in names, comments or evidence, status), in canonical form and order with their index, and the history of annotate writes in <name>.disasm.log.jsonl (latest first, the operations a filter selects with their evidence). Writes nothing.",output_schema=schema::<QueryAnnotationsReport>(),annotations(read_only_hint=true))]
+    async fn query_annotations(
+        &self,
+        Parameters(input): Parameters<QueryAnnotationsInput>,
+    ) -> CallToolResult {
+        let report = self
+            .guarded(move |root, _| Self::query_annotations_report(root, &input))
+            .await
+            .unwrap_or_else(|diagnostic| QueryAnnotationsReport {
+                diagnostics: vec![diagnostic],
+                ..QueryAnnotationsReport::default()
+            });
+        let summary = Self::query_annotations_summary(&report);
+        tool_result(&report, report.success, summary)
+    }
     #[tool(description="Read assembler syntax documentation. Topics: index, instructions, directives, expressions, options, disassembler.",output_schema=schema::<ReferenceReport>(),annotations(read_only_hint=true))]
     fn get_reference(&self, Parameters(input): Parameters<ReferenceInput>) -> CallToolResult {
         // Unknown topics are rejected when the arguments are parsed.
@@ -2215,7 +2621,8 @@ impl ServerHandler for Server {
                 "NESASM assembler. Read the syntax reference first (get_reference, or the ",
                 "nesasm://reference/* resources); use check to inspect diagnostics before ",
                 "assemble. To turn a ROM into source, read the disassembler reference and use ",
-                "disassemble, record what is confirmed with annotate, then export_disassembly. ",
+                "disassemble, record what is confirmed with annotate (query_annotations reads the ",
+                "entries and their history), then export_disassembly. ",
                 "All paths are relative to the configured ",
                 "project root."
             )

@@ -531,6 +531,7 @@ classDiagram
         -disassemble(input)
         -export_disassembly(input)
         -annotate(input)
+        -query_annotations(input)
         -get_reference(input)
         list_resources()
         read_resource(uri)
@@ -582,7 +583,7 @@ classDiagram
 
 `ServerHandler` はrmcpのtraitです。MCPツールはRust上では非公開メソッドですが、
 マクロによってMCPの `assemble`・`check`・`inspect_rom`・`disassemble`・`export_disassembly`・
-`annotate`・`get_reference` として公開されます。
+`annotate`・`query_annotations`・`get_reference` として公開されます。
 `gate` の型は `Arc<tokio::sync::Mutex<()>>` で、checkとassembleの実行を直列化します。
 時間制限を超えると `assemble_with_cancel` に渡したフラグを立て、エンジンは次の行で停止します。
 `stdio_relay` はstdinとrmcpの間で行を中継し、JSONとして解析できない行に `-32700` を返します。

@@ -61,4 +61,5 @@ undefined label values are 0. DEFINED does not produce a forward-reference warni
   to 1,000,000 calls per assembly.
 - Disassembler annotations: up to 64 `evidence` strings per entry, each up to
   2000 characters; over MCP, annotation and `annotate` operations files of up
-  to 8 MiB (see [Disassembler](disassembler.md#limits)).
+  to 8 MiB, and annotation logs of up to 64 MiB
+  (see [Disassembler](disassembler.md#limits)).
