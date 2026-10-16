@@ -646,15 +646,23 @@ struct AnnotationQuery {
 }
 
 impl AnnotationQuery {
-    fn filter(&self) -> AnnotationFilter {
-        AnnotationFilter {
+    fn filter(&self) -> Result<AnnotationFilter, Vec<Diagnostic>> {
+        if let (Some(from), Some(to)) = (self.from, self.to)
+            && from.0 > to.0
+        {
+            return Err(vec![error(
+                DiagnosticCode::Disasm,
+                format!("from ({from}) is after to ({to})"),
+            )]);
+        }
+        Ok(AnnotationFilter {
             kinds: self.kinds.clone(),
             bank: self.bank,
             from: self.from,
             to: self.to,
             text: self.text.clone(),
             status: self.status,
-        }
+        })
     }
 }
 
@@ -1950,7 +1958,7 @@ impl Server {
         report.options = serde_json::to_value(&config.options).ok();
         report.counts = disasm::annotation_counts(&config);
         if let Some(query) = &input.entries {
-            let found = disasm::query_annotations(&config, &query.filter());
+            let found = disasm::query_annotations(&config, &query.filter()?);
             report.entries = Some(Page::of(
                 &found,
                 query.offset,
@@ -1982,7 +1990,7 @@ impl Server {
         } else {
             None
         };
-        let filter = &query.filter();
+        let filter = &query.filter()?;
         let filtered = !filter.is_empty();
         let mut writes = 0;
         let mut selected = Vec::new();

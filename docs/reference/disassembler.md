@@ -342,9 +342,9 @@ writes nothing:
   them (each with its bank) in the canonical order of lists and entries, each
   with its `kind` and `index` in its list. Every field given must match:
   `kinds` (the lists; default all), `bank` (symbols have none), `from`-`to`
-  (inclusive, either may be left out; the address of an entry, the range of
-  a region or patch, the value of a symbol through its `size`, the 8 KiB
-  window of a bank), `text` (in any string of the entry: names, comments,
+  (inclusive, either may be left out, `from` after `to` is an error; the
+  address of an entry, the range of a region or patch, the value of a symbol
+  through its `size`, the 8 KiB window of a bank), `text` (in any string of the entry: names, comments,
   `evidence`, expressions, addresses as written; ignoring case) and `status`.
   `offset` and `limit` (default 100, at most 1000) page them. If the ROM
   cannot be read or the annotations are not valid, a warning says so and the

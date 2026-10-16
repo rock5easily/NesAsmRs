@@ -5062,6 +5062,8 @@ fn annotation_filters_select_by_span_bank_text_and_status() {
     assert_eq!(select(between(0xc20f, 0xc210)), ["Banks 0", "Regions 1"]);
     assert_eq!(select(between(0xc210, 0xc2ff)), ["Banks 0"]);
     assert_eq!(select(between(0xc300, 0xc300)), ["Banks 0", "Patches 0"]);
+    // A range that ends before it starts holds nothing.
+    assert!(select(between(0xc10f, 0xc100)).is_empty());
     assert_eq!(
         select(disasm::AnnotationFilter {
             from: Some(Address(0xe000)),

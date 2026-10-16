@@ -2101,6 +2101,14 @@ fn query_annotations_errors() {
             json!({"annotations":"loose.disasm.json","history":{"text":"x","limit":"9"}}),
             "invalid type",
         ),
+        (
+            json!({"annotations":"loose.disasm.json","entries":{"from":"$E00A","to":"$E009"}}),
+            "from ($E00A) is after to ($E009)",
+        ),
+        (
+            json!({"annotations":"loose.disasm.json","history":{"from":"$E00A","to":"$E009"}}),
+            "from ($E00A) is after to ($E009)",
+        ),
     ] {
         let r = c.call("query_annotations", arguments.clone());
         assert_eq!(r["isError"], true, "{arguments}: {r}");

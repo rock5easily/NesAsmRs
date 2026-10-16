@@ -986,6 +986,12 @@ impl AnnotationFilter {
             return false;
         }
         if self.from.is_some() || self.to.is_some() {
+            // A range that ends before it starts holds nothing.
+            if let (Some(from), Some(to)) = (self.from, self.to)
+                && from.0 > to.0
+            {
+                return false;
+            }
             let Some((first, last)) = span(kind, entry) else {
                 return false;
             };
