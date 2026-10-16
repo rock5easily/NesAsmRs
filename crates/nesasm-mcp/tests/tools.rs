@@ -1120,6 +1120,17 @@ fn annotate_shares_evidence_among_the_operations() {
         assert_eq!(r["isError"], true, "{r}");
         assert!(Client::messages(&r).contains(message), "{r}");
     }
+    // The limit is that of the evidence added to the entries: trimmed.
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations":[ops[1]],
+               "evidence":format!(" {} ", "x".repeat(2000))}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        r["structuredContent"]["annotations"]["regions"][0]["evidence"],
+        json!(["x".repeat(2000)])
+    );
 }
 
 #[test]

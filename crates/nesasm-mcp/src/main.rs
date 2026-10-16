@@ -1706,8 +1706,9 @@ impl Server {
     ) -> Result<Vec<Operation>, Vec<Diagnostic>> {
         let mut operations = Self::given_operations(root, input)?;
         if let Some(text) = input.evidence.as_deref().filter(|t| !t.trim().is_empty()) {
-            // Once, rather than for each entry it would be added to.
-            let length = text.chars().count();
+            // Once, rather than for each entry it would be added to, as
+            // it is added (trimmed).
+            let length = text.trim().chars().count();
             if length > disasm::MAX_EVIDENCE_TEXT {
                 return Err(vec![error(
                     DiagnosticCode::Disasm,
