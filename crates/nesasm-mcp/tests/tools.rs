@@ -952,6 +952,128 @@ fn annotate_writes_nothing_that_fails() {
 }
 
 #[test]
+fn annotate_reads_operations_from_a_file() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let evidence = "the bytes after JMP Loop are never read";
+    let ops = json!([
+        {"op": "upsert", "kind": "labels", "item": {"address": "$E005", "name": "Loop"}},
+        {"op": "upsert", "kind": "regions",
+         "item": {"start": "$E008", "length": 5, "type": "code"}, "evidence": evidence},
+    ]);
+    c.write("ops/table.json", ops.to_string());
+    let create = json!({"rom": "old/loose.nes"});
+    // A dry run applies them as if given inline.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","create":create,
+               "operations_file":"ops/table.json","dry_run":true}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let report = &r["structuredContent"];
+    assert_eq!(report["applied"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(report["log_entry"]["operations"], ops);
+    assert!(!c.root.join("loose.disasm.json").exists());
+    // Written, the log records the operations of the file, the evidence
+    // included.
+    let r = c.call(
+        "annotate",
+        json!({"annotations":"loose.disasm.json","create":create,
+               "operations_file":"ops/table.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["written"], true);
+    let annotations: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(c.root.join("loose.disasm.json")).unwrap())
+            .unwrap();
+    assert_eq!(annotations["labels"][0]["name"], "Loop");
+    assert_eq!(annotations["regions"][0]["evidence"], json!([evidence]));
+    let log = std::fs::read_to_string(c.root.join("loose.disasm.log.jsonl")).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["operations"], ops);
+    // The file is read as the other inputs: within the root, of operations,
+    // and not with operations inline.
+    c.write("ops/object.json", r#"{"operations": []}"#);
+    c.write("ops/evidence.json", ops[1].to_string());
+    c.write("ops/large.json", vec![b' '; 8 * 1024 * 1024 + 1]);
+    let inline = json!({"rom": "old/loose.nes"});
+    for (arguments, message) in [
+        (
+            json!({"inline":inline,"operations":[],"operations_file":"ops/table.json"}),
+            "Give operations or operations_file, not both",
+        ),
+        (
+            json!({"inline":inline,"operations_file":"../outside.json"}),
+            "outside the project root",
+        ),
+        (
+            json!({"inline":inline,"operations_file":"ops/missing.json"}),
+            "ops/missing.json",
+        ),
+        (
+            json!({"inline":inline,"operations_file":"ops/large.json"}),
+            "File exceeds 8 MiB",
+        ),
+        (
+            json!({"inline":inline,"operations_file":"ops/object.json"}),
+            "The operations file is not an array of operations",
+        ),
+        (
+            json!({"inline":inline,"operations_file":"ops/evidence.json"}),
+            "The operations file is not an array of operations",
+        ),
+    ] {
+        let r = c.call("annotate", arguments.clone());
+        assert_eq!(r["isError"], true, "{arguments}: {r}");
+        assert!(Client::messages(&r).contains(message), "{arguments}: {r}");
+    }
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations_file":"ops/object.json"}),
+    );
+    let d = &r["structuredContent"]["diagnostics"][0];
+    assert_eq!(d["code"], "E_DISASM", "{r}");
+    assert_eq!(d["location"]["file"], "ops/object.json", "{r}");
+    // A file of exactly 8 MiB is read.
+    let mut limit = b"[]".to_vec();
+    limit.resize(8 * 1024 * 1024, b' ');
+    c.write("ops/limit.json", limit);
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations_file":"ops/limit.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    // Without operations, nothing changes.
+    let r = c.call("annotate", json!({"inline":inline}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["applied"], json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn annotate_reads_no_operations_file_linked_outside_the_root() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("ops.json"), "[]").unwrap();
+    std::fs::create_dir_all(c.root.join("ops")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("ops.json"),
+        c.root.join("ops/link.json"),
+    )
+    .unwrap();
+    let r = c.call(
+        "annotate",
+        json!({"inline":{"rom":"old/loose.nes"},"operations_file":"ops/link.json"}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains("outside the project root"),
+        "{r}"
+    );
+}
+
+#[test]
 fn annotate_inline_returns_the_annotations_and_suggestions_apply() {
     let mut c = Client::start();
     let source = concat!(

@@ -43,6 +43,8 @@ const MAX_DISASSEMBLY_COUNT: usize = 512;
 const MAX_ROM_FILE: u64 = 8 * 1024 * 1024;
 /// Largest annotation file the disassembler reads.
 const MAX_ANNOTATIONS_FILE: u64 = 8 * 1024 * 1024;
+/// Largest operations file annotate reads.
+const MAX_OPERATIONS_FILE: u64 = 8 * 1024 * 1024;
 const DEFAULT_ISSUE_LIMIT: usize = 20;
 const DEFAULT_DIFF_LIMIT: usize = 20;
 const DEFAULT_ITEM_LIMIT: usize = 100;
@@ -291,7 +293,11 @@ struct AnnotateInput {
     /// symbols; bank for banks. remove takes key and removes every entry it
     /// names. set changes fields of options (null: the default). The
     /// suggestions of issues are operations in this form.
-    operations: Vec<Operation>,
+    operations: Option<Vec<Operation>>,
+    /// Or a JSON file in the root holding the operations (an array in the
+    /// form of operations), such as one a script generated. The operations
+    /// are logged as if given inline.
+    operations_file: Option<PathBuf>,
     /// Apply and analyse without writing anything.
     #[serde(default)]
     dry_run: bool,
@@ -1453,6 +1459,7 @@ impl Server {
         if path.is_some_and(|p| nesasm_core::annotation_log_path(p).is_none()) {
             return Err(fail("The annotation file name must end with .disasm.json"));
         }
+        let operations = Self::read_operations(root, input)?;
         // The annotations as they are, and the file's contents.
         let (original, existing) = match (path, &input.inline, &input.create) {
             (Some(path), None, None) => {
@@ -1526,8 +1533,8 @@ impl Server {
                     disasm::canonical_json(&config).as_bytes() != bytes
                 });
         }
-        let (config, applied) = disasm::apply_operations(&original, &rom.bytes, &input.operations)
-            .map_err(with_location)?;
+        let (config, applied) =
+            disasm::apply_operations(&original, &rom.bytes, &operations).map_err(with_location)?;
         report.applied = applied;
         report.hypotheses = Hypotheses::of(&config, input.hypotheses);
         // The errors name entries by their index in the changed annotations,
@@ -1632,7 +1639,7 @@ impl Server {
             "annotations": path,
             "sha256_before": sha256_before,
             "sha256_after": sha256,
-            "operations": input.operations,
+            "operations": operations,
             "before": report.summary_before.as_ref().map(totals),
             "after": report.summary_after.as_ref().map(totals),
         }));
@@ -1676,6 +1683,32 @@ impl Server {
             }),
         }
         Ok(())
+    }
+
+    /// The operations given inline or in `operations_file`.
+    fn read_operations(
+        root: &Path,
+        input: &AnnotateInput,
+    ) -> Result<Vec<Operation>, Vec<Diagnostic>> {
+        match (&input.operations, &input.operations_file) {
+            (Some(_), Some(_)) => Err(vec![error(
+                DiagnosticCode::Disasm,
+                "Give operations or operations_file, not both",
+            )]),
+            (Some(operations), None) => Ok(operations.clone()),
+            (None, Some(path)) => {
+                let (_, bytes) =
+                    read_limited(root, path, MAX_OPERATIONS_FILE).map_err(|d| vec![d])?;
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    vec![Diagnostic::error(
+                        DiagnosticCode::Disasm,
+                        format!("The operations file is not an array of operations: {e}"),
+                        SourceLocation::file(path),
+                    )]
+                })
+            }
+            (None, None) => Ok(Vec::new()),
+        }
     }
 
     fn annotate_summary(report: &AnnotateReport) -> String {
@@ -2073,7 +2106,7 @@ impl Server {
         let summary = Self::disasm_summary(&report);
         tool_result(&report, report.success, summary)
     }
-    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations: upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after, and the issues resolved and introduced. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
+    #[tool(description="Change an annotation file (<name>.disasm.json in the root) for disassemble by operations (inline, or a JSON file in the root with operations_file): upsert an entry by its key, remove entries by key, or set options. The issues of disassemble suggest operations in this form; apply them only with evidence. Entries that override the analysis (references; entry_points with no_return, inline_bytes, switch_banks or keeps_banks; code regions and tables with code_targets) require evidence, which is appended with the operations to <name>.disasm.log.jsonl. The file is written in canonical form, only if the operations apply, the annotations are valid and (unless require_match is false) the source reassembles to the same ROM, and only if its SHA-256 is still expected_sha256. Returns the analysis before and after, and the issues resolved and introduced. dry_run, or inline annotations, writes nothing.",output_schema=schema::<AnnotateReport>(),annotations(read_only_hint=false,destructive_hint=true))]
     async fn annotate(&self, Parameters(input): Parameters<AnnotateInput>) -> CallToolResult {
         let report = match self
             .guarded_late(move |root, cancel| Self::annotate_report(root, &input, cancel))
