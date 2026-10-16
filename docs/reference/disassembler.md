@@ -232,6 +232,11 @@ writes it as one change:
 }
 ```
 
+- The operations can instead be in a JSON file in the root,
+  `"operations_file": "ops/labels.json"`, holding an array in the form of
+  `operations` (such as one a script generated). They apply and are logged
+  as if given inline; `operations` and `operations_file` cannot be given
+  together, and with neither there are no operations.
 - `upsert` adds `item`, a whole entry with the fields of the annotation file,
   and replaces the entries with the same key. It does not merge fields: the
   result reports the entries it replaced (`applied[].previous`) to change and
@@ -569,8 +574,8 @@ Annotation values must stay within the ROM: ranges within one bank,
 whose adjusted target would wrap around $FFFF are written as numbers. An entry
 gives at most 64 `evidence` strings of at most 2000 characters each.
 
-ROMs of up to 128 banks of 8 KiB; over MCP, ROM and annotation files of up
-to 8 MiB each (also the base ROM). A disassembly is subject to the server's time limit.
+ROMs of up to 128 banks of 8 KiB; over MCP, ROM, annotation and operations
+files of up to 8 MiB each (also the base ROM). A disassembly is subject to the server's time limit.
 
 The trace remembers up to 32 RAM values and 16 pushed values per path, and
 is repeated at most 16 times for joins of paths. A routine's summary follows

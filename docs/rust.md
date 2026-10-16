@@ -332,6 +332,9 @@ MCPの `annotate` は注釈ファイル（`*.disasm.json`）を操作（`upsert`
 処理は `nesasm_core::disasm::apply_operations`（操作の適用、各項目のバンクの補完、キーの重複の検出、
 正規の順序への並べ替え）と `canonical_json`（正規の書式）で行い、書き込みは
 `write_annotations`／`append_annotation_log`（`output.rs`）に限ります。
+- 操作は引数の `operations` のほか、ルート内のJSONファイル（`operations_file`、`operations` と同じ形式の配列、
+  8 MiBまで）からも読めます。スクリプトで生成した大量の操作をLLMの出力として送り直さないためです。
+  両方の指定は誤りで、どちらもなければ操作なしです。ログには引数で渡した場合と同じ形式で操作を記録します。
 - `upsert` は項目全体を受け取り、同じキーの項目を置き換えます（フィールド単位のマージはしません）。
   キーは `entry_points`・`operands`・`references` が (bank, address)、`regions`・`patches` が (bank, start)、
   `comments` が (bank, address, position)、`labels`・`symbols` が name、`banks` が bank です。

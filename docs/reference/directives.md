@@ -60,4 +60,5 @@ undefined label values are 0. DEFINED does not produce a forward-reference warni
 - Expressions: up to 256 tokens; FUNC calls nest up to 32 levels and are limited
   to 1,000,000 calls per assembly.
 - Disassembler annotations: up to 64 `evidence` strings per entry, each up to
-  2000 characters (see [Disassembler](disassembler.md#limits)).
+  2000 characters; over MCP, annotation and `annotate` operations files of up
+  to 8 MiB (see [Disassembler](disassembler.md#limits)).
