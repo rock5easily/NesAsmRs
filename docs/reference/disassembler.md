@@ -291,9 +291,12 @@ writes it as one change:
 - Each write appends a line to `<name>.disasm.log.jsonl` beside the file: the
   time, the operations with their evidence, the SHA-256 before and after, and
   PRG totals (instructions, code, data and unknown bytes, issues, dynamic
-  references) before and after. The result gives the same `log_entry`, also for a dry run or
-  `inline` annotations (then nothing is written and the changed
-  `annotations` are returned).
+  references) before and after; the result names the `log`. The result
+  gives the entry as `log_entry` only when it is not in the log: for a dry
+  run or `inline` annotations (then nothing is written and the changed
+  `annotations` are returned), when the analysed annotations are not
+  written (the round trip fails, or writing does), and when the log could not
+  be written (with a warning).
 - The result also gives the summaries before and after, `verification`, and
   the issues resolved, introduced and changed (`issues_changed`: reported
   before and after with another message, with its `previous_message`),
@@ -301,6 +304,9 @@ writes it as one change:
   (`dynamic_references_added`, `dynamic_references_removed`, when there are
   any). An `unresolved_bank` settled by `target_window` is among the issues
   resolved, and its id is the `issue_id` of the added reference.
+- `brief: true` gives a shorter result: no `summary_before` and
+  `summary_after` (the text keeps their totals), and `applied` lists only the
+  operations that replaced or removed entries. The rest is the same.
 
 Only files named `*.disasm.json` inside the root and outside hidden
 directories are written (also after following links; a link to a file or
