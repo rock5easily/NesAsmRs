@@ -1034,10 +1034,43 @@ fn annotate_reads_operations_from_a_file() {
     let d = &r["structuredContent"]["diagnostics"][0];
     assert_eq!(d["code"], "E_DISASM", "{r}");
     assert_eq!(d["location"]["file"], "ops/object.json", "{r}");
+    // A file of exactly 8 MiB is read.
+    let mut limit = b"[]".to_vec();
+    limit.resize(8 * 1024 * 1024, b' ');
+    c.write("ops/limit.json", limit);
+    let r = c.call(
+        "annotate",
+        json!({"inline":inline,"operations_file":"ops/limit.json"}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
     // Without operations, nothing changes.
     let r = c.call("annotate", json!({"inline":inline}));
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(r["structuredContent"]["applied"], json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn annotate_reads_no_operations_file_linked_outside_the_root() {
+    let mut c = Client::start();
+    loose_rom(&mut c);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("ops.json"), "[]").unwrap();
+    std::fs::create_dir_all(c.root.join("ops")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("ops.json"),
+        c.root.join("ops/link.json"),
+    )
+    .unwrap();
+    let r = c.call(
+        "annotate",
+        json!({"inline":{"rom":"old/loose.nes"},"operations_file":"ops/link.json"}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        Client::messages(&r).contains("outside the project root"),
+        "{r}"
+    );
 }
 
 #[test]
