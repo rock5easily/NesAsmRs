@@ -100,8 +100,8 @@ never need to load them whole:
    data matter), and an output directory distinct from the inputs.
 2. `inspect_rom` `{"rom": "roms/game.nes"}`: header, mapper, PRG/CHR sizes,
    vectors, warnings. Note the ROM's size and SHA-256.
-3. Create the annotation file (its name ends with `.disasm.json`), or work on a
-   copy of an existing one:
+3. Create the annotation file (its name ends with `.disasm.json`) with
+   `annotate` and `create`, or work on a copy of an existing one:
 
    ```json
    {"annotations": "annotations/game.disasm.json",
@@ -142,10 +142,10 @@ range of a hack. Then gather the facts in one `disassemble` call, for example:
 Banks are 8 KiB banks in decimal; addresses are `"$C000"` strings or numbers.
 Look at the callers, the bank switch before a call, the RAM a routine reads
 and writes (`routines`, `ram`), where an indirect jump's pointer is set, and
-where a table ends. For bytes nothing traced, decode a few with `inspect_rom`
-(`"disassemble": {"bank": 27, "address": 32768, "length": 32}`, a number
-address, `length` in instructions; `hexdump` length in bytes): this shows what
-the bytes would be, not that anything executes them.
+where a table ends. For bytes that no traced path reaches, decode a few with
+`inspect_rom` (`"disassemble": {"bank": 27, "address": 32768, "length": 32}`,
+a number address, `length` in instructions; `hexdump` length in bytes): this
+shows what the bytes would be, not that anything executes them.
 
 Check existing annotations and their evidence with `query_annotations` before
 adding to them:
